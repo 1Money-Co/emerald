@@ -25,6 +25,14 @@ scrape_configs:
         labels:
           client_name: "reth"
           client_type: "execution"
+  - job_name: "reth3"
+    metrics_path: "/"
+    scrape_interval: 1s
+    static_configs:
+      - targets: ['host.docker.internal:9103']
+        labels:
+          client_name: "reth"
+          client_type: "execution"
 
   - job_name: "malachite0"
     metrics_path: "/metrics"
@@ -47,6 +55,14 @@ scrape_configs:
     scrape_interval: 1s
     static_configs:
       - targets: ['host.docker.internal:29002']
+        labels:
+          client_name: "malachite"
+          client_type: "consensus"
+  - job_name: "malachite3"
+    metrics_path: "/metrics"
+    scrape_interval: 1s
+    static_configs:
+      - targets: ['host.docker.internal:29003']
         labels:
           client_name: "malachite"
           client_type: "consensus"

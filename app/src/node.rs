@@ -161,6 +161,7 @@ impl Node for App {
                     "test-0" => 8551,
                     "test-1" => 18551,
                     "test-2" => 28551,
+                    "test-3" => 38551,
                     _ => 8551,
                 };
                 Url::parse(&format!("http://localhost:{engine_port}"))?
@@ -171,6 +172,7 @@ impl Node for App {
                     "test-0" => 8545,
                     "test-1" => 18545,
                     "test-2" => 28545,
+                    "test-3" => 38545,
                     _ => 8545,
                 };
                 Url::parse(&format!("http://localhost:{eth_port}"))?

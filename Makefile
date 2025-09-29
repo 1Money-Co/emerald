@@ -3,9 +3,9 @@ all: clean
 	cargo run --bin malachitebft-eth-utils genesis
 	docker compose up -d
 	./scripts/add_peers.sh 
-	cargo run --bin malachitebft-eth-app -- testnet --nodes 3 --home nodes
+	cargo run --bin malachitebft-eth-app -- testnet --nodes 4 --home nodes
 	echo 👉 Grafana dashboard is available at http://localhost:3000
-	bash scripts/spawn.bash --nodes 3 --home nodes
+	bash scripts/spawn.bash --nodes 4 --home nodes
 
 stop:
 	docker compose down

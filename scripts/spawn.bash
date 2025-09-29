@@ -43,6 +43,12 @@ export RUST_BACKTRACE=full
 
 # Create nodes and logs directories, run nodes
 for NODE in $(seq 0 $((NODES_COUNT - 1))); do
+    # Add delay for the last node
+    if [[ $NODE -eq $((NODES_COUNT - 1)) ]]; then
+        echo "[Node $NODE] Waiting 30 seconds before starting the last node..."
+        sleep 30
+        echo "[Node $NODE] 🛸 Starting the last node..."
+    fi
     if [[ -z "$NO_RESET" ]]; then
         echo "[Node $NODE] Resetting the database..."
         rm -rf "$NODES_HOME/$NODE/db"
