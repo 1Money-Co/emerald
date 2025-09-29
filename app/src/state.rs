@@ -39,7 +39,7 @@ pub struct State {
     genesis: Genesis,
     signing_provider: Ed25519Provider,
     address: Address,
-    store: Store,
+    pub store: Store,
     stream_nonce: u32,
     streams_map: PartStreamsMap,
     #[allow(dead_code)]
@@ -256,7 +256,7 @@ impl State {
         }
 
         // Prune the store, keep the last 5 heights
-        let retain_height = Height::new(certificate.height.as_u64().saturating_sub(5));
+        let retain_height = Height::new(certificate.height.as_u64().saturating_sub(10000));
         self.store.prune(retain_height).await?;
 
         // Move to next height
