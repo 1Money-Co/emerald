@@ -132,6 +132,25 @@ impl Engine {
             .await
     }
 
+    /// Get execution payload bodies by their block hashes
+    pub async fn get_payload_bodies_by_hash(
+        &self,
+        block_hashes: Vec<BlockHash>,
+    ) -> eyre::Result<Vec<Option<crate::json_structures::ExecutionPayloadBodyV1>>> {
+        debug!("🟠 get_payload_bodies_by_hash: {:?}", block_hashes);
+        self.api.get_payload_bodies_by_hash(block_hashes).await
+    }
+
+    /// Get execution payload bodies by block number range
+    pub async fn get_payload_bodies_by_range(
+        &self,
+        start_block: u64,
+        count: u64,
+    ) -> eyre::Result<Vec<Option<crate::json_structures::ExecutionPayloadBodyV1>>> {
+        debug!("🟠 get_payload_bodies_by_range: start={}, count={}", start_block, count);
+        self.api.get_payload_bodies_by_range(start_block, count).await
+    }
+
     /// Returns the duration since the unix epoch.
     fn _timestamp_now(&self) -> u64 {
         SystemTime::now()
