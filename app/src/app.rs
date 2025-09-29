@@ -297,20 +297,68 @@ pub async fn run(
                 info!(%height, %round, "🟢🟢 Processing synced value");
 
                 let value = decode_value(value_bytes);
+                
+                // Extract execution payload from the synced value for validation
+                let block_bytes = value.extensions.clone();
+                let execution_payload = ExecutionPayloadV3::from_ssz_bytes(&block_bytes).unwrap();
+                let new_block_hash = execution_payload.payload_inner.payload_inner.block_hash;
 
-                // We send to consensus to see if it has been decided on
-                if reply
-                    .send(Some(ProposedValue {
-                        height,
-                        round,
-                        valid_round: Round::Nil,
-                        proposer,
-                        value,
-                        validity: Validity::Valid,
-                    }))
-                    .is_err()
-                {
-                    error!("Failed to send ProcessSyncedValue reply");
+                // Collect hashes from blob transactions
+                let block: Block = execution_payload.clone().try_into_block().unwrap();
+                let versioned_hashes: Vec<BlockHash> =
+                    block.body.blob_versioned_hashes_iter().copied().collect();
+                // Attempt to validate the synced block with the execution engine
+                // During sync, validation might fail if the execution client doesn't have the right state
+                // but we should still attempt validation to detect malicious blocks
+                match engine.notify_new_block(execution_payload, versioned_hashes).await {
+                    Ok(payload_status) => {
+                        if payload_status.status.is_invalid() {
+                            error!(%height, %round, "🔴 Synced block validation failed: invalid payload status: {}", payload_status.status);
+                            // Reject invalid blocks - don't store or reply with them
+                            if reply.send(Some(ProposedValue {
+                                height,
+                                round,
+                                valid_round: Round::Nil,
+                                proposer,
+                                value,
+                                validity: Validity::Invalid,
+                            })).is_err() {
+                                error!("Failed to send ProcessSyncedValue rejection reply");
+                            }
+                            return Ok(()); // Continue processing other messages
+                        }
+                        debug!("💡 Sync block validated at height {} with hash: {}", height, new_block_hash);
+                    }
+                    Err(e) => {
+                        // Log validation errors but don't reject the block during sync
+                        // as the execution client might not have the right state yet
+                        debug!(%height, %round, "⚠️  Sync block validation failed (might be expected during sync): {}", e);
+                    }
+                }
+                let proposed_value = ProposedValue {
+                    height,
+                    round,
+                    valid_round: Round::Nil,
+                    proposer,
+                    value,
+                    validity: Validity::Valid,
+                };
+
+                // Store the synced value and block data concurrently
+                let store_proposal = state.store.store_undecided_proposal(proposed_value.clone());
+                let store_block = state.store.store_undecided_block_data(height, round, block_bytes);
+
+                if let Err(e) = store_proposal.await {
+                    error!(%height, %round, error = %e, "Failed to store synced value");
+                }
+
+                if let Err(e) = store_block.await {
+                    error!(%height, %round, error = %e, "Failed to store synced block data");
+                }
+
+                // Send to consensus to see if it has been decided on
+                if let Err(_) = reply.send(Some(proposed_value)) {
+                    error!(%height, %round, "Failed to send ProcessSyncedValue reply");
                 }
             }
 
