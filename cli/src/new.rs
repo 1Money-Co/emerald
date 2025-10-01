@@ -84,7 +84,7 @@ pub fn generate_config(
     let metrics_port = METRICS_BASE_PORT + index;
 
     Config {
-        moniker: format!("{}-{index}", malaketh_config.moniker),
+        moniker: malaketh_config.moniker,
         consensus: ConsensusConfig {
             timeouts: TimeoutConfig::default(),
             p2p: P2pConfig {
