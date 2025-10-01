@@ -17,7 +17,7 @@ use malachitebft_eth_engine::json_structures::ExecutionBlock;
 use malachitebft_eth_types::codec::proto::ProtobufCodec;
 use malachitebft_eth_types::{Block, BlockHash, TestContext};
 
-use crate::state::{decode_value, State};
+use crate::state::{decode_value, extract_block_header, State};
 
 pub async fn run(
     state: &mut State,
@@ -227,6 +227,10 @@ pub async fn run(
                     .len();
                 debug!("🦄 Block at height {height} contains {tx_count} transactions");
 
+                // Extract block header
+                let block_header = extract_block_header(&execution_payload);
+                let block_header_bytes = Bytes::from(block_header.as_ssz_bytes());
+
                 // Collect hashes from blob transactions
                 let block: Block = execution_payload.clone().try_into_block().unwrap();
                 let versioned_hashes: Vec<BlockHash> =
@@ -253,7 +257,7 @@ pub async fn run(
 
                 // When that happens, we store the decided value in our store
                 // TODO: we should return an error reply if commit fails
-                state.commit(certificate).await?;
+                state.commit(certificate, block_header_bytes).await?;
 
                 // Save the latest block
                 state.latest_block = Some(ExecutionBlock {

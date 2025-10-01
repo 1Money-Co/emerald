@@ -206,6 +206,7 @@ impl State {
     pub async fn commit(
         &mut self,
         certificate: CommitCertificate<TestContext>,
+        block_header_bytes: Bytes,
     ) -> eyre::Result<()> {
         info!(
             height = %certificate.height,
@@ -248,6 +249,11 @@ impl State {
                 info!("Committed block_data[0..32]: {}", hex::encode(&data[..32]));
             }
         }
+
+        // Store block header (passed from caller to avoid re-deserialization)
+        self.store
+            .store_decided_block_header(certificate.height, block_header_bytes)
+            .await?;
 
         if let Some(data) = block_data {
             self.store
@@ -501,4 +507,38 @@ fn assemble_value_from_parts(parts: ProposalParts) -> (ProposedValue<TestContext
 /// Decodes a Value from its byte representation using ProtobufCodec
 pub fn decode_value(bytes: Bytes) -> Value {
     ProtobufCodec.decode(bytes).unwrap()
+}
+
+/// Extracts a block header from an ExecutionPayloadV3 by removing transactions and withdrawals.
+///
+/// Returns an ExecutionPayloadV3 with empty transactions and withdrawals vectors,
+/// containing only the block header fields.
+pub fn extract_block_header(
+    payload: &alloy_rpc_types_engine::ExecutionPayloadV3,
+) -> alloy_rpc_types_engine::ExecutionPayloadV3 {
+    use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3};
+
+    ExecutionPayloadV3 {
+        payload_inner: ExecutionPayloadV2 {
+            payload_inner: ExecutionPayloadV1 {
+                parent_hash: payload.payload_inner.payload_inner.parent_hash,
+                fee_recipient: payload.payload_inner.payload_inner.fee_recipient,
+                state_root: payload.payload_inner.payload_inner.state_root,
+                receipts_root: payload.payload_inner.payload_inner.receipts_root,
+                logs_bloom: payload.payload_inner.payload_inner.logs_bloom,
+                prev_randao: payload.payload_inner.payload_inner.prev_randao,
+                block_number: payload.payload_inner.payload_inner.block_number,
+                gas_limit: payload.payload_inner.payload_inner.gas_limit,
+                gas_used: payload.payload_inner.payload_inner.gas_used,
+                timestamp: payload.payload_inner.payload_inner.timestamp,
+                extra_data: payload.payload_inner.payload_inner.extra_data.clone(),
+                base_fee_per_gas: payload.payload_inner.payload_inner.base_fee_per_gas,
+                block_hash: payload.payload_inner.payload_inner.block_hash,
+                transactions: vec![],
+            },
+            withdrawals: vec![],
+        },
+        blob_gas_used: payload.blob_gas_used,
+        excess_blob_gas: payload.excess_blob_gas,
+    }
 }

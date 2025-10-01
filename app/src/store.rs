@@ -81,6 +81,9 @@ const DECIDED_BLOCK_DATA_TABLE: redb::TableDefinition<HeightKey, Vec<u8>> =
 const UNDECIDED_BLOCK_DATA_TABLE: redb::TableDefinition<UndecidedValueKey, Vec<u8>> =
     redb::TableDefinition::new("undecided_block_data");
 
+const DECIDED_BLOCK_HEADERS_TABLE: redb::TableDefinition<HeightKey, Vec<u8>> =
+    redb::TableDefinition::new("decided_block_headers");
+
 struct Db {
     db: redb::Database,
     metrics: DbMetrics,
@@ -331,6 +334,7 @@ impl Db {
         let _ = tx.open_table(UNDECIDED_PROPOSALS_TABLE)?;
         let _ = tx.open_table(DECIDED_BLOCK_DATA_TABLE)?;
         let _ = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
+        let _ = tx.open_table(DECIDED_BLOCK_HEADERS_TABLE)?;
 
         tx.commit()?;
 
@@ -413,6 +417,47 @@ impl Db {
         self.metrics.add_write_bytes(write_bytes);
 
         Ok(())
+    }
+
+    fn insert_decided_block_header(&self, height: Height, header: Bytes) -> Result<(), StoreError> {
+        let start = Instant::now();
+        let write_bytes = header.len() as u64;
+
+        let tx = self.db.begin_write()?;
+        {
+            let mut table = tx.open_table(DECIDED_BLOCK_HEADERS_TABLE)?;
+            // Only insert if no value exists at this key
+            if table.get(&height)?.is_none() {
+                table.insert(height, header.to_vec())?;
+            }
+        }
+        tx.commit()?;
+
+        self.metrics.observe_write_time(start.elapsed());
+        self.metrics.add_write_bytes(write_bytes);
+
+        Ok(())
+    }
+
+    fn get_decided_block_header(&self, height: Height) -> Result<Option<Bytes>, StoreError> {
+        let start = Instant::now();
+
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(DECIDED_BLOCK_HEADERS_TABLE)?;
+
+        let result = if let Some(data) = table.get(&height)? {
+            let bytes = data.value();
+            let read_bytes = bytes.len() as u64;
+            self.metrics.observe_read_time(start.elapsed());
+            self.metrics.add_read_bytes(read_bytes);
+            self.metrics.add_key_read_bytes(size_of::<Height>() as u64);
+            Some(Bytes::copy_from_slice(&bytes))
+        } else {
+            self.metrics.observe_read_time(start.elapsed());
+            None
+        };
+
+        Ok(result)
     }
 }
 
@@ -516,5 +561,22 @@ impl Store {
     ) -> Result<(), StoreError> {
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || db.insert_decided_block_data(height, data)).await?
+    }
+
+    pub async fn store_decided_block_header(
+        &self,
+        height: Height,
+        header: Bytes,
+    ) -> Result<(), StoreError> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || db.insert_decided_block_header(height, header)).await?
+    }
+
+    pub async fn get_decided_block_header(
+        &self,
+        height: Height,
+    ) -> Result<Option<Bytes>, StoreError> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || db.get_decided_block_header(height)).await?
     }
 }
