@@ -223,7 +223,7 @@ impl EngineRPC {
         self.rpc_request(ENGINE_NEW_PAYLOAD_V4, params, ENGINE_NEW_PAYLOAD_TIMEOUT)
             .await
     }
-    
+
     pub async fn get_payload_bodies_by_hash(
         &self,
         block_hashes: Vec<BlockHash>,
@@ -242,8 +242,8 @@ impl EngineRPC {
         start: u64,
         count: u64,
     ) -> eyre::Result<Vec<Option<crate::json_structures::ExecutionPayloadBodyV1>>> {
-        let start_hex = format!("0x{:x}", start);
-        let count_hex = format!("0x{:x}", count);
+        let start_hex = format!("0x{start:x}");
+        let count_hex = format!("0x{count:x}");
         let params = json!([start_hex, count_hex]);
         self.rpc_request(
             ENGINE_GET_PAYLOAD_BODIES_BY_RANGE_V1,
@@ -252,5 +252,4 @@ impl EngineRPC {
         )
         .await
     }
-
 }

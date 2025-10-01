@@ -353,17 +353,19 @@ pub async fn run(
                 };
 
                 // Store the synced value and block data concurrently
-                let store_proposal = state.store.store_undecided_proposal(proposed_value.clone());
-                let store_block =
-                    state
-                        .store
-                        .store_undecided_block_data(height, round, block_bytes);
-
-                if let Err(e) = store_proposal.await {
+                if let Err(e) = state
+                    .store
+                    .store_undecided_proposal(proposed_value.clone())
+                    .await
+                {
                     error!(%height, %round, error = %e, "Failed to store synced value");
                 }
 
-                if let Err(e) = store_block.await {
+                if let Err(e) = state
+                    .store
+                    .store_undecided_block_data(height, round, block_bytes)
+                    .await
+                {
                     error!(%height, %round, error = %e, "Failed to store synced block data");
                 }
 

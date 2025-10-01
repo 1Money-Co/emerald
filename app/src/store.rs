@@ -283,13 +283,11 @@ impl Db {
             }
 
             let mut decided = tx.open_table(DECIDED_VALUES_TABLE)?;
-            let mut certificates = tx.open_table(CERTIFICATES_TABLE)?;
             let mut decided_block_data = tx.open_table(DECIDED_BLOCK_DATA_TABLE)?;
 
             let keys = self.height_range(&decided, ..retain_height)?;
             for key in &keys {
                 decided.remove(key)?;
-                certificates.remove(key)?;
                 decided_block_data.remove(key)?;
             }
 
