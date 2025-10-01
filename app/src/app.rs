@@ -318,7 +318,7 @@ pub async fn run(
                     .await
                 {
                     Ok(payload_status) => {
-                        if payload_status.status.is_invalid() {
+                        if !payload_status.status.is_valid() {
                             error!(%height, %round, "🔴 Synced block validation failed: invalid payload status: {}", payload_status.status);
                             // Reject invalid blocks - don't store or reply with them
                             if reply
@@ -334,7 +334,7 @@ pub async fn run(
                             {
                                 error!("Failed to send ProcessSyncedValue rejection reply");
                             }
-                            return Ok(()); // Continue processing other messages
+                            continue;
                         }
                         debug!(
                             "💡 Sync block validated at height {} with hash: {}",
