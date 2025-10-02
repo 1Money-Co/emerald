@@ -6,12 +6,14 @@ use color_eyre::eyre;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use sha3::Digest;
+use ssz::{Decode, Encode};
 use tokio::time::Instant;
 use tracing::{debug, error, info};
 
 use malachitebft_app_channel::app::streaming::{StreamContent, StreamId, StreamMessage};
 use malachitebft_app_channel::app::types::codec::Codec;
 use malachitebft_app_channel::app::types::core::{CommitCertificate, Round, Validity};
+use malachitebft_app_channel::app::types::sync::RawDecidedValue;
 use malachitebft_app_channel::app::types::{LocallyProposedValue, PeerId, ProposedValue};
 
 use malachitebft_eth_engine::json_structures::ExecutionBlock;
@@ -113,10 +115,18 @@ impl State {
         }
     }
 
-    /// Returns the earliest height available in the state
+    /// Returns the earliest height available via EL
     pub async fn get_earliest_height(&self) -> Height {
         self.store
             .min_decided_value_height()
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Returns the earliest height available in the state
+    pub async fn get_earliest_unpruned_height(&self) -> Height {
+        self.store
+            .min_unpruned_decided_value_height()
             .await
             .unwrap_or_default()
     }
@@ -175,14 +185,20 @@ impl State {
 
         // Store the proposal and its data
         self.store.store_undecided_proposal(value.clone()).await?;
-        self.store_undecided_proposal_data(data).await?;
+        self.store_undecided_proposal_data(value.height, value.round, data)
+            .await?;
 
         Ok(Some(value))
     }
 
-    pub async fn store_undecided_proposal_data(&mut self, data: Bytes) -> eyre::Result<()> {
+    pub async fn store_undecided_proposal_data(
+        &mut self,
+        height: Height,
+        round: Round,
+        data: Bytes,
+    ) -> eyre::Result<()> {
         self.store
-            .store_undecided_block_data(self.current_height, self.current_round, data)
+            .store_undecided_block_data(height, round, data)
             .await
             .map_err(|e| eyre::Report::new(e))
     }
@@ -190,6 +206,97 @@ impl State {
     /// Retrieves a decided block at the given height
     pub async fn get_decided_value(&self, height: Height) -> Option<DecidedValue> {
         self.store.get_decided_value(height).await.ok().flatten()
+    }
+
+    /// Retrieves a decided value for sync, attempting reconstruction from EL if pruned
+    pub async fn get_decided_value_for_sync(
+        &self,
+        height: Height,
+        engine: &malachitebft_eth_engine::engine::Engine,
+    ) -> Option<malachitebft_app_channel::app::types::sync::RawDecidedValue<MalakethContext>> {
+        let earliest_unpruned_height = self.get_earliest_unpruned_height().await;
+
+        // Check if height is in unpruned decided values table
+        if height >= earliest_unpruned_height {
+            // Height is in our decided values table - get it directly from store
+            info!(%height, earliest_unpruned_height = %earliest_unpruned_height, "Getting decided value from local storage");
+            let decided_value = self.get_decided_value(height).await?;
+
+            Some(RawDecidedValue {
+                certificate: decided_value.certificate,
+                value_bytes: ProtobufCodec.encode(&decided_value.value).unwrap(),
+            })
+        } else {
+            // Height has been pruned from decided values
+            // Try to reconstruct from header + PayloadBody
+            info!(%height, %earliest_unpruned_height, "Height pruned from storage, reconstructing from block header + EL");
+
+            // Get certificate and block header
+            let (certificate, header_bytes) =
+                match self.store.get_certificate_and_header(height).await {
+                    Ok(Some((cert, header))) => (cert, header),
+                    Ok(None) => {
+                        error!(%height, "Certificate or block header not found for pruned height");
+                        return None;
+                    }
+                    Err(e) => {
+                        error!(%height, error = %e, "Failed to get certificate and header");
+                        return None;
+                    }
+                };
+
+            let header =
+                match alloy_rpc_types_engine::ExecutionPayloadV3::from_ssz_bytes(&header_bytes) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        error!(%height, error = ?e, "Failed to deserialize block header");
+                        return None;
+                    }
+                };
+
+            let block_number = header.payload_inner.payload_inner.block_number;
+
+            // Request payload body from EL
+            let bodies = match engine.get_payload_bodies_by_range(block_number, 1).await {
+                Ok(b) => b,
+                Err(e) => {
+                    error!(%height, block_number, error = %e, "Failed to get payload body from EL");
+                    return None;
+                }
+            };
+
+            if bodies.is_empty() {
+                // Empty array means requested range is beyond latest known block
+                error!(%height, block_number, "EL returned empty array - block beyond latest known");
+                return None;
+            }
+
+            let body = match bodies.first() {
+                Some(Some(body)) => body,
+                Some(None) => {
+                    // Body is null - block unavailable (pruned or not downloaded by EL)
+                    error!(%height, block_number, "EL returned null - block pruned or unavailable");
+                    return None;
+                }
+                None => {
+                    error!(%height, block_number, "EL returned unexpected empty response");
+                    return None;
+                }
+            };
+
+            info!(%height, block_number, "Successfully retrieved payload body from EL");
+
+            let full_payload = reconstruct_execution_payload(header, body.clone());
+            let payload_bytes = Bytes::from(full_payload.as_ssz_bytes());
+
+            // Create Value from payload bytes
+            let value = Value::new(payload_bytes);
+
+            Some(RawDecidedValue {
+                certificate,
+                value_bytes: ProtobufCodec.encode(&value).unwrap(),
+            })
+        }
     }
 
     /// Retrieves a decided block data at the given height
@@ -234,7 +341,7 @@ impl State {
         };
 
         self.store
-            .store_decided_value(&certificate, proposal.value)
+            .store_decided_value(&certificate, proposal.value, block_header_bytes)
             .await?;
 
         // Store block data for decided value
@@ -250,11 +357,6 @@ impl State {
             }
         }
 
-        // Store block header (passed from caller to avoid re-deserialization)
-        self.store
-            .store_decided_block_header(certificate.height, block_header_bytes)
-            .await?;
-
         if let Some(data) = block_data {
             self.store
                 .store_decided_block_data(certificate.height, data)
@@ -262,7 +364,7 @@ impl State {
         }
 
         // Prune the store, keep the last 5 heights
-        let retain_height = Height::new(certificate.height.as_u64().saturating_sub(10000));
+        let retain_height = Height::new(certificate.height.as_u64().saturating_sub(5));
         self.store.prune(retain_height).await?;
 
         // Move to next height
@@ -540,5 +642,40 @@ pub fn extract_block_header(
         },
         blob_gas_used: payload.blob_gas_used,
         excess_blob_gas: payload.excess_blob_gas,
+    }
+}
+
+/// Reconstructs a complete ExecutionPayloadV3 from a block header and payload body.
+///
+/// Takes a header (ExecutionPayloadV3 with empty transactions/withdrawals) and combines it
+/// with the transactions and withdrawals from an ExecutionPayloadBodyV1 to create a full payload.
+pub fn reconstruct_execution_payload(
+    header: alloy_rpc_types_engine::ExecutionPayloadV3,
+    body: malachitebft_eth_engine::json_structures::ExecutionPayloadBodyV1,
+) -> alloy_rpc_types_engine::ExecutionPayloadV3 {
+    use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3};
+
+    ExecutionPayloadV3 {
+        payload_inner: ExecutionPayloadV2 {
+            payload_inner: ExecutionPayloadV1 {
+                parent_hash: header.payload_inner.payload_inner.parent_hash,
+                fee_recipient: header.payload_inner.payload_inner.fee_recipient,
+                state_root: header.payload_inner.payload_inner.state_root,
+                receipts_root: header.payload_inner.payload_inner.receipts_root,
+                logs_bloom: header.payload_inner.payload_inner.logs_bloom,
+                prev_randao: header.payload_inner.payload_inner.prev_randao,
+                block_number: header.payload_inner.payload_inner.block_number,
+                gas_limit: header.payload_inner.payload_inner.gas_limit,
+                gas_used: header.payload_inner.payload_inner.gas_used,
+                timestamp: header.payload_inner.payload_inner.timestamp,
+                extra_data: header.payload_inner.payload_inner.extra_data,
+                base_fee_per_gas: header.payload_inner.payload_inner.base_fee_per_gas,
+                block_hash: header.payload_inner.payload_inner.block_hash,
+                transactions: body.transactions,
+            },
+            withdrawals: body.withdrawals.unwrap_or_default(),
+        },
+        blob_gas_used: header.blob_gas_used,
+        excess_blob_gas: header.excess_blob_gas,
     }
 }

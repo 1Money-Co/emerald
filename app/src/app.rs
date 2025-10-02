@@ -6,15 +6,12 @@ use tracing::{debug, error, info};
 use alloy_rpc_types_engine::ExecutionPayloadV3;
 use malachitebft_app_channel::app::engine::host::Next;
 use malachitebft_app_channel::app::streaming::StreamContent;
-use malachitebft_app_channel::app::types::codec::Codec;
 use malachitebft_app_channel::app::types::core::{Round, Validity};
-use malachitebft_app_channel::app::types::sync::RawDecidedValue;
 use malachitebft_app_channel::app::types::{LocallyProposedValue, ProposedValue};
 use malachitebft_app_channel::{AppMsg, Channels, NetworkMsg};
 
 use malachitebft_eth_engine::engine::Engine;
 use malachitebft_eth_engine::json_structures::ExecutionBlock;
-use malachitebft_eth_types::codec::proto::ProtobufCodec;
 use malachitebft_eth_types::{Block, BlockHash, MalakethContext};
 
 use crate::state::{decode_value, extract_block_header, State};
@@ -67,9 +64,21 @@ pub async fn run(
                 state.current_proposer = Some(proposer);
 
                 // TODO: Add pending parts validation
-                // For now, send empty proposals list to consensus
-                let proposals: Vec<ProposedValue<MalakethContext>> = Vec::new();
-                info!(%height, %round, "Found {} undecided proposals", proposals.len());
+                // Try to get undecided proposals from storage, or use empty vector
+                let proposals: Vec<ProposedValue<MalakethContext>> = state
+                    .store
+                    .get_undecided_proposal(height, round)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|proposal| vec![proposal])
+                    .unwrap_or_else(Vec::new);
+
+                if proposals.is_empty() {
+                    info!(%height, %round, "📭 Found 0 undecided proposals");
+                } else {
+                    info!(%height, %round, "📬 Found {} undecided proposals", proposals.len());
+                }
 
                 if reply_value.send(proposals).is_err() {
                     error!("Failed to send undecided proposals");
@@ -104,9 +113,11 @@ pub async fn run(
                 let proposal: LocallyProposedValue<MalakethContext> =
                     state.propose_value(height, round, bytes.clone()).await?;
 
-                // When the node is not the proposer, store the block data,
+                // Store the block data at the proposal's height/round,
                 // which will be passed to the execution client (EL) on commit.
-                state.store_undecided_proposal_data(bytes.clone()).await?;
+                state
+                    .store_undecided_proposal_data(height, round, bytes.clone())
+                    .await?;
 
                 // Send it to consensus
                 if reply.send(proposal.clone()).is_err() {
@@ -386,12 +397,17 @@ pub async fn run(
             // and send it to consensus.
             AppMsg::GetDecidedValue { height, reply } => {
                 info!(%height, "🟢🟢 GetDecidedValue");
-                let decided_value = state.get_decided_value(height).await;
 
-                let raw_decided_value = decided_value.map(|decided_value| RawDecidedValue {
-                    certificate: decided_value.certificate,
-                    value_bytes: ProtobufCodec.encode(&decided_value.value).unwrap(),
-                });
+                let earliest_height_available = state.get_earliest_height().await;
+                // Check if requested height is beyond our current height
+                let raw_decided_value = if height >= state.current_height
+                    || height < earliest_height_available
+                {
+                    info!(%height, current_height = %state.current_height, "Requested height is >= current height");
+                    None
+                } else {
+                    state.get_decided_value_for_sync(height, &engine).await
+                };
 
                 if reply.send(raw_decided_value).is_err() {
                     error!("Failed to send GetDecidedValue reply");
