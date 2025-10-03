@@ -312,5 +312,6 @@ fn generate_distributed_config(
         logging,
         runtime,
         test: TestConfig::default(),
+        host: HostConfig::default(),
     }
 }

@@ -9,6 +9,35 @@ pub use malachitebft_config::{
     Selector, TestConfig, TimeoutConfig, TransportProtocol, ValuePayload, ValueSyncConfig,
 };
 
+/// Malaketh-layered configuration
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HostConfig {
+    /// Maximum time to wait for execution client to sync before crashing
+    #[serde(default = "default_sync_timeout")]
+    pub sync_timeout_ms: u64,
+
+    /// Initial retry delay for execution client sync validation
+    #[serde(default = "default_sync_initial_delay")]
+    pub sync_initial_delay_ms: u64,
+}
+
+impl Default for HostConfig {
+    fn default() -> Self {
+        Self {
+            sync_timeout_ms: default_sync_timeout(),
+            sync_initial_delay_ms: default_sync_initial_delay(),
+        }
+    }
+}
+
+fn default_sync_timeout() -> u64 {
+    30000 // 30 seconds
+}
+
+fn default_sync_initial_delay() -> u64 {
+    100 // 100 ms
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     /// A custom human-readable name for this node
@@ -34,6 +63,9 @@ pub struct Config {
 
     /// Test configuration options
     pub test: TestConfig,
+
+    /// Host application configuration
+    pub host: HostConfig,
 }
 
 impl NodeConfig for Config {

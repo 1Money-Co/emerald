@@ -160,5 +160,6 @@ pub fn generate_config(
         logging,
         runtime,
         test: TestConfig::default(),
+        host: HostConfig::default(),
     }
 }
