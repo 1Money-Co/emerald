@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use color_eyre::eyre::{self, eyre};
-use malachitebft_eth_cli::config::HostConfig;
+use malachitebft_eth_cli::config::{MalakethConfig};
 use ssz::{Decode, Encode};
 use std::time::Duration;
 use tracing::{debug, error, info};
@@ -23,7 +23,7 @@ pub async fn run(
     state: &mut State,
     channels: &mut Channels<MalakethContext>,
     engine: Engine,
-    host_config: HostConfig,
+    malaketh_config: MalakethConfig,
 ) -> eyre::Result<()> {
     while let Some(msg) = channels.consensus.recv().await {
         match msg {
@@ -330,8 +330,8 @@ pub async fn run(
                     &engine,
                     &execution_payload,
                     &versioned_hashes,
-                    Duration::from_millis(host_config.sync_timeout_ms),
-                    Duration::from_millis(host_config.sync_initial_delay_ms),
+                    Duration::from_millis( malaketh_config.sync_timeout_ms),
+                    Duration::from_millis(malaketh_config.sync_initial_delay_ms),
                     height,
                     round,
                 )

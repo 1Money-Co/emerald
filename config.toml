@@ -1,0 +1,9 @@
+# This is an example configuration for Malaketh. It is meant to be
+# used as a reference.
+
+# Moniker prefix used when creating the Malachite configuration file
+moniker = "test-0"
+
+# Sync timeout parameters
+sync_timeout_ms = 10000
+sync_initial_delay_ms = 100

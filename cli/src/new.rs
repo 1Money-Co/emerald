@@ -10,7 +10,6 @@ use rand::{seq::IteratorRandom, Rng, SeedableRng};
 use crate::config::*;
 use malachitebft_app::node::{CanGeneratePrivateKey, CanMakeGenesis, Node};
 use malachitebft_core_types::{PrivateKey, PublicKey};
-
 const MIN_VOTING_POWER: u64 = 1;
 const MAX_VOTING_POWER: u64 = 1;
 
@@ -77,13 +76,13 @@ pub fn generate_config(
     ephemeral_connection_timeout_ms: u64,
     transport: TransportProtocol,
     logging: LoggingConfig,
+    malaketh_config: MalakethConfig,
 ) -> Config {
     let consensus_port = CONSENSUS_BASE_PORT + index;
     let mempool_port = MEMPOOL_BASE_PORT + index;
     let metrics_port = METRICS_BASE_PORT + index;
 
     Config {
-        moniker: format!("test-{index}"),
         consensus: ConsensusConfig {
             timeouts: TimeoutConfig::default(),
             p2p: P2pConfig {
@@ -160,6 +159,6 @@ pub fn generate_config(
         logging,
         runtime,
         test: TestConfig::default(),
-        host: HostConfig::default(),
+        malaketh: new_malaketh_config(malaketh_config.moniker, malaketh_config.sync_timeout_ms, malaketh_config.sync_initial_delay_ms),
     }
 }

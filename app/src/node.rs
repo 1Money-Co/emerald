@@ -115,7 +115,7 @@ impl Node for App {
 
     async fn start(&self) -> eyre::Result<Handle> {
         let config = self.load_config()?;
-        let span = tracing::error_span!("node", moniker = %config.moniker);
+        let span = tracing::error_span!("node", moniker = %config.malaketh.moniker);
         let _enter = span.enter();
 
         let private_key_file = self.load_private_key_file()?;
@@ -143,7 +143,7 @@ impl Node for App {
 
         let tx_event = channels.events.clone();
 
-        let registry = SharedRegistry::global().with_moniker(&self.config.moniker);
+        let registry = SharedRegistry::global().with_moniker(&self.config.malaketh.moniker);
         let metrics = DbMetrics::register(&registry);
 
         if config.metrics.enabled {
@@ -157,7 +157,7 @@ impl Node for App {
         let engine: Engine = {
             // TODO: make EL host, EL port, and jwt secret configurable
             let engine_url: Url = {
-                let engine_port = match config.moniker.as_str() {
+                let engine_port = match config.malaketh.moniker.as_str() {
                     "test-0" => 8551,
                     "test-1" => 18551,
                     "test-2" => 28551,
@@ -168,7 +168,7 @@ impl Node for App {
             };
             let jwt_path = PathBuf::from_str("./assets/jwtsecret")?; // Should be the same secret used by the execution client.
             let eth_url: Url = {
-                let eth_port = match config.moniker.as_str() {
+                let eth_port = match config.malaketh.moniker.as_str() {
                     "test-0" => 8545,
                     "test-1" => 18545,
                     "test-2" => 28545,
@@ -184,7 +184,7 @@ impl Node for App {
         };
 
         let app_handle = tokio::spawn(async move {
-            if let Err(e) = crate::app::run(&mut state, &mut channels, engine, config.host).await {
+            if let Err(e) = crate::app::run(&mut state, &mut channels, engine, config.malaketh).await {
                 tracing::error!(%e, "Application error");
             }
         });

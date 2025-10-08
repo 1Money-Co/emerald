@@ -9,9 +9,11 @@ pub use malachitebft_config::{
     Selector, TestConfig, TimeoutConfig, TransportProtocol, ValuePayload, ValueSyncConfig,
 };
 
-/// Malaketh-layered configuration
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct HostConfig {
+pub struct MalakethConfig {
+    /// A custom human-readable name for this node
+    pub moniker: String,
+
     /// Maximum time to wait for execution client to sync before crashing
     #[serde(default = "default_sync_timeout")]
     pub sync_timeout_ms: u64,
@@ -21,9 +23,10 @@ pub struct HostConfig {
     pub sync_initial_delay_ms: u64,
 }
 
-impl Default for HostConfig {
+impl Default for MalakethConfig {
     fn default() -> Self {
         Self {
+            moniker: "malaketh-node".to_string(),
             sync_timeout_ms: default_sync_timeout(),
             sync_initial_delay_ms: default_sync_initial_delay(),
         }
@@ -38,10 +41,16 @@ fn default_sync_initial_delay() -> u64 {
     100 // 100 ms
 }
 
+pub fn new_malaketh_config(moniker: String, sync_timeout_ms: u64, sync_initial_delay_ms: u64) -> MalakethConfig {
+    MalakethConfig {
+        moniker,
+        sync_timeout_ms,
+        sync_initial_delay_ms,
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Config {
-    /// A custom human-readable name for this node
-    pub moniker: String,
 
     /// Consensus configuration options
     pub consensus: ConsensusConfig,
@@ -65,12 +74,12 @@ pub struct Config {
     pub test: TestConfig,
 
     /// Host application configuration
-    pub host: HostConfig,
+    pub malaketh: MalakethConfig,
 }
 
 impl NodeConfig for Config {
     fn moniker(&self) -> &str {
-        &self.moniker
+        &self.malaketh.moniker
     }
 
     fn consensus(&self) -> &ConsensusConfig {
