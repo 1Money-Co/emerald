@@ -343,6 +343,10 @@ fn generate_distributed_config(
         logging,
         runtime,
         test: TestConfig::default(),
-        malaketh: new_malaketh_config(malaketh_config.moniker, malaketh_config.sync_timeout_ms, malaketh_config.sync_initial_delay_ms),
+        malaketh: new_malaketh_config(
+            malaketh_config.moniker,
+            malaketh_config.sync_timeout_ms,
+            malaketh_config.sync_initial_delay_ms,
+        ),
     }
 }

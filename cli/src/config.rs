@@ -41,7 +41,11 @@ fn default_sync_initial_delay() -> u64 {
     100 // 100 ms
 }
 
-pub fn new_malaketh_config(moniker: String, sync_timeout_ms: u64, sync_initial_delay_ms: u64) -> MalakethConfig {
+pub fn new_malaketh_config(
+    moniker: String,
+    sync_timeout_ms: u64,
+    sync_initial_delay_ms: u64,
+) -> MalakethConfig {
     MalakethConfig {
         moniker,
         sync_timeout_ms,
@@ -51,7 +55,6 @@ pub fn new_malaketh_config(moniker: String, sync_timeout_ms: u64, sync_initial_d
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Config {
-
     /// Consensus configuration options
     pub consensus: ConsensusConfig,
 
