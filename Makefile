@@ -22,6 +22,7 @@ stop:
 	docker compose down
 
 clean: clean-prometheus
+	rm -rf ./.testnet
 	rm -rf ./assets/genesis.json
 	rm -rf ./nodes
 	rm -rf ./rethdata
