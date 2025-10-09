@@ -1,5 +1,4 @@
 use color_eyre::eyre::{eyre, Result};
-use malachitebft_eth_cli::config::MalakethConfig;
 use malachitebft_eth_cli::error::Error;
 use std::fs;
 use tracing::{info, trace};
@@ -56,6 +55,7 @@ fn main() -> Result<()> {
         Commands::Start(cmd) => start(&args, cmd, logging),
         Commands::Init(cmd) => init(&args, cmd, logging),
         Commands::Testnet(cmd) => testnet(&args, cmd, logging),
+        Commands::ShowPubkey(cmd) => cmd.run(),
         _ => unimplemented!(),
     }
 }
@@ -94,9 +94,9 @@ fn start(args: &Args, cmd: &StartCmd, logging: config::LoggingConfig) -> Result<
         config,
         home_dir: args.get_home_dir()?,
         genesis_file: args.get_genesis_file_path()?,
+        malaketh_config_file: args.get_malaketch_config_file()?,
         private_key_file: args.get_priv_validator_key_file_path()?,
         start_height: cmd.start_height.map(Height::new),
-        malaketh_config: malaketh_config,
     };
 
     // Start the node
@@ -110,9 +110,9 @@ fn init(args: &Args, cmd: &InitCmd, logging: config::LoggingConfig) -> Result<()
         config: Default::default(), // There is not existing configuration yet
         home_dir: args.get_home_dir()?,
         genesis_file: args.get_genesis_file_path()?,
+        malaketh_config_file: args.get_malaketch_config_file()?,
         private_key_file: args.get_priv_validator_key_file_path()?,
         start_height: Some(Height::new(1)), // We always start at height 1
-        malaketh_config: MalakethConfig::default(), // There is not existing configuration yet
     };
 
     cmd.run(
@@ -132,16 +132,11 @@ fn testnet(args: &Args, cmd: &TestnetCmd, logging: config::LoggingConfig) -> Res
         config: Default::default(), // There is not existing configuration yet
         home_dir: args.get_home_dir()?,
         genesis_file: args.get_genesis_file_path()?,
+        malaketh_config_file: args.get_malaketch_config_file()?,
         private_key_file: args.get_priv_validator_key_file_path()?,
         start_height: Some(Height::new(1)), // We always start at height 1
-        malaketh_config: MalakethConfig::default(), // This configuration will NOT be overwritten, but malaketh config file will be loaded, and moniker from config will be set
     };
 
-    cmd.run(
-        &app,
-        &args.get_home_dir()?,
-        &args.get_malaketch_config_dir()?,
-        logging,
-    )
-    .map_err(|error| eyre!("Failed to run testnet command {:?}", error))
+    cmd.run(&app, &args.get_home_dir()?, logging)
+        .map_err(|error| eyre!("Failed to run testnet command {:?}", error))
 }

@@ -1,7 +1,7 @@
 use color_eyre::eyre;
 use malachitebft_app::node::NodeConfig;
 use serde::{Deserialize, Serialize};
-use std::{path::Path};
+use std::path::Path;
 
 pub use malachitebft_config::{
     BootstrapProtocol, ConsensusConfig, DiscoveryConfig, LoggingConfig, MempoolConfig,
@@ -31,6 +31,10 @@ pub struct MalakethConfig {
     /// A custom human-readable name for this node
     pub moniker: String,
 
+    pub execution_authrpc_address: String,
+    pub engine_authrpc_address: String,
+    pub jwt_token_path: String,
+
     /// Maximum time to wait for execution client to sync before crashing
     #[serde(default = "default_sync_timeout")]
     pub sync_timeout_ms: u64,
@@ -52,16 +56,6 @@ fn default_sync_initial_delay() -> u64 {
     100
 }
 
-impl Default for MalakethConfig {
-    fn default() -> Self {
-        MalakethConfig {
-            moniker: "malaketh-node".to_string(),
-            sync_timeout_ms: default_sync_timeout(),
-            sync_initial_delay_ms: default_sync_initial_delay(),
-            el_node_type: ElNodeType::Archive, // Default to archive node
-        }
-    }
-}
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     /// A custom human-readable name for this node
