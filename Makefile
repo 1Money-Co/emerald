@@ -9,7 +9,7 @@ all: clean build
 	bash scripts/spawn.bash --nodes 3 --home nodes --no-delay
 
 sync: clean build
-	./scripts/generate_testnet_config.sh --nodes 3 --testnet-config-dir .testnet
+	./scripts/generate_testnet_config.sh --nodes 4 --testnet-config-dir .testnet
 	cargo run --bin malachitebft-eth-app -- testnet --home nodes --testnet-config .testnet/testnet_config.toml
 	ls nodes/*/config/priv_validator_key.json | xargs -I{} cargo run --bin malachitebft-eth-app show-pubkey {} > nodes/validator_public_keys.txt
 	cargo run --bin malachitebft-eth-utils genesis --public-keys-file ./nodes/validator_public_keys.txt

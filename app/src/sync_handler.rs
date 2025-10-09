@@ -91,9 +91,17 @@ pub async fn get_decided_value_for_sync(
         info!(%height, earliest_unpruned_height = %earliest_unpruned_height, "Getting decided value from local storage");
         let decided_value = store.get_decided_value(height).await.ok()??;
 
+        let value_bytes = match ProtobufCodec.encode(&decided_value.value) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!(%height, error = %e, "Failed to encode decided value");
+                return None;
+            }
+        };
+
         Some(RawDecidedValue {
             certificate: decided_value.certificate,
-            value_bytes: ProtobufCodec.encode(&decided_value.value).unwrap(),
+            value_bytes,
         })
     } else {
         // Height has been pruned from decided values - try to reconstruct from header + EL
@@ -161,9 +169,17 @@ pub async fn get_decided_value_for_sync(
         // Create Value from payload bytes
         let value = Value::new(payload_bytes);
 
+        let value_bytes = match ProtobufCodec.encode(&value) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!(%height, error = %e, "Failed to encode decided value");
+                return None;
+            }
+        };
+
         Some(RawDecidedValue {
-            certificate,
-            value_bytes: ProtobufCodec.encode(&value).unwrap(),
+            certificate: certificate,
+            value_bytes,
         })
     }
 }
