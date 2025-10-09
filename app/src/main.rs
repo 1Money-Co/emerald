@@ -1,6 +1,7 @@
-//! Example application using channels
-
 use color_eyre::eyre::{eyre, Result};
+use malachitebft_eth_cli::config::MalakethConfig;
+use malachitebft_eth_cli::error::Error;
+use std::fs;
 use tracing::{info, trace};
 
 use malachitebft_app_channel::app::node::Node;
@@ -70,6 +71,15 @@ fn start(args: &Args, cmd: &StartCmd, logging: config::LoggingConfig) -> Result<
 
     config.logging = logging;
 
+    let malaketh_config_file = &args.get_malaketch_config_file()?;
+    let malaketh_config_content = fs::read_to_string(malaketh_config_file)
+        .map_err(|e| Error::LoadFile(malaketh_config_file.to_path_buf(), e))?;
+    let malaketh_config = toml::from_str::<crate::config::MalakethConfig>(&malaketh_config_content)
+        .map_err(Error::FromTOML)?;
+
+    info!(file = %malaketh_config_file.display(), "Loaded Malaketh configuration");
+    info!(?malaketh_config, "Malaketh configuration");
+
     let rt = runtime::build_runtime(config.runtime)?;
 
     info!(
@@ -86,6 +96,7 @@ fn start(args: &Args, cmd: &StartCmd, logging: config::LoggingConfig) -> Result<
         genesis_file: args.get_genesis_file_path()?,
         private_key_file: args.get_priv_validator_key_file_path()?,
         start_height: cmd.start_height.map(Height::new),
+        malaketh_config: malaketh_config,
     };
 
     // Start the node
@@ -101,6 +112,7 @@ fn init(args: &Args, cmd: &InitCmd, logging: config::LoggingConfig) -> Result<()
         genesis_file: args.get_genesis_file_path()?,
         private_key_file: args.get_priv_validator_key_file_path()?,
         start_height: Some(Height::new(1)), // We always start at height 1
+        malaketh_config: MalakethConfig::default(), // There is not existing configuration yet
     };
 
     cmd.run(
@@ -122,6 +134,7 @@ fn testnet(args: &Args, cmd: &TestnetCmd, logging: config::LoggingConfig) -> Res
         genesis_file: args.get_genesis_file_path()?,
         private_key_file: args.get_priv_validator_key_file_path()?,
         start_height: Some(Height::new(1)), // We always start at height 1
+        malaketh_config: MalakethConfig::default(), // This configuration will NOT be overwritten, but malaketh config file will be loaded, and moniker from config will be set
     };
 
     cmd.run(

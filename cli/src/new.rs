@@ -83,6 +83,7 @@ pub fn generate_config(
     let metrics_port = METRICS_BASE_PORT + index;
 
     Config {
+        moniker: malaketh_config.moniker,
         consensus: ConsensusConfig {
             timeouts: TimeoutConfig::default(),
             p2p: P2pConfig {
@@ -159,10 +160,5 @@ pub fn generate_config(
         logging,
         runtime,
         test: TestConfig::default(),
-        malaketh: new_malaketh_config(
-            malaketh_config.moniker,
-            malaketh_config.sync_timeout_ms,
-            malaketh_config.sync_initial_delay_ms,
-        ),
     }
 }

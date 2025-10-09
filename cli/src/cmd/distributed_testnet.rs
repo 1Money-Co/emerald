@@ -257,6 +257,7 @@ fn generate_distributed_config(
     let metrics_port = METRICS_BASE_PORT + (index / machines.len());
 
     Config {
+        moniker: malaketh_config.moniker.clone(),
         consensus: ConsensusConfig {
             timeouts: TimeoutConfig::default(),
             p2p: P2pConfig {
@@ -343,10 +344,5 @@ fn generate_distributed_config(
         logging,
         runtime,
         test: TestConfig::default(),
-        malaketh: new_malaketh_config(
-            malaketh_config.moniker,
-            malaketh_config.sync_timeout_ms,
-            malaketh_config.sync_initial_delay_ms,
-        ),
     }
 }

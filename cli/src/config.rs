@@ -1,13 +1,30 @@
 use color_eyre::eyre;
 use malachitebft_app::node::NodeConfig;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::{path::Path};
 
 pub use malachitebft_config::{
     BootstrapProtocol, ConsensusConfig, DiscoveryConfig, LoggingConfig, MempoolConfig,
     MempoolLoadConfig, MetricsConfig, P2pConfig, PubSubProtocol, RuntimeConfig, ScoringStrategy,
     Selector, TestConfig, TimeoutConfig, TransportProtocol, ValuePayload, ValueSyncConfig,
 };
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ElNodeType {
+    /// No pruning - keeps all historical data
+    Archive,
+    /// Standard pruning - keeps recent data based on distance
+    Full,
+    /// Custom pruning configuration
+    Custom,
+}
+
+impl Default for ElNodeType {
+    fn default() -> Self {
+        ElNodeType::Archive
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MalakethConfig {
@@ -21,40 +38,35 @@ pub struct MalakethConfig {
     /// Initial retry delay for execution client sync validation
     #[serde(default = "default_sync_initial_delay")]
     pub sync_initial_delay_ms: u64,
+
+    /// Type of execution layer node (archive, full, or custom)
+    #[serde(default)]
+    pub el_node_type: ElNodeType,
+}
+
+fn default_sync_timeout() -> u64 {
+    10000
+}
+
+fn default_sync_initial_delay() -> u64 {
+    100
 }
 
 impl Default for MalakethConfig {
     fn default() -> Self {
-        Self {
+        MalakethConfig {
             moniker: "malaketh-node".to_string(),
             sync_timeout_ms: default_sync_timeout(),
             sync_initial_delay_ms: default_sync_initial_delay(),
+            el_node_type: ElNodeType::Archive, // Default to archive node
         }
     }
 }
-
-fn default_sync_timeout() -> u64 {
-    30000 // 30 seconds
-}
-
-fn default_sync_initial_delay() -> u64 {
-    100 // 100 ms
-}
-
-pub fn new_malaketh_config(
-    moniker: String,
-    sync_timeout_ms: u64,
-    sync_initial_delay_ms: u64,
-) -> MalakethConfig {
-    MalakethConfig {
-        moniker,
-        sync_timeout_ms,
-        sync_initial_delay_ms,
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Config {
+    /// A custom human-readable name for this node
+    pub moniker: String,
+
     /// Consensus configuration options
     pub consensus: ConsensusConfig,
 
@@ -75,14 +87,11 @@ pub struct Config {
 
     /// Test configuration options
     pub test: TestConfig,
-
-    /// Host application configuration
-    pub malaketh: MalakethConfig,
 }
 
 impl NodeConfig for Config {
     fn moniker(&self) -> &str {
-        &self.malaketh.moniker
+        &self.moniker
     }
 
     fn consensus(&self) -> &ConsensusConfig {
