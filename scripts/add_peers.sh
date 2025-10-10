@@ -11,12 +11,15 @@ while [[ "$#" -gt 0 ]]; do
     shift
 done
 
-# Get IPs and enodes for all nodes
-for PORT in 8545 18545 28545; do
+PORT=8545
+PORT_INCREMENT=10000
+
+for _ in {0..NODES_COUNT-1}; do
     echo "Waiting for Reth node on port ${PORT} to be ready..."
-    until cast rpc --rpc-url 127.0.0.1:${PORT} net_listening > /dev/null 2>&1; do
+    until cast rpc --rpc-url "127.0.0.1:${PORT}" net_listening > /dev/null 2>&1; do
         sleep 1
     done
+    PORT=$((PORT + PORT_INCREMENT))
 done
 
 RETH0_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' reth0)
