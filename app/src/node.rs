@@ -185,16 +185,7 @@ impl Node for App {
             )
         };
 
-        let malaketh_config = {
-            let file_content = fs::read_to_string(&self.malaketh_config_file).map_err(|e| {
-                eyre::eyre!(
-                    "Failed to read malaketh config file `{}`: {e}",
-                    self.malaketh_config_file.display()
-                )
-            })?;
-            toml::from_str::<crate::config::MalakethConfig>(&file_content)
-                .map_err(|e| eyre::eyre!("Failed to parse malaketh config file: {e}"))?
-        };
+        let malaketh_config = self.load_malaketh_config()?;
 
         let app_handle = tokio::spawn(async move {
             if let Err(e) =
