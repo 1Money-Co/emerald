@@ -178,7 +178,7 @@ pub async fn get_decided_value_for_sync(
         };
 
         Some(RawDecidedValue {
-            certificate: certificate,
+            certificate,
             value_bytes,
         })
     }
