@@ -148,8 +148,8 @@ for NODE_PORT in 8545 18545 28545; do
 done
 
 # Check progress for additional node
-if [[ -z "$NO_DELAY" ]]; then
-check_reth_progress 38545 || exit_and_cleanup 1
+if [[ $NODES_COUNT -ge 4 ]]; then
+    check_reth_progress 38545 || exit_and_cleanup 1
 fi
 
 # Trap the INT signal (Ctrl+C) to run the cleanup function
