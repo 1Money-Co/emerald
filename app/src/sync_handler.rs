@@ -68,14 +68,15 @@ pub async fn validate_synced_payload(
         }
     };
 
-    match tokio::time::timeout(sync_timeout, validation_future).await {
-        Ok(result) => result,
-        Err(_) => Err(eyre!(
+    let Ok(result) = tokio::time::timeout(sync_timeout, validation_future).await else {
+        return Err(eyre!(
             "Execution client stuck in SYNCING for {:?} at height {}",
             sync_timeout,
             height
-        )),
-    }
+        ));
+    };
+
+    result
 }
 
 /// Retrieves a decided value for sync at the given height.
@@ -95,7 +96,7 @@ pub async fn get_decided_value_for_sync(
 
         Ok(Some(RawDecidedValue {
             certificate: decided_value.certificate,
-            value_bytes: ProtobufCodec.encode(&decided_value.value).unwrap(),
+            value_bytes: ProtobufCodec.encode(&decided_value.value)?,
         }))
     } else {
         // Height has been pruned from decided values - try to reconstruct from header + EL
@@ -159,7 +160,7 @@ pub async fn get_decided_value_for_sync(
 
         Ok(Some(RawDecidedValue {
             certificate,
-            value_bytes: ProtobufCodec.encode(&value).unwrap(),
+            value_bytes: ProtobufCodec.encode(&value)?,
         }))
     }
 }
