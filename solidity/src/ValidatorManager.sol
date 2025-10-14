@@ -80,14 +80,35 @@ contract ValidatorManager is Ownable, ReentrancyGuard {
     }
 
     /**
+     * @dev Batch register validators.
+     * @param validatorKeys Array of validator key identifiers
+     * @param powers Array of voting powers for the validators
+     */
+    function registerSet(uint256[] memory validatorKeys, uint256[] memory powers) external nonReentrant onlyOwner {
+        uint256 length = validatorKeys.length;
+        require(length == powers.length, "Length mismatch");
+
+        for (uint256 i = 0; i < length; i++) {
+            _register(validatorKeys[i], powers[i]);
+        }
+    }
+
+    /**
      * @dev Register a new validator with specified key and power
      * @param validatorKey The validator key identifier
      * @param power The voting power for the validator
      */
-    function register(uint256 validatorKey, uint256 power)
-        external
-        nonReentrant
-        onlyOwner
+    function register(uint256 validatorKey, uint256 power) external nonReentrant onlyOwner {
+        _register(validatorKey, power);
+    }
+
+    /**
+     * @dev Internal implementationto register a new validator with specified key and power
+     * @param validatorKey The validator key identifier
+     * @param power The voting power for the validator
+     */
+    function _register(uint256 validatorKey, uint256 power)
+        internal
         validatorNotExists(validatorKey)
         validKey(validatorKey)
         validPower(power)

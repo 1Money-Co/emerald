@@ -42,6 +42,41 @@ contract ValidatorManagerTest is Test {
         assertEq(keys[0], ALICE_KEY);
     }
 
+    function testOwnerCanRegisterSetOfValidators() public {
+        vm.expectEmit(true, true, true, true);
+        emit ValidatorRegistered(ALICE_KEY, INITIAL_POWER);
+
+        vm.expectEmit(true, true, true, true);
+        emit ValidatorRegistered(BOB_KEY, SECOND_POWER);
+
+        uint256[] memory keys = new uint256[](2);
+        keys[0] = ALICE_KEY;
+        keys[1] = BOB_KEY;
+        uint256[] memory powers = new uint256[](2);
+        powers[0] = INITIAL_POWER;
+        powers[1] = SECOND_POWER;
+
+        validatorManager.registerSet(keys, powers);
+
+        assertEq(validatorManager.getValidatorCount(), 2);
+        assertEq(validatorManager.getTotalPower(), INITIAL_POWER + SECOND_POWER);
+
+        ValidatorManager.ValidatorInfo memory aliceInfo = validatorManager.getValidator(ALICE_KEY);
+        assertEq(aliceInfo.validatorKey, ALICE_KEY);
+        assertEq(aliceInfo.power, INITIAL_POWER);
+        assertTrue(validatorManager.isValidator(ALICE_KEY));
+
+        ValidatorManager.ValidatorInfo memory bobInfo = validatorManager.getValidator(BOB_KEY);
+        assertEq(bobInfo.validatorKey, BOB_KEY);
+        assertEq(bobInfo.power, SECOND_POWER);
+        assertTrue(validatorManager.isValidator(BOB_KEY));
+
+        uint256[] memory retrievedKeys = validatorManager.getValidatorKeys();
+        assertEq(retrievedKeys.length, 2);
+        assertEq(retrievedKeys[0], ALICE_KEY);
+        assertEq(retrievedKeys[1], BOB_KEY);
+    }
+
     function testNonOwnerCannotRegisterValidator() public {
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, NON_OWNER));
         vm.prank(NON_OWNER);
