@@ -23,8 +23,6 @@ sync: clean build
 build:
 	cargo build
 	forge build
-	docker build -t informalsystems/prometheus:latest -f Dockerfile.prometheus .
-	docker build -t informalsystems/grafana:latest -f Dockerfile.grafana .
 
 stop:
 	docker compose down
@@ -34,7 +32,10 @@ clean: clean-prometheus
 	rm -rf ./assets/genesis.json
 	rm -rf ./nodes
 	rm -rf ./monitoring/data-grafana
-	docker volume rm --force malaketh-layered-private_reth{0,1,2,3}
+	docker volume rm --force malaketh-layered-private_reth0
+	docker volume rm --force malaketh-layered-private_reth1
+	docker volume rm --force malaketh-layered-private_reth2
+	docker volume rm --force malaketh-layered-private_reth3
 
 clean-prometheus: stop
 	rm -rf ./monitoring/data-prometheus
