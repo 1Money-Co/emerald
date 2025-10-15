@@ -147,11 +147,13 @@ services:
       # - "--txpool.queued-max-count=50000" # default=10000
   prometheus:
     network_mode: host
-    image: informalsystems/prometheus:latest
+    build:
+      dockerfile: Dockerfile.prometheus
     user: "65534"
   grafana:
     network_mode: host
-    image: informalsystems/grafana:latest
+    build:
+      dockerfile: Dockerfile.grafana
     user: "501"
     environment:
       GF_LOG_LEVEL: info

@@ -22,9 +22,6 @@ for _ in {0..NODES_COUNT-1}; do
     PORT=$((PORT + PORT_INCREMENT))
 done
 
-# RPCs need extra time to boot before calls are made
-sleep 2
-
 RETH0_ENODE=$(cast rpc --rpc-url 127.0.0.1:8545 admin_nodeInfo | jq -r .enode )
 RETH1_ENODE=$(cast rpc --rpc-url 127.0.0.1:18545 admin_nodeInfo | jq -r .enode )
 RETH2_ENODE=$(cast rpc --rpc-url 127.0.0.1:28545 admin_nodeInfo | jq -r .enode )
