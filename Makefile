@@ -31,11 +31,14 @@ clean: clean-prometheus
 	rm -rf ./.testnet
 	rm -rf ./assets/genesis.json
 	rm -rf ./nodes
-	rm -rf ./rethdata
 	rm -rf ./monitoring/data-grafana
+	docker volume rm --force malaketh-layered-private_reth0
+	docker volume rm --force malaketh-layered-private_reth1
+	docker volume rm --force malaketh-layered-private_reth2
+	docker volume rm --force malaketh-layered-private_reth3
 
 clean-prometheus: stop
 	rm -rf ./monitoring/data-prometheus
 
 spam:
-	cargo run --bin malachitebft-eth-utils spam --time=60 --rate=500 --rpc-url=127.0.0.1:8545
+	cargo run --bin malachitebft-eth-utils spam --time=60 --rate=5000 --rpc-url=127.0.0.1:8545
