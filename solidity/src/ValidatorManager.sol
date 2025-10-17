@@ -81,39 +81,33 @@ contract ValidatorManager is Ownable, ReentrancyGuard {
 
     /**
      * @dev Batch register validators.
-     * @param addValidatorKeys Array of validator key identifiers to be added
-     * @param powers Array of voting powers for the added validators
+     * @param addValidators Array of validator key identifiers and power to be added
      * @param removeValidatorKeys Array of validator key identifiers to be removed
      */
-    function addAndRemove(
-        uint256[] memory addValidatorKeys,
-        uint256[] memory powers,
-        uint256[] memory removeValidatorKeys
-    ) external nonReentrant onlyOwner {
-        _registerSet(addValidatorKeys, powers);
+    function addAndRemove(ValidatorInfo[] memory addValidators, uint256[] memory removeValidatorKeys)
+        external
+        nonReentrant
+        onlyOwner
+    {
+        _registerSet(addValidators);
         _unregisterSet(removeValidatorKeys);
     }
 
     /**
      * @dev Batch register validators.
-     * @param validatorKeys Array of validator key identifiers
-     * @param powers Array of voting powers for the validators
+     * @param addValidators Array of validator key identifiers and power to be added
      */
-    function registerSet(uint256[] memory validatorKeys, uint256[] memory powers) external nonReentrant onlyOwner {
-        _registerSet(validatorKeys, powers);
+    function registerSet(ValidatorInfo[] memory addValidators) external nonReentrant onlyOwner {
+        _registerSet(addValidators);
     }
 
     /**
-     * @dev Internal implementation of batch register validators.
-     * @param validatorKeys Array of validator key identifiers
-     * @param powers Array of voting powers for the validators
+     * @dev Internal implementation of batch register validators
+     * @param addValidators Array of validator key identifiers and power to be added
      */
-    function _registerSet(uint256[] memory validatorKeys, uint256[] memory powers) internal {
-        uint256 length = validatorKeys.length;
-        require(length == powers.length, "Length mismatch");
-
-        for (uint256 i = 0; i < length; i++) {
-            _register(validatorKeys[i], powers[i]);
+    function _registerSet(ValidatorInfo[] memory addValidators) internal {
+        for (uint256 i = 0; i < addValidators.length; i++) {
+            _register(addValidators[i].validatorKey, addValidators[i].power);
         }
     }
 
@@ -152,7 +146,7 @@ contract ValidatorManager is Ownable, ReentrancyGuard {
     }
 
     /**
-     * @dev Internal implementation of batch unregister validators.
+     * @dev Internal implementation of batch unregister validators
      * @param validatorKeys Array of validator key identifiers
      */
     function _unregisterSet(uint256[] memory validatorKeys) internal {

@@ -51,14 +51,11 @@ contract ValidatorManagerTest is Test {
         vm.expectEmit(true, true, true, true);
         emit ValidatorRegistered(BOB_KEY, SECOND_POWER);
 
-        uint256[] memory keys = new uint256[](2);
-        keys[0] = ALICE_KEY;
-        keys[1] = BOB_KEY;
-        uint256[] memory powers = new uint256[](2);
-        powers[0] = INITIAL_POWER;
-        powers[1] = SECOND_POWER;
+        ValidatorManager.ValidatorInfo[] memory addValidators = new ValidatorManager.ValidatorInfo[](2);
+        addValidators[0] = ValidatorManager.ValidatorInfo({validatorKey: ALICE_KEY, power: INITIAL_POWER});
+        addValidators[1] = ValidatorManager.ValidatorInfo({validatorKey: BOB_KEY, power: SECOND_POWER});
 
-        validatorManager.registerSet(keys, powers);
+        validatorManager.registerSet(addValidators);
 
         assertEq(validatorManager.getValidatorCount(), 2);
         assertEq(validatorManager.getTotalPower(), INITIAL_POWER + SECOND_POWER);
@@ -255,17 +252,14 @@ contract ValidatorManagerTest is Test {
         vm.expectEmit(true, true, true, true);
         emit ValidatorUnregistered(BOB_KEY);
 
-        uint256[] memory addKeys = new uint256[](1);
-        addKeys[0] = COFFEE_KEY;
-
-        uint256[] memory addPowers = new uint256[](1);
-        addPowers[0] = THIRD_POWER;
+        ValidatorManager.ValidatorInfo[] memory addValidators = new ValidatorManager.ValidatorInfo[](1);
+        addValidators[0] = ValidatorManager.ValidatorInfo({validatorKey: COFFEE_KEY, power: THIRD_POWER});
 
         uint256[] memory removeKeys = new uint256[](2);
         removeKeys[0] = ALICE_KEY;
         removeKeys[1] = BOB_KEY;
 
-        validatorManager.addAndRemove(addKeys, addPowers, removeKeys);
+        validatorManager.addAndRemove(addValidators, removeKeys);
 
         assertEq(validatorManager.getValidatorCount(), 1);
         assertEq(validatorManager.getTotalPower(), THIRD_POWER);
