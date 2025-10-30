@@ -5,28 +5,57 @@ use std::fmt;
 
 use alloy_rpc_types_engine::ExecutionPayloadV3;
 use bytes::Bytes;
+use caches::lru::AdaptiveCache;
+use caches::Cache;
 use color_eyre::eyre;
 use malachitebft_app_channel::app::streaming::{StreamContent, StreamId, StreamMessage};
 use malachitebft_app_channel::app::types::codec::Codec;
 use malachitebft_app_channel::app::types::core::{CommitCertificate, Context, Round, Validity};
 use malachitebft_app_channel::app::types::{LocallyProposedValue, PeerId, ProposedValue};
+use malachitebft_eth_engine::engine::Engine;
 use malachitebft_eth_engine::json_structures::ExecutionBlock;
 use malachitebft_eth_types::codec::proto::ProtobufCodec;
 use malachitebft_eth_types::secp256k1::K256Provider;
 use malachitebft_eth_types::{
-    Address, Genesis, Height, MalakethContext, ProposalData, ProposalFin, ProposalInit,
-    ProposalPart, ValidatorSet, Value, ValueId,
+    Address, Block, BlockHash, Genesis, Height, MalakethContext, ProposalData, ProposalFin,
+    ProposalInit, ProposalPart, RetryConfig, ValidatorSet, Value, ValueId,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use sha3::Digest;
 use ssz::Decode;
 use tokio::time::Instant;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::metrics::Metrics;
 use crate::store::Store;
 use crate::streaming::{PartStreamsMap, ProposalParts};
+
+/// Cache for tracking recently validated execution payloads to avoid redundant validation.
+/// Stores both the block hash and its validity result (Valid or Invalid).
+pub struct ValidatedPayloadCache {
+    cache: AdaptiveCache<BlockHash, Validity>,
+}
+
+impl ValidatedPayloadCache {
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            cache: AdaptiveCache::new(max_size)
+                .expect("Failed to create AdaptiveCache: invalid cache size"),
+        }
+    }
+
+    /// Check if a block hash has been validated and return its cached validity
+    pub fn get(&mut self, block_hash: &BlockHash) -> Option<Validity> {
+        self.cache.get(block_hash).copied()
+    }
+
+    /// Insert a block hash and its validity result into the cache
+    pub fn insert(&mut self, block_hash: BlockHash, validity: Validity) {
+        self.cache.put(block_hash, validity);
+    }
+}
+use crate::sync_handler::validate_payload;
 
 pub struct StateMetrics {
     pub txs_count: u64,
@@ -62,6 +91,9 @@ pub struct State {
     pub latest_block: Option<ExecutionBlock>,
 
     validator_set: Option<ValidatorSet>,
+
+    // Cache for tracking recently validated payloads to avoid duplicate validation
+    validated_payload_cache: ValidatedPayloadCache,
 
     // For stats
     pub txs_count: u64,
@@ -161,11 +193,17 @@ impl State {
             latest_block: None,
             validator_set: None,
 
+            validated_payload_cache: ValidatedPayloadCache::new(10),
+
             txs_count: state_metrics.txs_count,
             chain_bytes: state_metrics.chain_bytes,
             start_time,
             metrics: state_metrics.metrics,
         }
+    }
+
+    pub fn validated_cache_mut(&mut self) -> &mut ValidatedPayloadCache {
+        &mut self.validated_payload_cache
     }
 
     pub async fn get_latest_block_candidate(&self, height: Height) -> Option<ExecutionBlock> {
@@ -276,12 +314,67 @@ impl State {
         Ok(())
     }
 
+    /// Validates execution payload with the execution engine
+    /// Returns Ok(Validity) - Invalid if decoding fails or payload is invalid
+    pub async fn validate_execution_payload(
+        &mut self,
+        data: &Bytes,
+        height: Height,
+        round: Round,
+        engine: &Engine,
+        retry_config: &RetryConfig,
+    ) -> eyre::Result<Validity> {
+        // Decode execution payload
+        let execution_payload = match ExecutionPayloadV3::from_ssz_bytes(data) {
+            Ok(payload) => payload,
+            Err(e) => {
+                warn!(
+                    height = %height,
+                    round = %round,
+                    error = ?e,
+                    "Proposal has invalid ExecutionPayloadV3 encoding"
+                );
+                return Ok(Validity::Invalid);
+            }
+        };
+
+        // Extract versioned hashes for blob transactions
+        let block: Block = match execution_payload.clone().try_into_block() {
+            Ok(block) => block,
+            Err(e) => {
+                warn!(
+                    height = %height,
+                    round = %round,
+                    error = ?e,
+                    "Failed to convert ExecutionPayloadV3 to Block"
+                );
+                return Ok(Validity::Invalid);
+            }
+        };
+        let versioned_hashes: Vec<BlockHash> =
+            block.body.blob_versioned_hashes_iter().copied().collect();
+
+        // Validate with execution engine
+        validate_payload(
+            &mut self.validated_payload_cache,
+            engine,
+            &execution_payload,
+            &versioned_hashes,
+            retry_config,
+            height,
+            round,
+        )
+        .await
+    }
+
     /// Processes and adds a new proposal to the state if it's valid
     /// Returns Some(ProposedValue) if the proposal was accepted, None otherwise
     pub async fn received_proposal_part(
         &mut self,
         from: PeerId,
         part: StreamMessage<ProposalPart>,
+        engine: &Engine,
+        retry_config: &RetryConfig,
     ) -> eyre::Result<Option<ProposedValue<MalakethContext>>> {
         let sequence = part.sequence;
 
@@ -327,15 +420,30 @@ impl State {
                         value.value.id().as_u64()
                     );
                 }
+
+                // Validate the execution payload with the execution engine
+                let validity = self
+                    .validate_execution_payload(
+                        &data,
+                        value.height,
+                        value.round,
+                        engine,
+                        retry_config,
+                    )
+                    .await?;
+
+                if validity == Validity::Invalid {
+                    warn!(
+                        height = %self.current_height,
+                        round = %self.current_round,
+                        "Received proposal with invalid execution payload, ignoring"
+                    );
+                    return Ok(None);
+                }
                 info!(%value.height, %value.round, %value.proposer, "Storing validated proposal as undecided");
                 self.store.store_undecided_proposal(value.clone()).await?;
-                self.store_undecided_proposal_data(
-                    value.height,
-                    value.round,
-                    value.value.id(),
-                    data,
-                )
-                .await?;
+                self.store_undecided_block_data(value.height, value.round, value.value.id(), data)
+                    .await?;
 
                 Ok(Some(value))
             }
@@ -352,7 +460,7 @@ impl State {
             }
         }
     }
-    pub async fn store_undecided_proposal_data(
+    pub async fn store_undecided_block_data(
         &mut self,
         height: Height,
         round: Round,

@@ -14,7 +14,7 @@ use malachitebft_eth_engine::json_structures::ExecutionBlock;
 use malachitebft_eth_types::secp256k1::PublicKey;
 use malachitebft_eth_types::{Block, BlockHash, Height, MalakethContext, Validator, ValidatorSet};
 use ssz::{Decode, Encode};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 const GENESIS_VALIDATOR_MANAGER_ACCOUNT: Address =
     address!("0x0000000000000000000000000000000000002000");
@@ -27,7 +27,7 @@ alloy_sol_types::sol!(
 );
 
 use crate::state::{assemble_value_from_parts, decode_value, extract_block_header, State};
-use crate::sync_handler::{get_decided_value_for_sync, validate_synced_payload};
+use crate::sync_handler::{get_decided_value_for_sync, validate_payload};
 
 pub async fn initialize_state_from_genesis(state: &mut State, engine: &Engine) -> eyre::Result<()> {
     // TODO Unify this with code above @Jasmina
@@ -217,9 +217,38 @@ pub async fn run(
 
                     match state.validate_proposal_parts(parts) {
                         Ok(()) => {
-                            // Validation passed - convert to ProposedValue and move to undecided
-                            let (value, _) = assemble_value_from_parts(parts.clone());
-                            state.store.store_undecided_proposal(value).await?;
+                            // Validate execution payload with the execution engine before storing it as undecided proposal
+                            let (value, data) = assemble_value_from_parts(parts.clone());
+
+                            let validity = state
+                                .validate_execution_payload(
+                                    &data,
+                                    parts.height,
+                                    parts.round,
+                                    &engine,
+                                    &malaketh_config.retry_config,
+                                )
+                                .await?;
+
+                            if validity == Validity::Invalid {
+                                warn!(
+                                    height = %parts.height,
+                                    round = %parts.round,
+                                    "Pending proposal has invalid execution payload, rejecting"
+                                );
+                                continue;
+                            }
+
+                            state.store.store_undecided_proposal(value.clone()).await?;
+                            state
+                                .store
+                                .store_undecided_block_data(
+                                    value.height,
+                                    value.round,
+                                    value.value.id(),
+                                    data,
+                                )
+                                .await?;
                             info!(
                                 height = %parts.height,
                                 round = %parts.round,
@@ -307,7 +336,7 @@ pub async fn run(
                             // Store the block data at the proposal's height/round,
                             // which will be passed to the execution client (EL) on commit.
                             state
-                                .store_undecided_proposal_data(
+                                .store_undecided_block_data(
                                     height,
                                     round,
                                     proposal.value.id(),
@@ -355,7 +384,14 @@ pub async fn run(
                     "Received proposal part"
                 );
 
-                let proposed_value = state.received_proposal_part(from, part).await?;
+                // Try to reassemble the proposal from received parts. If present,
+                // validate it with the execution engine and mark invalid when
+                // parsing or validation fails. Keep the outer `Option` and send it
+                // back to the caller (consensus) regardless.
+                let proposed_value = state
+                    .received_proposal_part(from, part, &engine, &malaketh_config.retry_config)
+                    .await?;
+
                 if let Some(proposed_value) = proposed_value.clone() {
                     debug!("✅ Received complete proposal: {:?}", proposed_value);
                 }
@@ -462,18 +498,44 @@ pub async fn run(
                 let block_header_bytes = Bytes::from(block_header.as_ssz_bytes());
 
                 // Collect hashes from blob transactions
-                let block: Block = execution_payload.clone().try_into_block().unwrap();
+                let block: Block = execution_payload.clone().try_into_block().map_err(|e| {
+                    eyre::eyre!(
+                        "Failed to convert decided ExecutionPayloadV3 to Block at height {}: {}",
+                        height,
+                        e
+                    )
+                })?;
                 let versioned_hashes: Vec<BlockHash> =
                     block.body.blob_versioned_hashes_iter().copied().collect();
 
-                let payload_status = engine
-                    .notify_new_block(execution_payload, versioned_hashes)
-                    .await?;
-                if payload_status.status.is_invalid() {
-                    return Err(eyre!("Invalid payload status: {}", payload_status.status));
+                // Get validation status from cache or call newPayload
+                let validity =
+                    if let Some(cached) = state.validated_cache_mut().get(&new_block_hash) {
+                        cached
+                    } else {
+                        let payload_status = engine
+                            .notify_new_block(execution_payload, versioned_hashes)
+                            .await?;
+
+                        let validity = if payload_status.status.is_valid() {
+                            Validity::Valid
+                        } else {
+                            Validity::Invalid
+                        };
+
+                        state.validated_cache_mut().insert(new_block_hash, validity);
+                        validity
+                    };
+
+                if validity == Validity::Invalid {
+                    return Err(eyre!(
+                        "Block validation failed for hash: {}",
+                        new_block_hash
+                    ));
                 }
+
                 debug!(
-                    "💡 New block added at height {} with hash: {}",
+                    "💡 Block validated at height {} with hash: {}",
                     height, new_block_hash
                 );
 
@@ -543,16 +605,30 @@ pub async fn run(
 
                 // Extract execution payload from the synced value for validation
                 let block_bytes = value.extensions.clone();
-                let execution_payload = ExecutionPayloadV3::from_ssz_bytes(&block_bytes).unwrap();
+                let execution_payload =
+                    ExecutionPayloadV3::from_ssz_bytes(&block_bytes).map_err(|e| {
+                        eyre::eyre!(
+                            "Failed to decode synced ExecutionPayloadV3 at height {}: {:?}",
+                            height,
+                            e
+                        )
+                    })?;
                 let new_block_hash = execution_payload.payload_inner.payload_inner.block_hash;
 
                 // Collect hashes from blob transactions
-                let block: Block = execution_payload.clone().try_into_block().unwrap();
+                let block: Block = execution_payload.clone().try_into_block().map_err(|e| {
+                    eyre::eyre!(
+                        "Failed to convert synced ExecutionPayloadV3 to Block at height {}: {}",
+                        height,
+                        e
+                    )
+                })?;
                 let versioned_hashes: Vec<BlockHash> =
                     block.body.blob_versioned_hashes_iter().copied().collect();
 
                 // Validate the synced block
-                let validity = validate_synced_payload(
+                let validity = validate_payload(
+                    state.validated_cache_mut(),
                     &engine,
                     &execution_payload,
                     &versioned_hashes,
