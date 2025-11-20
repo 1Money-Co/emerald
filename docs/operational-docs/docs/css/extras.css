@@ -1,0 +1,31 @@
+.md-grid {
+  max-width: 70rem !important;
+  padding: 1rem;
+}
+
+.md-sidebar--secondary {
+  display: none !important;
+}
+
+.md-content p {
+  font-size: 0.75rem !important;
+}
+
+.md-nav__link {
+  font-size: 1em !important;
+}
+
+[data-md-component="toc"] {
+  color: dimgray !important;
+  font-style: italic !important;
+}
+
+@media screen and (min-width: 1260px) {
+  .md-grid {
+    max-width: 80rem !important;
+  }
+
+  .md-content {
+    padding: 1.5rem !important;
+  }
+}

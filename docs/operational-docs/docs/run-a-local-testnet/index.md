@@ -1,8 +1,10 @@
-# Testnet Setup Guide
+# **Testnet Setup Guide**
 
 This guide explains how to create and manage a local Emerald testnet using the Makefile and the Proof-of-Authority (PoA) utilities.
 
-## Table of Contents
+---
+
+## **Table of Contents**
 
 - [Overview](#overview)
 - [Creating a New Network](#creating-a-new-network)
@@ -10,20 +12,24 @@ This guide explains how to create and manage a local Emerald testnet using the M
 - [Network Configuration](#network-configuration)
 - [Troubleshooting](#troubleshooting)
 
-## Overview
+---
 
-Malaketh-layered uses Malachite BFT consensus connected to Reth execution clients via Engine API. The testnet setup creates multiple validator nodes that reach consensus on blocks with instant finality.
+## **Overview**
 
-### Architecture
+Emerald uses Malachite BFT consensus connected to Reth execution clients via Engine API. The testnet setup creates multiple validator nodes that reach consensus on blocks with instant finality.
+
+### **Architecture**
 
 - **Consensus Layer**: Malachite BFT (instant finality)
 - **Execution Layer**: Reth (Ethereum execution client)
 - **Connection**: Engine API with JWT authentication
 - **Validator Management**: ValidatorManager PoA smart contract at `0x0000000000000000000000000000000000002000`
 
-## Creating a New Network
+---
 
-### Quick Start: 3-Validator Network
+## **Creating a New Network (devnet)**
+
+### **Quick Start: 3-Validator Network**
 
 The default configuration creates a 3-validator network:
 
@@ -41,11 +47,11 @@ This command performs the following steps:
 6. Generates genesis file with initial validators
 7. Starts Docker containers (Reth nodes, Prometheus, Grafana, Otterscan)
 8. Configures peer connections
-9. Spawns Malachite consensus nodes
+9. Spawns Emerald consensus nodes
 
 **Monitoring**: Grafana dashboard available at http://localhost:3000
 
-### 4-Validator Network
+### **4-Validator Network**
 
 To create a network with 4 validators:
 
@@ -53,7 +59,7 @@ To create a network with 4 validators:
 make four
 ```
 
-### What Happens During Network Creation
+### **What Happens During Network Creation**
 
 1. **Configuration Generation** (`./scripts/generate_testnet_config.sh`)
    - Creates `.testnet/testnet_config.toml` with network parameters
@@ -61,7 +67,7 @@ make four
 2. **Validator Key Generation**
 
    ```bash
-   cargo run --bin malachitebft-eth-app -- testnet \
+   cargo run --bin emerald -- testnet \
      --home nodes \
      --testnet-config .testnet/testnet_config.toml
    ```
@@ -72,7 +78,7 @@ make four
 3. **Public Key Extraction**
 
    ```bash
-   cargo run --bin malachitebft-eth-app show-pubkey \
+   cargo run --bin emerald show-pubkey \
      nodes/0/config/priv_validator_key.json
    ```
 
@@ -81,7 +87,7 @@ make four
 4. **Genesis File Generation**
 
    ```bash
-   cargo run --bin malachitebft-eth-utils genesis \
+   cargo run --bin emerald-utils genesis \
      --public-keys-file ./nodes/validator_public_keys.txt
    ```
 
@@ -94,13 +100,15 @@ make four
    - Docker Compose starts Reth execution clients
    - Each Reth node initializes from `assets/genesis.json`
    - Peer connections established
-   - Malachite consensus nodes spawn and connect to Reth via Engine API
+   - Emerald consensus nodes spawn and connect to Reth via Engine API
 
-## Managing Validators with PoA Tools
+---
+
+## **Managing Validators with PoA Tools**
 
 Once the network is running, you can manage validators using the Rust-based PoA utilities.
 
-### Prerequisites
+### **Prerequisites**
 
 - Network must be running (`make` or `make four`)
 - RPC endpoint accessible (default: `http://127.0.0.1:8545`)
@@ -111,12 +119,12 @@ Once the network is running, you can manage validators using the Rust-based PoA 
 - `make` creates testnet validator keys under relative path `nodes/{0,1,2}/config/priv_validator_key.json`.
 - for local testnet the PoA contract owner private key is `0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80` which corresponds to signer index 0 of the menomnic shown above.
 
-### List Current Validators
+### **List Current Validators**
 
 View all registered validators and their voting power:
 
 ```bash
-cargo run --bin malachitebft-eth-utils poa list
+cargo run --bin emerald-utils poa list
 ```
 
 **Output:**
@@ -134,21 +142,21 @@ Validator #2:
   ...
 ```
 
-### Add a New Validator
+### **Add a New Validator**
 
 To add a new validator to the active set:
 
 First get the pubkey of the validator you want to add by running:
 
 ```bash
-cargo run --bin malachitebft-eth-app show-pubkey \
+cargo run --bin emerald show-pubkey \
   path/to/new/validator/priv_validator_key.json
 ```
 
 Then run the following command, replacing the placeholder values:
 
 ```bash
-cargo run --bin malachitebft-eth-utils poa add-validator \
+cargo run --bin emerald-utils poa add-validator \
   --validator-pubkey 0x04abcdef1234567890... \
   --power 100 \
   --owner-private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
@@ -165,30 +173,30 @@ cargo run --bin malachitebft-eth-utils poa add-validator \
 - `--rpc-url`: RPC endpoint (default: `http://127.0.0.1:8545`)
 - `--contract-address`: ValidatorManager address (default: `0x0000000000000000000000000000000000002000`)
 
-### Remove a Validator
+### **Remove a Validator**
 
 To remove a validator from the active set:
 
 ```bash
-cargo run --bin malachitebft-eth-utils poa remove-validator \
+cargo run --bin emerald-utils poa remove-validator \
   --validator-pubkey 0x04681eaaa34e491e6c8335abc9ea92b024ef52eb91442ca3b84598c79a79f31b75... \
   --owner-private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 ```
 
-### Update Validator Power
+### **Update Validator Power**
 
 To change a validator's voting weight:
 
 ```bash
-cargo run --bin malachitebft-eth-utils poa update-validator \
+cargo run --bin emerald-utils poa update-validator \
   --validator-pubkey 0x04681eaaa34e491e6c8335abc9ea92b024ef52eb91442ca3b84598c79a79f31b75... \
   --power 200 \
   --owner-private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 ```
 
-## Network Configuration
+## **Network Configuration**
 
-### Default Addresses
+### **Default Addresses**
 
 - **ValidatorManager Contract**: `0x0000000000000000000000000000000000002000`
 - **RPC Endpoints**:
@@ -197,7 +205,7 @@ cargo run --bin malachitebft-eth-utils poa update-validator \
   - Node 2: `http://127.0.0.1:8547`
   - Node 3 (if running): `http://127.0.0.1:8548`
 
-### Genesis Validators
+### **Genesis Validators**
 
 The genesis file is generated with 3 initial validators, each with power 100. Validator public keys are extracted from:
 
@@ -205,9 +213,11 @@ The genesis file is generated with 3 initial validators, each with power 100. Va
 - `nodes/1/config/priv_validator_key.json`
 - `nodes/2/config/priv_validator_key.json`
 
-## Network Operations
+---
 
-### Stop the Network
+## **Network Operations**
+
+### **Stop the Network**
 
 ```bash
 make stop
@@ -215,7 +225,7 @@ make stop
 
 This stops all Docker containers but preserves data.
 
-### Clean the Network
+### **Clean the Network**
 
 ```bash
 make clean
@@ -229,16 +239,18 @@ make clean
 - Docker volumes (Reth databases)
 - Prometheus/Grafana data
 
-### Restart a Clean Network
+### **Restart a Clean Network**
 
 ```bash
 make clean
 make
 ```
 
-## Troubleshooting
+---
 
-### Network Won't Start
+## **Troubleshooting**
+
+### **Network Won't Start**
 
 1. **Check if ports are in use**:
 
@@ -265,7 +277,7 @@ make
    tail -f nodes/0/emerald.log
    ```
 
-### Validator Operations Fail
+### **Validator Operations Fail**
 
 1. **Verify network is running**:
 
@@ -283,16 +295,18 @@ make
 3. **Verify contract owner key**:
    - Default: `0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80`
 
-### Public Key Extraction
+### **Public Key Extraction**
 
 To get a validator's public key from their private key file:
 
 ```bash
-cargo run --bin malachitebft-eth-app show-pubkey \
+cargo run --bin emerald show-pubkey \
   nodes/0/config/priv_validator_key.json
 ```
 
-## Monitoring
+---
+
+## **Monitoring**
 
 The `make` command starts monitoring services:
 
@@ -300,7 +314,9 @@ The `make` command starts monitoring services:
 - **Prometheus**: http://localhost:9090 (raw metrics)
 - **Otterscan**: http://localhost:5100 (block explorer)
 
-## References
+---
+
+## **References**
 
 - [Main README](../../README.md) - Project overview and architecture
 - [Makefile](../../Makefile) - Build and deployment automation

@@ -1,0 +1,14 @@
+---
+services:
+  mkdocs:
+    build:
+      context: .
+      args:
+        UID: ${UID}
+        GID: ${GID}
+        USERNAME: ${USERNAME}
+    volumes:
+      - ./:/docs
+    ports:
+      - "8000:8000"
+
