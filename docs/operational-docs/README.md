@@ -1,62 +1,169 @@
-# Emerald - Documentation
+# Emerald Documentation
 
-To install to view locally:
+This documentation is built using [mdBook](https://rust-lang.github.io/mdBook/), a utility to create modern online books from Markdown files.
 
+## Prerequisites
+
+To build and view the documentation locally, you need to install mdBook:
+
+### Installation
+
+**Using Cargo (Rust package manager):**
 ```bash
-python3 -m venv ~/mkdocs-env
-source ~/mkdocs-env/bin/activate
-pip install mkdocs mkdocs-material mkdocs-awesome-pages-plugin mkdocs-github-admonitions-plugin
-mkdocs --version # To verify the installation
+cargo install mdbook
 ```
 
-To view the documentation locally:
-
+**On macOS using Homebrew:**
 ```bash
-mkdocs serve
+brew install mdbook
 ```
 
-When you are done, deactivate the virtual environment:
-
+**On Linux using pre-built binaries:**
 ```bash
-deactivate
+curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz | tar -xz
+sudo mv mdbook /usr/local/bin/
 ```
 
-### How to Add Documentation
-
-`mkdocs awesome-pages` plugin is used to auto generate the navigation for nested directories in `docs/`.
-
-To add a new page, create a new markdown file in the `docs/{topic}/` directory. The file should have a `.md` extension.
-
-Each directory 1 level into `docs/` should have an `index.md` file. This file should contain the title `Overview` and a brief description of the contents of the directory.
-
-All nested directories only need to contain the documentation files for the topics they cover.
-Example `docs/infra/ovh/provision-server.md` will be automatically added to the navigation.
-
-### How to Style Documentation
-
-`mkdocs-github-admonitions-plugin` is used to support GitHub-style admonitions in markdown files. These are rendered consistently in both GitHub and in our MkDocs documentation.
-
-For detailed information on formatting, including:
-- Using admonitions (notes, warnings, tips, etc.)
-- Code block formatting
-- Links and references
-- Other styling guidelines
-
-Please refer to the [MkDocs Styling Guide](docs/mkdocs-styling-guide.md) for comprehensive styling guidelines and examples.
-
-## Using Docker Compose
-
-Setup your environment to have the same user inside the container.
-
+Verify the installation:
 ```bash
-echo "UID=$(id -u)" > .env
-echo "GID=$(id -g)" >> .env
-echo "USERNAME=$(id -un)" >> .env
+mdbook --version
 ```
 
-Start the container, which also builds the image.
+## Building the Documentation
+
+### Serve Locally (with auto-reload)
+
+To view the documentation locally with automatic reloading on changes:
 
 ```bash
-docker compose up -d
+cd docs/operational-docs
+mdbook serve --open
 ```
 
+This will:
+- Build the documentation
+- Start a local web server at `http://localhost:3000`
+- Open your browser automatically
+- Watch for file changes and rebuild automatically
+
+### Build Static HTML
+
+To build the documentation as static HTML files:
+
+```bash
+cd docs/operational-docs
+mdbook build
+```
+
+The generated HTML will be in the `book/` directory.
+
+## Documentation Structure
+
+The documentation follows this structure:
+
+```
+docs/operational-docs/
+├── book.toml              # mdBook configuration
+├── src/                   # Source markdown files
+│   ├── SUMMARY.md         # Table of contents (defines navigation)
+│   ├── introduction.md    # Main introduction page
+│   ├── local-testnet.md   # Running a local testnet guide
+│   ├── production-network.md  # Production network setup guide
+│   ├── config-examples.md # Configuration examples reference
+│   ├── images/            # Image assets
+│   └── config-examples/   # Configuration file examples
+└── book/                  # Generated HTML output (gitignored)
+```
+
+## Adding New Content
+
+### Adding a New Page
+
+1. Create a new Markdown file in the `src/` directory
+2. Add the page to `src/SUMMARY.md` to include it in the navigation
+
+**Example:**
+```markdown
+# Summary
+
+[Introduction](./introduction.md)
+
+- [My New Page](./my-new-page.md)
+```
+
+### Adding Images
+
+1. Place image files in `src/images/`
+2. Reference them in Markdown using relative paths:
+```markdown
+![Description](images/my-image.png)
+```
+
+### Adding Configuration Examples
+
+1. Place configuration files in `src/config-examples/`
+2. Reference them in Markdown:
+```markdown
+See [config.toml](config-examples/config.toml) for an example.
+```
+
+## Markdown Features
+
+mdBook supports standard Markdown plus some additional features:
+
+### Code Blocks with Syntax Highlighting
+
+\`\`\`rust
+fn main() {
+    println!("Hello, world!");
+}
+\`\`\`
+
+### Admonitions (Info Boxes)
+
+Use blockquotes with special markers:
+
+```markdown
+> **Note:** This is an informational note.
+
+> **Warning:** This is a warning message.
+
+> **Important:** This is an important message.
+```
+
+### Links
+
+- Internal links: `[Link Text](./other-page.md)`
+- External links: `[Link Text](https://example.com)`
+- Anchor links: `[Link Text](./page.md#section)`
+
+## Configuration
+
+The `book.toml` file contains the mdBook configuration:
+
+- **Book metadata**: Title, authors, language
+- **Build settings**: Output directory, source directory
+- **HTML output**: Theme, search, playground settings
+- **Preprocessors**: Link processing, etc.
+
+## Deployment
+
+To deploy the documentation:
+
+1. Build the static HTML:
+   ```bash
+   mdbook build
+   ```
+
+2. Deploy the contents of the `book/` directory to your web server or hosting platform
+
+Common deployment targets:
+- GitHub Pages
+- Netlify
+- Any static site hosting service
+
+## Additional Resources
+
+- [mdBook Documentation](https://rust-lang.github.io/mdBook/)
+- [mdBook GitHub Repository](https://github.com/rust-lang/mdBook)
+- [Markdown Guide](https://www.markdownguide.org/)
