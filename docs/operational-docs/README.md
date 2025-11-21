@@ -57,6 +57,30 @@ mdbook build
 
 The generated HTML will be in the `book/` directory.
 
+### Using Docker
+
+If you prefer to use Docker instead of installing mdBook locally:
+
+**Build the Docker image:**
+```bash
+cd docs/operational-docs
+docker build -t emerald-docs .
+```
+
+**Run the container:**
+```bash
+docker run -p 3000:3000 emerald-docs
+```
+
+The documentation will be available at `http://localhost:3000`
+
+**Run with live reload (mount source directory):**
+```bash
+docker run -p 3000:3000 -v $(pwd)/src:/docs/src emerald-docs
+```
+
+This mounts your local `src` directory into the container, allowing you to edit files and see changes reflected immediately.
+
 ## Documentation Structure
 
 The documentation follows this structure:

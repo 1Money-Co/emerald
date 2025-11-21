@@ -11,10 +11,10 @@ create-missing = true
 [preprocessor.links]
 
 [output.html]
-default-theme = "rust"
+default-theme = "light"
 preferred-dark-theme = "navy"
 git-repository-url = "https://github.com/informalsystems/emerald"
-edit-url-template = "https://github.com/informalsystems/emerald/edit/main/docs/operational-docs/{path}"
+additional-css = ["theme/custom.css"]
 
 [output.html.search]
 enable = true
