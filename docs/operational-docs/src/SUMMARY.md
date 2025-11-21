@@ -4,6 +4,12 @@
 
 ---
 
+# Architecture
+
+- [Technical Architecture](./architecture.md)
+
+---
+
 # Guides
 
 - [Running a Local Testnet](./local-testnet.md)
