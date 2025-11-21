@@ -1,6 +1,6 @@
 # Emerald
 
-![banner](assets/banner.jpg)
+![banner](docs/assets/banner.jpg)
 
 [![Telegram Chat][tg-badge]][tg-url]
 [![Documentation][docs-main-image]][docs-main-link]
