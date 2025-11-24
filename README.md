@@ -9,7 +9,7 @@
 [docs-main-image]: https://img.shields.io/badge/docs-main-blue?logo=googledocs&logoColor=white
 [docs-main-link]: https://emerald-docs.informalsystems.io
 [tg-badge]: https://img.shields.io/badge/Emerald-Chat-blue?logo=telegram
-[tg-url]: https://t.me/<your_channel_or_group>
+[tg-url]: https://t.me/+uHIbcHYVbA44NzNh
 
 Emerald is a modular framework for building decentralized networks of trust. 
 Designed with simplicity at its core, it enables users to deploy reliable, easy to operate, high performance, EVM-compatible networks.
