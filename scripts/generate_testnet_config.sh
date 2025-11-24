@@ -141,6 +141,8 @@ for ((i = 0; i < nodes; i++)); do
     fi
 done
 
+PRUNING_NODES=() #list of nodes who we want pruned. Note that you need to set the correpsonding flags in compose.yaml
+
 for ((i = 0; i < nodes; i++)); do
     mkdir -p "$TESTNET_DIR/config/$i"
     cat > "$TESTNET_DIR/config/$i/config.toml" <<EOF
@@ -150,6 +152,12 @@ engine_authrpc_address = "http://localhost:${AUTH_PORTS[i]}"
 jwt_token_path = "./assets/jwtsecret"
 sync_timeout_ms = 10000
 sync_initial_delay_ms = 100
-el_node_type = "archive"
 EOF
+ # Set max_retain_blocks for pruning nodes
+      if [[ " ${PRUNING_NODES[@]} " =~ " ${i} " ]]; then
+          echo "max_retain_blocks = 10064" >> "$TESTNET_DIR/config/$i/config.toml"
+          echo "el_node_type = \"custom\"" >> "$TESTNET_DIR/config/$i/config.toml"
+      else
+          echo "el_node_type = \"archive\"" >> "$TESTNET_DIR/config/$i/config.toml"
+      fi
 done
