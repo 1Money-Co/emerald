@@ -18,7 +18,7 @@ make clean
 
 - All node data (`nodes/`)
 - Genesis file (`assets/genesis.json`)
-- Testnet config (`.testnet/`)
+- Devnet config (`.testnet/`)
 - Docker volumes (Reth databases)
 - Prometheus/Grafana data
 

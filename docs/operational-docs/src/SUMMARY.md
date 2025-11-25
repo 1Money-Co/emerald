@@ -21,11 +21,16 @@
   - [Monitoring](local-devnet/monitoring.md)
   - [Troubleshooting](local-devnet/troubleshooting.md)
   - [Common Workflows](local-devnet/workflows.md)
-- [Production Network](./production-network.md)
+- [Production Network](production-network/README.md)
+  - [Network Overview](production-network/network-overview.md)
+  - [Installation](production-network/installation.md)
+  - [Creating Network Genesis](production-network/genesis.md)
+  - [Running Reth](production-network/running-reth.md)
+  - [Running Emerald](production-network/running-emerald.md)
 
 ---
 
-# Reference
+# References 
 
 - [Configuration Examples](./config-examples.md)
 
