@@ -20,8 +20,8 @@ Emerald's architecture is intentionally clean and composable, consisting of thre
 - The [Malachite](https://github.com/circlefin/malachite) consensus engine
 - An Ethereum execution client (currently [Reth](https://github.com/paradigmxyz/reth)) integrated via [Engine API](https://github.com/ethereum/execution-apis/tree/main/src/engine)
 - A proof-of-authority (PoA) module
-
-> TODO: add diagram 
+  
+<img src="images/emerald-architecture.png" width="40%" />
 
 > TODO: For more details, please have a look at the Emerald architecture. 
 
