@@ -42,10 +42,10 @@ Malachite expects nodes that fall behind to use a different protocol to catch up
 In Malachite terminology, this protocol is referred to as _Value Sync_ (as the nodes sync on the past values decided by Malachite). 
 In the context of Emerald, these values consists of Ethereum blocks. 
 
-Emerald uses the following Malachite events to implement the Value Sync protocol:
+Emerald handles the following events emitted by Malachite, in order to implement the Value Sync protocol:
 
 - `AppMsg::ProcessSyncedValue { height, round, proposer, value_bytes, reply }`: 
-  Used to process and validat values received from other peers while syncing. 
+  Used to process and validate values received from other peers while syncing. 
   The values are validated against the execution client and stored for processing in the Decided function.
 
 - `AppMsg::GetDecidedValue { height, reply }`: 
