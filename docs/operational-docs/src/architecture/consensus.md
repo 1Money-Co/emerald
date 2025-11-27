@@ -4,7 +4,7 @@ Emerald leverages [Malachite](https://github.com/circlefin/malachite) as its con
 Malachite is the most optimized and lightweight evolution of the [Tendermint](https://arxiv.org/abs/1807.04938) Byzantine Fault Tolerant (BFT) protocol, 
 which is the most battle-tested consensus protocol in blockchain today. 
 
-## Key Features 
+## Key Properties 
 
 - **Separation from execution:** Consensus is separated from execution, allowing modular development and easy component customization.
 - **Single-slot finality:** Transactions are finalized immediately once blocks are committed, without the risk of reorgs.
@@ -13,22 +13,39 @@ which is the most battle-tested consensus protocol in blockchain today.
  > TODO: add throughput results 
 - **Formally specified:** Malachite was formally specified and model checked using the [Quint specification language](https://quint-lang.org). 
 
-## Emerald Integration 
+## Malachite Integration 
 
 Emerald uses Malachite's [channel-based interface](https://github.com/circlefin/malachite/blob/main/ARCHITECTURE.md#channel-based-interface) for integration.
 This provides built-in synchronization, crash recovery, networking for consensus voting, and block propagation protocols.
 
 Emerald, as a Malachite application, only needs to interact with the consensus engine through a channel that emits events:
 
-- **`AppMsg::ConsensusReady { reply }`**: Signals that Malachite is initialized and ready to begin consensus.
+- `AppMsg::ConsensusReady { reply }`: Signals that Malachite is initialized and ready to begin consensus.
 
-- **`AppMsg::GetValue { height, round, timeout, reply }`**: Requests a value (e.g., a block) from the application when the node is the proposer for a given height and round.
+- `AppMsg::GetValue { height, round, timeout, reply }`: Requests a value (e.g., a block) from the application when the node is the proposer for a given height and round.
 
-- **`AppMsg::ReceivedProposalPart { from, part, reply }`**: Delivers parts of a proposed value from other nodes, which are reassembled into a complete block.
+- `AppMsg::ReceivedProposalPart { from, part, reply }`: Delivers parts of a proposed value from other nodes, which are reassembled into a complete block.
 
-- **`AppMsg::Decided { certificate, reply }`**: Notifies the application that consensus has been reached, providing a certificate with the decided value and supporting votes.
+- `AppMsg::Decided { certificate, reply }`: Notifies the application that consensus has been reached, providing a certificate with the decided value and supporting votes.
 
-> TODO
-> - what other things we added here (crash recovery, block sync ... )
-> - do we want to add a section about Tendermint and how it works? 
-> - do we want to mention 5f+1 or not yet? 
+**Note.** Emerald doesn't currently support the following Malachite events: `AppMsg::RestreamProposal` , `AppMsg::ExtendVote`, `AppMsg::VerifyVoteExtension`.
+
+## Additional Features
+
+### Value Sync 
+
+Malachite expects nodes that fall behind to use a different protocol to catch up without participating in consensus. 
+In Malachite terminology, this protocol is referred to as _Value Sync_ (as the nodes sync on the past values decided by Malachite). 
+In the context of Emerald, these values consists of Ethereum blocks. 
+
+Emerald uses the following Malachite events to implement the Value Sync protocol:
+
+- `AppMsg::ProcessSyncedValue { height, round, proposer, value_bytes, reply }`: 
+  Used to process and validat values received from other peers while syncing. 
+  The values are validated against the execution client and stored for processing in the Decided function.
+
+- `AppMsg::GetDecidedValue { height, reply }`: 
+  Used to provide peers that are behind with already decided values stored. 
+  Note that Emerald caches a certain number of blocks locally, but the actual block history is stored in the execution client.
+
+- `AppMsg::GetHistoryMinHeight`: Used to update peers on the minimum height for which the local node has a block.
