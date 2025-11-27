@@ -1,4 +1,4 @@
-# Consensus Engine
+# Consensus Layer
 
 Emerald leverages [Malachite](https://github.com/circlefin/malachite) as its consensus engine. 
 Malachite is the most optimized and lightweight evolution of the [Tendermint](https://arxiv.org/abs/1807.04938) Byzantine Fault Tolerant (BFT) protocol, 
@@ -6,12 +6,16 @@ which is the most battle-tested consensus protocol in blockchain today.
 
 ## Key Properties 
 
-- **Separation from execution:** Consensus is separated from execution, allowing modular development and easy component customization.
-- **Single-slot finality:** Transactions are finalized immediately once blocks are committed, without the risk of reorgs.
-- **Low latency:** Malachite finalizes blocks in under one second, delivering the low-latency confirmation times required for high-performance institutional applications.
-- **High throughput:** 
+**Separation From Execution.** Consensus is separated from execution, allowing modular development and easy component customization.
+
+**Single-Slot Finality.** Transactions are finalized immediately once blocks are committed, without the risk of reorgs.
+
+**Low Latency.** Malachite finalizes blocks in under one second, delivering the low-latency confirmation times required for high-performance institutional applications.
+
+**High Throughput.** 
  > TODO: add throughput results 
-- **Formally specified:** Malachite was formally specified and model checked using the [Quint specification language](https://quint-lang.org). 
+
+**Formally Specified.** Malachite was formally specified and model checked using the [Quint specification language](https://quint-lang.org). 
 
 ## Malachite Integration 
 

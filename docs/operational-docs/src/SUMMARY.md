@@ -12,9 +12,9 @@
 
 
 - [Architecture](./architecture/index.md)
-  - [Consensus Engine](./architecture/consensus.md)
-  - [Ethereum Execution Client](./architecture/execution-client.md)
-  - [PoA Module](./architecture/poa.md)
+  - [Consensus Layer](./architecture/consensus.md)
+  - [Execution Layer](./architecture/execution-client.md)
+  - [Proof-of-Authority Model](./architecture/poa.md)
 
 ---
 
