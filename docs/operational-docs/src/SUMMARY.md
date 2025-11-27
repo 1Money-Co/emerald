@@ -16,8 +16,6 @@
   - [Ethereum Execution Client](./architecture/execution-client.md)
   - [PoA Module](./architecture/poa.md)
 
-- [Old Architecture](./architecture.md)
-
 ---
 
 # Guides
