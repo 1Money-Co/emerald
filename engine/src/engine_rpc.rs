@@ -4,7 +4,7 @@ use std::fmt;
 use std::path::Path;
 
 use alloy_rpc_types_engine::{
-    ExecutionPayloadEnvelopeV3, ExecutionPayloadEnvelopeV5, ExecutionPayloadV3, ForkchoiceState,
+    ExecutionPayloadEnvelopeV4, ExecutionPayloadEnvelopeV5, ExecutionPayloadV3, ForkchoiceState,
     ForkchoiceUpdated, PayloadAttributes, PayloadId as AlloyPayloadId, PayloadStatus,
 };
 use color_eyre::eyre;
@@ -219,6 +219,10 @@ impl EngineRPC {
         .await
     }
 
+    // Note that we take only the execution payload from the nevelopes.
+    // The consensus client currently does not have support for processing
+    // items like blobs or execution requests.
+    // TODO Support handling of all fields from the response
     pub async fn get_payload(
         &self,
         payload_id: AlloyPayloadId,
@@ -236,14 +240,14 @@ impl EngineRPC {
                 Ok(response.execution_payload)
             }
             Fork::Prague => {
-                let response: ExecutionPayloadEnvelopeV3 = self
+                let response: ExecutionPayloadEnvelopeV4 = self
                     .rpc_request(
                         ENGINE_GET_PAYLOAD_V4,
                         json!([payload_id]),
                         ENGINE_GET_PAYLOAD_TIMEOUT,
                     )
                     .await?;
-                Ok(response.execution_payload)
+                Ok(response.envelope_inner.execution_payload)
             }
             Fork::Unsupported => Err(eyre!("Unsupported fork")),
         }
