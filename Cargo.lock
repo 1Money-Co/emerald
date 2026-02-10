@@ -4867,6 +4867,7 @@ dependencies = [
  "alloy-consensus",
  "alloy-primitives",
  "async-trait",
+ "blst",
  "bytes",
  "hex",
  "humantime-serde",
@@ -4888,6 +4889,7 @@ dependencies = [
  "serde",
  "serde_json",
  "signature",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
