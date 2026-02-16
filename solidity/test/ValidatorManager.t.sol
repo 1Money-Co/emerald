@@ -4,6 +4,7 @@ pragma solidity ^0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {ValidatorManager} from "../src/ValidatorManager.sol";
 import {ValidatorManagerProxy} from "../src/ValidatorManagerProxy.sol";
+import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 
 contract ValidatorManagerTest is Test {
@@ -158,7 +159,13 @@ contract ValidatorManagerTest is Test {
 
     function testNonOwnerCannotRegisterValidator() public {
         bytes memory alicePublicKey = ALICE_UNCOMPRESSED;
-        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, NON_OWNER));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector,
+                NON_OWNER,
+                validatorManager.VALIDATOR_MANAGER_ROLE()
+            )
+        );
         vm.prank(NON_OWNER);
         validatorManager.register(alicePublicKey, INITIAL_POWER);
     }
@@ -199,7 +206,13 @@ contract ValidatorManagerTest is Test {
         bytes memory alicePublicKey = ALICE_UNCOMPRESSED;
         validatorManager.register(alicePublicKey, INITIAL_POWER);
 
-        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, NON_OWNER));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector,
+                NON_OWNER,
+                validatorManager.VALIDATOR_MANAGER_ROLE()
+            )
+        );
         vm.prank(NON_OWNER);
         validatorManager.updatePower(aliceValidatorAddress, UPDATED_POWER);
     }
@@ -259,7 +272,13 @@ contract ValidatorManagerTest is Test {
         bytes memory alicePublicKey = ALICE_UNCOMPRESSED;
         validatorManager.register(alicePublicKey, INITIAL_POWER);
 
-        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, NON_OWNER));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector,
+                NON_OWNER,
+                validatorManager.VALIDATOR_MANAGER_ROLE()
+            )
+        );
         vm.prank(NON_OWNER);
         validatorManager.unregister(aliceValidatorAddress);
     }
@@ -319,30 +338,48 @@ contract ValidatorManagerTest is Test {
         validatorManager.transferOwnership(NEW_OWNER);
         assertEq(validatorManager.owner(), NEW_OWNER);
 
+        // Non-owner cannot transfer ownership
         vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, NON_OWNER));
         vm.prank(NON_OWNER);
         validatorManager.transferOwnership(address(0xBAD));
 
+        // New owner has VALIDATOR_MANAGER_ROLE and can register
         bytes memory alicePublicKey = ALICE_UNCOMPRESSED;
         vm.expectEmit(true, false, false, true);
         emit ValidatorRegistered(aliceValidatorAddress, aliceKey, INITIAL_POWER);
         vm.prank(NEW_OWNER);
         validatorManager.register(alicePublicKey, INITIAL_POWER);
 
+        // Old owner lost VALIDATOR_MANAGER_ROLE and cannot register
         bytes memory bobPublicKey = BOB_COMPRESSED;
-        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, address(this)));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector,
+                address(this),
+                validatorManager.VALIDATOR_MANAGER_ROLE()
+            )
+        );
         validatorManager.register(bobPublicKey, SECOND_POWER);
     }
 
-    function testRenounceOwnershipLocksMutations() public {
+    function testRenounceOwnershipRetainsRoles() public {
         validatorManager.renounceOwnership();
         assertEq(validatorManager.owner(), address(0));
 
+        // Former owner retains VALIDATOR_MANAGER_ROLE and can still register
         bytes memory alicePublicKey = ALICE_UNCOMPRESSED;
-        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, address(this)));
+        vm.expectEmit(true, false, false, true);
+        emit ValidatorRegistered(aliceValidatorAddress, aliceKey, INITIAL_POWER);
         validatorManager.register(alicePublicKey, INITIAL_POWER);
 
-        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, NON_OWNER));
+        // Non-role holder still cannot operate
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector,
+                NON_OWNER,
+                validatorManager.VALIDATOR_MANAGER_ROLE()
+            )
+        );
         vm.prank(NON_OWNER);
         validatorManager.updatePower(aliceValidatorAddress, UPDATED_POWER);
     }
@@ -395,5 +432,193 @@ contract ValidatorManagerTest is Test {
     function testValidatorAddressMatchesDerivedFromPrivateKey() public view {
         address derived = vm.addr(ALICE_PRIVATE_KEY);
         assertEq(derived, aliceValidatorAddress);
+    }
+
+    // -- AccessControl role delegation tests ----------------------------------
+
+    function testManagerRoleCanRegisterValidator() public {
+        validatorManager.grantRole(validatorManager.VALIDATOR_MANAGER_ROLE(), NON_OWNER);
+
+        vm.expectEmit(true, false, false, true);
+        emit ValidatorRegistered(aliceValidatorAddress, aliceKey, INITIAL_POWER);
+        vm.prank(NON_OWNER);
+        validatorManager.register(ALICE_UNCOMPRESSED, INITIAL_POWER);
+
+        assertEq(validatorManager.getValidatorCount(), 1);
+    }
+
+    function testManagerRoleCanUnregisterValidator() public {
+        validatorManager.register(ALICE_UNCOMPRESSED, INITIAL_POWER);
+        validatorManager.grantRole(validatorManager.VALIDATOR_MANAGER_ROLE(), NON_OWNER);
+
+        vm.expectEmit(true, false, false, true);
+        emit ValidatorUnregistered(aliceValidatorAddress, aliceKey);
+        vm.prank(NON_OWNER);
+        validatorManager.unregister(aliceValidatorAddress);
+
+        assertEq(validatorManager.getValidatorCount(), 0);
+    }
+
+    function testManagerRoleCanUpdatePower() public {
+        validatorManager.register(ALICE_UNCOMPRESSED, INITIAL_POWER);
+        validatorManager.grantRole(validatorManager.VALIDATOR_MANAGER_ROLE(), NON_OWNER);
+
+        vm.expectEmit(true, false, false, true);
+        emit ValidatorPowerUpdated(aliceValidatorAddress, aliceKey, INITIAL_POWER, UPDATED_POWER);
+        vm.prank(NON_OWNER);
+        validatorManager.updatePower(aliceValidatorAddress, UPDATED_POWER);
+
+        assertEq(validatorManager.getTotalPower(), UPDATED_POWER);
+    }
+
+    function testOwnerCanGrantAndRevokeManagerRole() public {
+        bytes32 managerRole = validatorManager.VALIDATOR_MANAGER_ROLE();
+
+        // Grant
+        validatorManager.grantRole(managerRole, NON_OWNER);
+        assertTrue(validatorManager.hasRole(managerRole, NON_OWNER));
+
+        // Manager can register
+        vm.prank(NON_OWNER);
+        validatorManager.register(ALICE_UNCOMPRESSED, INITIAL_POWER);
+
+        // Revoke
+        validatorManager.revokeRole(managerRole, NON_OWNER);
+        assertFalse(validatorManager.hasRole(managerRole, NON_OWNER));
+
+        // Manager can no longer register
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, NON_OWNER, managerRole
+            )
+        );
+        vm.prank(NON_OWNER);
+        validatorManager.register(BOB_COMPRESSED, SECOND_POWER);
+    }
+
+    function testNonAdminCannotGrantManagerRole() public {
+        bytes32 managerRole = validatorManager.VALIDATOR_MANAGER_ROLE();
+        bytes32 adminRole = validatorManager.DEFAULT_ADMIN_ROLE();
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, NON_OWNER, adminRole)
+        );
+        vm.prank(NON_OWNER);
+        validatorManager.grantRole(managerRole, NON_OWNER);
+    }
+
+    function testRenounceManagerRoleRemovesAccess() public {
+        bytes32 managerRole = validatorManager.VALIDATOR_MANAGER_ROLE();
+        validatorManager.grantRole(managerRole, NON_OWNER);
+        assertTrue(validatorManager.hasRole(managerRole, NON_OWNER));
+
+        // Manager renounces own role
+        vm.prank(NON_OWNER);
+        validatorManager.renounceRole(managerRole, NON_OWNER);
+        assertFalse(validatorManager.hasRole(managerRole, NON_OWNER));
+
+        // Cannot operate anymore
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, NON_OWNER, managerRole
+            )
+        );
+        vm.prank(NON_OWNER);
+        validatorManager.register(ALICE_UNCOMPRESSED, INITIAL_POWER);
+    }
+
+    function testSelfTransferOwnershipPreservesRoles() public {
+        bytes32 managerRole = validatorManager.VALIDATOR_MANAGER_ROLE();
+        bytes32 adminRole = validatorManager.DEFAULT_ADMIN_ROLE();
+
+        // Self-transfer
+        validatorManager.transferOwnership(address(this));
+        assertEq(validatorManager.owner(), address(this));
+
+        // Roles still intact
+        assertTrue(validatorManager.hasRole(adminRole, address(this)));
+        assertTrue(validatorManager.hasRole(managerRole, address(this)));
+
+        // Can still operate
+        validatorManager.register(ALICE_UNCOMPRESSED, INITIAL_POWER);
+        assertEq(validatorManager.getValidatorCount(), 1);
+    }
+
+    function testMultipleManagersCanOperate() public {
+        bytes32 managerRole = validatorManager.VALIDATOR_MANAGER_ROLE();
+        address manager2 = address(0xDEAD);
+
+        validatorManager.grantRole(managerRole, NON_OWNER);
+        validatorManager.grantRole(managerRole, manager2);
+
+        // First manager registers
+        vm.prank(NON_OWNER);
+        validatorManager.register(ALICE_UNCOMPRESSED, INITIAL_POWER);
+
+        // Second manager registers
+        vm.prank(manager2);
+        validatorManager.register(BOB_COMPRESSED, SECOND_POWER);
+
+        // Owner registers
+        validatorManager.register(COFFEE_COMPRESSED, THIRD_POWER);
+
+        assertEq(validatorManager.getValidatorCount(), 3);
+    }
+
+    // -- Owner role lockstep protection tests ---------------------------------
+
+    function testCannotRevokeOwnerAdminRole() public {
+        bytes32 adminRole = validatorManager.DEFAULT_ADMIN_ROLE();
+
+        vm.expectRevert(
+            abi.encodeWithSelector(ValidatorManager.CannotRevokeOwnerRole.selector, adminRole)
+        );
+        validatorManager.revokeRole(adminRole, address(this));
+    }
+
+    function testCannotRevokeOwnerManagerRole() public {
+        bytes32 managerRole = validatorManager.VALIDATOR_MANAGER_ROLE();
+
+        vm.expectRevert(
+            abi.encodeWithSelector(ValidatorManager.CannotRevokeOwnerRole.selector, managerRole)
+        );
+        validatorManager.revokeRole(managerRole, address(this));
+    }
+
+    function testOwnerCannotRenounceAdminRole() public {
+        bytes32 adminRole = validatorManager.DEFAULT_ADMIN_ROLE();
+
+        vm.expectRevert(
+            abi.encodeWithSelector(ValidatorManager.CannotRevokeOwnerRole.selector, adminRole)
+        );
+        validatorManager.renounceRole(adminRole, address(this));
+    }
+
+    function testOwnerCannotRenounceManagerRole() public {
+        bytes32 managerRole = validatorManager.VALIDATOR_MANAGER_ROLE();
+
+        vm.expectRevert(
+            abi.encodeWithSelector(ValidatorManager.CannotRevokeOwnerRole.selector, managerRole)
+        );
+        validatorManager.renounceRole(managerRole, address(this));
+    }
+
+    function testDelegatedManagerCanStillRenounceOwnRole() public {
+        bytes32 managerRole = validatorManager.VALIDATOR_MANAGER_ROLE();
+        validatorManager.grantRole(managerRole, NON_OWNER);
+
+        // Non-owner can renounce (they are not owner())
+        vm.prank(NON_OWNER);
+        validatorManager.renounceRole(managerRole, NON_OWNER);
+        assertFalse(validatorManager.hasRole(managerRole, NON_OWNER));
+    }
+
+    function testRevokeManagerRoleFromDelegatedManagerSucceeds() public {
+        bytes32 managerRole = validatorManager.VALIDATOR_MANAGER_ROLE();
+        validatorManager.grantRole(managerRole, NON_OWNER);
+
+        // Admin can revoke from non-owner
+        validatorManager.revokeRole(managerRole, NON_OWNER);
+        assertFalse(validatorManager.hasRole(managerRole, NON_OWNER));
     }
 }

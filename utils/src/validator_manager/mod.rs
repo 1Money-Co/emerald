@@ -40,8 +40,8 @@ pub fn patched_impl_bytecode(impl_address: Address) -> Bytes {
 }
 
 use crate::validator_manager::storage::{
-    set_validator_addresses_set, set_validator_entries_mapping, EIP1967_IMPL_SLOT,
-    INITIALIZABLE_SLOT, OWNABLE_SLOT, REENTRANCY_GUARD_SLOT,
+    set_access_control_roles, set_validator_addresses_set, set_validator_entries_mapping,
+    EIP1967_IMPL_SLOT, INITIALIZABLE_SLOT, OWNABLE_SLOT, REENTRANCY_GUARD_SLOT,
 };
 
 /// Generate proxy storage slots and values for a given validator list.
@@ -92,6 +92,7 @@ pub fn generate_storage_data(
 ///   ERC-7201 Ownable    : _owner
 ///   ERC-7201 ReentrancyGuard : _status = 1 (NOT_ENTERED)
 ///   ERC-7201 Initializable   : _initialized = 1, _initializing = false
+///   ERC-7201 AccessControl   : DEFAULT_ADMIN_ROLE + VALIDATOR_MANAGER_ROLE for owner
 ///   Slot 0 : _validatorAddresses._inner._values  (EnumerableSet)
 ///   Slot 1 : _validatorAddresses._inner._positions
 ///   Slot 2 : _validators mapping(address => ValidatorInfo)
@@ -122,6 +123,9 @@ pub fn generate_from_validator_set(
         INITIALIZABLE_SLOT,
         B256::from(U256::from(1u64).to_be_bytes::<32>()),
     );
+
+    // -- ERC-7201: AccessControl roles for owner --
+    set_access_control_roles(&mut storage, owner);
 
     // -- Contract state: sequential slots starting at 0 --
     // Slot 0-1: _validatorAddresses (EnumerableSet, occupies 2 slots)

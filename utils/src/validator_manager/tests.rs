@@ -21,8 +21,9 @@ use super::{
 };
 use crate::genesis::generate_evm_genesis;
 use crate::validator_manager::storage::{
-    erc7201_slot, EIP1967_IMPL_SLOT, INITIALIZABLE_NAMESPACE, INITIALIZABLE_SLOT,
-    OWNABLE_NAMESPACE, OWNABLE_SLOT, REENTRANCY_GUARD_NAMESPACE, REENTRANCY_GUARD_SLOT,
+    access_control_has_role_slot, erc7201_slot, ACCESS_CONTROL_NAMESPACE, ACCESS_CONTROL_SLOT,
+    EIP1967_IMPL_SLOT, INITIALIZABLE_NAMESPACE, INITIALIZABLE_SLOT, OWNABLE_NAMESPACE,
+    OWNABLE_SLOT, REENTRANCY_GUARD_NAMESPACE, REENTRANCY_GUARD_SLOT, VALIDATOR_MANAGER_ROLE,
 };
 
 const TEST_OWNER_ADDRESS: Address = address!("0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65");
@@ -103,6 +104,52 @@ fn test_erc7201_reentrancy_guard_slot() {
 #[test]
 fn test_erc7201_initializable_slot() {
     assert_eq!(erc7201_slot(INITIALIZABLE_NAMESPACE), INITIALIZABLE_SLOT);
+}
+
+#[test]
+fn test_erc7201_access_control_slot() {
+    assert_eq!(
+        erc7201_slot(ACCESS_CONTROL_NAMESPACE),
+        ACCESS_CONTROL_SLOT
+    );
+}
+
+#[test]
+fn test_validator_manager_role_hash() {
+    use alloy_primitives::keccak256;
+    assert_eq!(keccak256("VALIDATOR_MANAGER_ROLE"), VALIDATOR_MANAGER_ROLE);
+}
+
+#[test]
+fn test_generate_storage_includes_access_control_roles() -> eyre::Result<()> {
+    let validators = generate_validators_from_mnemonic(2)?;
+    let storage = generate_storage_data(
+        validators,
+        TEST_OWNER_ADDRESS,
+        GENESIS_VALIDATOR_MANAGER_IMPL_ACCOUNT,
+    )?;
+
+    let default_admin_role = alloy_primitives::B256::ZERO;
+    let true_val =
+        alloy_primitives::B256::from(U256::from(1u64).to_be_bytes::<32>());
+
+    // DEFAULT_ADMIN_ROLE granted to owner
+    let admin_slot = access_control_has_role_slot(default_admin_role, TEST_OWNER_ADDRESS);
+    assert_eq!(
+        storage.get(&admin_slot),
+        Some(&true_val),
+        "DEFAULT_ADMIN_ROLE not set for owner in genesis storage"
+    );
+
+    // VALIDATOR_MANAGER_ROLE granted to owner
+    let manager_slot = access_control_has_role_slot(VALIDATOR_MANAGER_ROLE, TEST_OWNER_ADDRESS);
+    assert_eq!(
+        storage.get(&manager_slot),
+        Some(&true_val),
+        "VALIDATOR_MANAGER_ROLE not set for owner in genesis storage"
+    );
+
+    Ok(())
 }
 
 #[test]
@@ -327,6 +374,101 @@ async fn test_anvil_boot_from_generated_genesis_upgrade_succeeds()
     assert_eq!(vm_proxy.owner().call().await?, TEST_OWNER_ADDRESS);
     assert_eq!(vm_proxy.getValidatorCount().call().await?, U256::from(5));
     assert_eq!(vm_proxy.getTotalPower().call().await?, 500u64);
+
+    Ok(())
+}
+
+/// Verify that the genesis-allocated owner can call role-gated validator ops
+/// (register, unregister, updatePower) and that hasRole returns true.
+#[tokio::test]
+#[test_log::test]
+async fn test_anvil_genesis_owner_has_access_control_roles() -> eyre::Result<()> {
+    let tmp = tempdir()?;
+    let keys_path = tmp.path().join("validator_keys.txt");
+    let genesis_path = tmp.path().join("genesis.json");
+
+    let validators = generate_validators_from_mnemonic(3)?;
+    write_validator_keys_file(&validators, &keys_path)?;
+
+    let owner = Some(format!("{TEST_OWNER_ADDRESS:#x}"));
+    generate_evm_genesis(
+        keys_path.to_str().unwrap(),
+        &owner,
+        &false,
+        &0u64,
+        &12345u64,
+        genesis_path.to_str().unwrap(),
+    )?;
+
+    let anvil = Anvil::new()
+        .args(["--init", genesis_path.to_str().unwrap()])
+        .spawn();
+    let rpc_url: Url = anvil.endpoint().parse()?;
+
+    let owner_key = PrivateKeySigner::from_str(TEST_OWNER_PRIVATE_KEY)?;
+    let owner_provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(owner_key))
+        .connect_http(rpc_url);
+
+    let vm = ValidatorManager::new(GENESIS_VALIDATOR_MANAGER_ACCOUNT, &owner_provider);
+
+    // Verify roles are set on-chain
+    let default_admin_role = alloy_primitives::FixedBytes::<32>::ZERO;
+    assert!(
+        vm.hasRole(default_admin_role, TEST_OWNER_ADDRESS)
+            .call()
+            .await?,
+        "owner should have DEFAULT_ADMIN_ROLE"
+    );
+    assert!(
+        vm.hasRole(VALIDATOR_MANAGER_ROLE, TEST_OWNER_ADDRESS)
+            .call()
+            .await?,
+        "owner should have VALIDATOR_MANAGER_ROLE"
+    );
+
+    // Use a known valid key from the validator set: pick the first validator's key
+    let first_v = &validators[0];
+    let (x, y) = first_v.validator_key;
+    // The first validator is already registered; unregister then re-register to test both ops.
+    let info: ValidatorManager::ValidatorInfo = first_v.clone().into();
+    let validator_addr = vm
+        ._validatorAddress(info.validatorKey.clone())
+        .call()
+        .await?;
+
+    // Unregister (role-gated)
+    let receipt = vm
+        .unregister(validator_addr)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    assert!(receipt.status(), "unregister should succeed for owner with VALIDATOR_MANAGER_ROLE");
+
+    // Re-register (role-gated)
+    let mut pubkey = Vec::with_capacity(65);
+    pubkey.push(0x04);
+    pubkey.extend_from_slice(&x.to_be_bytes::<32>());
+    pubkey.extend_from_slice(&y.to_be_bytes::<32>());
+    let receipt = vm
+        .register(pubkey.into(), first_v.power)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    assert!(receipt.status(), "register should succeed for owner with VALIDATOR_MANAGER_ROLE");
+
+    // Update power (role-gated)
+    let receipt = vm
+        .updatePower(validator_addr, 9999)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    assert!(receipt.status(), "updatePower should succeed for owner with VALIDATOR_MANAGER_ROLE");
+
+    assert_eq!(vm.getValidator(validator_addr).call().await?.power, 9999u64);
 
     Ok(())
 }

@@ -122,6 +122,33 @@ contract ValidatorManagerUpgradeTest is Test {
         validatorManager.upgradeToAndCall(address(v2Impl), "");
     }
 
+    // -- Role state preservation after upgrade ---------------------------------
+
+    function testRoleStateSurvivesUpgrade() public {
+        bytes32 adminRole = validatorManager.DEFAULT_ADMIN_ROLE();
+        bytes32 managerRole = validatorManager.VALIDATOR_MANAGER_ROLE();
+
+        // Grant manager role to another address before upgrade
+        validatorManager.grantRole(managerRole, NON_OWNER);
+        assertTrue(validatorManager.hasRole(managerRole, NON_OWNER));
+
+        // Upgrade
+        ValidatorManagerV2 v2Impl = new ValidatorManagerV2();
+        validatorManager.upgradeToAndCall(address(v2Impl), "");
+
+        // Owner roles survive
+        assertTrue(validatorManager.hasRole(adminRole, address(this)));
+        assertTrue(validatorManager.hasRole(managerRole, address(this)));
+
+        // Delegated manager role survives
+        assertTrue(validatorManager.hasRole(managerRole, NON_OWNER));
+
+        // Delegated manager can still operate after upgrade
+        vm.prank(NON_OWNER);
+        validatorManager.register(ALICE_UNCOMPRESSED, ALICE_POWER);
+        assertEq(validatorManager.getValidatorCount(), 1);
+    }
+
     // -- Helpers --------------------------------------------------------------
 
     function keysEqual(ValidatorManager.Secp256k1Key memory a, ValidatorManager.Secp256k1Key memory b)

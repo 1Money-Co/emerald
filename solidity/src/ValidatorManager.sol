@@ -2,6 +2,7 @@
 pragma solidity ^0.8.28;
 
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
@@ -12,9 +13,19 @@ import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet
  * @dev Manages a set of validators with associated voting power.
  *      Deployed behind an ERC1967 proxy (UUPS pattern). Only the owner can
  *      authorize upgrades via `_authorizeUpgrade`.
+ *      Validator mutation operations are gated by VALIDATOR_MANAGER_ROLE,
+ *      which the owner can delegate to additional addresses via AccessControl.
  */
-contract ValidatorManager is Initializable, OwnableUpgradeable, ReentrancyGuardUpgradeable, UUPSUpgradeable {
+contract ValidatorManager is
+    Initializable,
+    OwnableUpgradeable,
+    AccessControlUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable
+{
     using EnumerableSet for EnumerableSet.AddressSet;
+
+    bytes32 public constant VALIDATOR_MANAGER_ROLE = keccak256("VALIDATOR_MANAGER_ROLE");
 
     uint256 internal constant SECP256K1_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F;
     uint256 internal constant SECP256K1_B = 7;
@@ -53,14 +64,47 @@ contract ValidatorManager is Initializable, OwnableUpgradeable, ReentrancyGuardU
      */
     function initialize(address initialOwner) public initializer {
         __Ownable_init(initialOwner);
+        __AccessControl_init();
         __ReentrancyGuard_init();
         __UUPSUpgradeable_init();
+        _grantRole(DEFAULT_ADMIN_ROLE, initialOwner);
+        _grantRole(VALIDATOR_MANAGER_ROLE, initialOwner);
     }
 
     /**
      * @dev Required by UUPSUpgradeable. Restricts upgrades to the owner.
      */
     function _authorizeUpgrade(address) internal override onlyOwner {}
+
+    /**
+     * @dev Transfers ownership and syncs AccessControl roles to the new owner.
+     *      The new owner receives DEFAULT_ADMIN_ROLE and VALIDATOR_MANAGER_ROLE;
+     *      both are revoked from the old owner. Self-transfer is a no-op for roles.
+     */
+    function transferOwnership(address newOwner) public override onlyOwner {
+        address oldOwner = owner();
+        if (newOwner == oldOwner) return;
+        super.transferOwnership(newOwner);
+        _grantRole(DEFAULT_ADMIN_ROLE, newOwner);
+        _grantRole(VALIDATOR_MANAGER_ROLE, newOwner);
+        _revokeRole(VALIDATOR_MANAGER_ROLE, oldOwner);
+        _revokeRole(DEFAULT_ADMIN_ROLE, oldOwner);
+    }
+
+    /**
+     * @dev Prevents revoking DEFAULT_ADMIN_ROLE or VALIDATOR_MANAGER_ROLE from the
+     *      current owner. Both `revokeRole` and `renounceRole` funnel through this
+     *      internal hook, so the owner's lockstep roles cannot be removed while they
+     *      remain owner. The `transferOwnership` override calls `_revokeRole` after
+     *      `super.transferOwnership`, so the old owner is no longer `owner()` and
+     *      the guard does not interfere.
+     */
+    function _revokeRole(bytes32 role, address account) internal override returns (bool) {
+        if (account == owner() && (role == DEFAULT_ADMIN_ROLE || role == VALIDATOR_MANAGER_ROLE)) {
+            revert CannotRevokeOwnerRole(role);
+        }
+        return super._revokeRole(role, account);
+    }
 
     /**
      * @dev Contract version identifier for upgrade/migration tooling.
@@ -87,6 +131,7 @@ contract ValidatorManager is Initializable, OwnableUpgradeable, ReentrancyGuardU
     error InvalidPublicKeyLength();
     error InvalidPublicKeyFormat();
     error InvalidPublicKeyCoordinates();
+    error CannotRevokeOwnerRole(bytes32 role);
 
     /**
      * @dev Modifier to check if power is valid (greater than 0)
@@ -165,7 +210,7 @@ contract ValidatorManager is Initializable, OwnableUpgradeable, ReentrancyGuardU
     function updateValidatorSet(
         ValidatorRegistration[] calldata addValidators,
         address[] calldata removeValidatorAddresses
-    ) external nonReentrant onlyOwner {
+    ) external nonReentrant onlyRole(VALIDATOR_MANAGER_ROLE) {
         _registerSet(addValidators);
         _unregisterAddresses(removeValidatorAddresses);
     }
@@ -174,7 +219,7 @@ contract ValidatorManager is Initializable, OwnableUpgradeable, ReentrancyGuardU
      * @dev Batch register validators.
      * @param registrations Array of validator registration payloads
      */
-    function registerSet(ValidatorRegistration[] calldata registrations) external nonReentrant onlyOwner {
+    function registerSet(ValidatorRegistration[] calldata registrations) external nonReentrant onlyRole(VALIDATOR_MANAGER_ROLE) {
         _registerSet(registrations);
     }
 
@@ -199,7 +244,7 @@ contract ValidatorManager is Initializable, OwnableUpgradeable, ReentrancyGuardU
      * @param validatorPublicKey The validator public key bytes
      * @param power The voting power for the validator
      */
-    function register(bytes calldata validatorPublicKey, uint64 power) external nonReentrant onlyOwner {
+    function register(bytes calldata validatorPublicKey, uint64 power) external nonReentrant onlyRole(VALIDATOR_MANAGER_ROLE) {
         Secp256k1Key memory validatorKey = _secp256k1KeyFromBytesInternal(validatorPublicKey);
         _register(ValidatorInfo({validatorKey: validatorKey, power: power}));
     }
@@ -225,15 +270,15 @@ contract ValidatorManager is Initializable, OwnableUpgradeable, ReentrancyGuardU
      * @dev Batch unregister validators.
      * @param validatorAddresses Array of validator addresses
      */
-    function unregisterSet(address[] calldata validatorAddresses) external nonReentrant onlyOwner {
+    function unregisterSet(address[] calldata validatorAddresses) external nonReentrant onlyRole(VALIDATOR_MANAGER_ROLE) {
         _unregisterAddresses(validatorAddresses);
     }
 
     /**
-     * @dev Unregister a validator (only callable by the owner).
+     * @dev Unregister a validator. Requires VALIDATOR_MANAGER_ROLE.
      * @param validatorAddress The address derived from the validator public key to remove.
      */
-    function unregister(address validatorAddress) external nonReentrant onlyOwner {
+    function unregister(address validatorAddress) external nonReentrant onlyRole(VALIDATOR_MANAGER_ROLE) {
         _unregisterByAddress(validatorAddress);
     }
 
@@ -265,14 +310,14 @@ contract ValidatorManager is Initializable, OwnableUpgradeable, ReentrancyGuardU
     }
 
     /**
-     * @dev Update a validator's power (only callable by the owner).
+     * @dev Update a validator's power. Requires VALIDATOR_MANAGER_ROLE.
      * @param validatorAddress The registered validator address whose voting power is being updated.
      * @param newPower The new voting power to assign.
      */
     function updatePower(address validatorAddress, uint64 newPower)
         external
         nonReentrant
-        onlyOwner
+        onlyRole(VALIDATOR_MANAGER_ROLE)
         validPower(newPower)
     {
         _requireValidatorAddressExists(validatorAddress);

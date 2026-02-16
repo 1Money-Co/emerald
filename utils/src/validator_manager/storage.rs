@@ -39,6 +39,18 @@ pub const INITIALIZABLE_NAMESPACE: &str = "openzeppelin.storage.Initializable";
 pub const INITIALIZABLE_SLOT: B256 =
     B256::new(hex!("f0c57e16840df040f15088dc2f81fe391c3923bec73e23a9662efc9c229c6a00"));
 
+/// Namespace identifier for AccessControlUpgradeable storage.
+pub const ACCESS_CONTROL_NAMESPACE: &str = "openzeppelin.storage.AccessControl";
+
+/// Pre-computed ERC-7201 slot for AccessControlUpgradeable (OZ 5.4.0).
+/// Layout: `mapping(bytes32 role => RoleData) _roles` at this base slot.
+pub const ACCESS_CONTROL_SLOT: B256 =
+    B256::new(hex!("02dd7bc7dec4dceedda775e58dd541e08a116c6c53815c0bd028192f7b626800"));
+
+/// `keccak256("VALIDATOR_MANAGER_ROLE")` — matches the Solidity constant.
+pub const VALIDATOR_MANAGER_ROLE: B256 =
+    B256::new(hex!("87421e189bd94dc1673f0d5255fa9f0cb8ff65bb74e34e0a80b07e9f0b4e34d5"));
+
 // ---------------------------------------------------------------------------
 // EIP-1967 proxy slots
 // ---------------------------------------------------------------------------
@@ -164,6 +176,38 @@ pub(crate) fn set_validator_entries_mapping(
     }
 
     Ok(())
+}
+
+/// Compute the storage slot for `_roles[role].hasRole[account]` in the
+/// AccessControl ERC-7201 namespace.
+///
+/// Layout:
+///   _roles mapping at ACCESS_CONTROL_SLOT (base)
+///   RoleData { mapping(address => bool) hasRole, bytes32 adminRole }
+///   hasRole slot = keccak256(account_padded || keccak256(role || ACCESS_CONTROL_SLOT))
+pub fn access_control_has_role_slot(role: B256, account: Address) -> B256 {
+    let ac_base = U256::from_be_bytes(ACCESS_CONTROL_SLOT.0);
+    // _roles[role] → RoleData base slot
+    let role_data_base = StorageSlotCalculator::mapping_slot(role, ac_base);
+    // hasRole[account] inside RoleData (hasRole is at struct field 0, so same slot)
+    let has_role_base = U256::from_be_bytes(role_data_base.0);
+    StorageSlotCalculator::mapping_slot(account.into_word(), has_role_base)
+}
+
+/// Write AccessControl role grants for the owner at genesis.
+/// Grants DEFAULT_ADMIN_ROLE (0x00) and VALIDATOR_MANAGER_ROLE.
+pub(crate) fn set_access_control_roles(storage: &mut BTreeMap<B256, B256>, owner: Address) {
+    let true_val = B256::from(U256::from(1u64).to_be_bytes::<32>());
+    let default_admin_role = B256::ZERO;
+
+    storage.insert(
+        access_control_has_role_slot(default_admin_role, owner),
+        true_val,
+    );
+    storage.insert(
+        access_control_has_role_slot(VALIDATOR_MANAGER_ROLE, owner),
+        true_val,
+    );
 }
 
 fn validator_address_from_key(key: &ValidatorKey) -> Address {
