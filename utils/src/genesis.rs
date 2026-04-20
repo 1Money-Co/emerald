@@ -164,6 +164,18 @@ pub(crate) fn generate_evm_genesis(
         unreachable!("unable to determine PoA owner address");
     };
 
+    // Fund the operator account if testnet param is not used
+    if !*testnet {
+        let amount = U256::from(*testnet_balance) * U256::from(10).pow(U256::from(18));
+        alloc.insert(
+            poa_address_owner,
+            GenesisAccount {
+                balance: amount,
+                ..Default::default()
+            },
+        );
+    }
+
     // Proxy at 0x2000: ERC1967Proxy runtime code + all contract storage
     let proxy_storage = generate_storage_data(
         initial_validators,
