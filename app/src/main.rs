@@ -2,6 +2,7 @@ use color_eyre::eyre::{eyre, Result};
 use emerald::node::App;
 use malachitebft_app_channel::app::node::Node;
 use malachitebft_eth_cli::args::{Args, Commands};
+use malachitebft_eth_cli::cmd::generate::GenerateCmd;
 use malachitebft_eth_cli::cmd::init::InitCmd;
 use malachitebft_eth_cli::cmd::start::StartCmd;
 use malachitebft_eth_cli::cmd::testnet::TestnetCmd;
@@ -44,7 +45,8 @@ fn main() -> Result<()> {
         Commands::Init(cmd) => init(&args, cmd, logging),
         Commands::Testnet(cmd) => testnet(&args, cmd, logging),
         Commands::ShowPubkey(cmd) => cmd.run(),
-        _ => unimplemented!(),
+        Commands::DistributedTestnet(_) => unimplemented!(),
+        Commands::Generate(cmd) => generate(cmd, logging),
     }
 }
 
@@ -102,6 +104,19 @@ fn init(args: &Args, cmd: &InitCmd, logging: config::LoggingConfig) -> Result<()
         logging,
     )
     .map_err(|error| eyre!("Failed to run init command {error:?}"))
+}
+
+fn generate(cmd: &GenerateCmd, logging: config::LoggingConfig) -> Result<()> {
+    let app = App {
+        config: Default::default(),
+        home_dir: Default::default(),
+        genesis_file: Default::default(),
+        emerald_config_file: Default::default(),
+        private_key_file: Default::default(),
+        start_height: Some(Height::new(1)),
+    };
+    cmd.run(&app, logging)
+        .map_err(|error| eyre!("Failed to run generate command: {error:?}"))
 }
 
 fn testnet(args: &Args, cmd: &TestnetCmd, logging: config::LoggingConfig) -> Result<()> {
