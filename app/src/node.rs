@@ -68,8 +68,25 @@ impl App {
         let span = tracing::error_span!("node", moniker = %config.moniker);
         let _enter = span.enter();
 
-        let private_key_file = self.load_private_key_file()?;
-        let private_key = self.load_private_key(private_key_file);
+        let emerald_config = self.load_emerald_config()?;
+
+        let key_bytes = {
+            let provider: Box<dyn key_provider::KeyProvider> =
+                match &emerald_config.key_provider {
+                    key_provider::KeyProviderConfig::File => {
+                        Box::new(key_provider::FileKeyProvider::new(&self.private_key_file))
+                    }
+                    key_provider::KeyProviderConfig::AwsSmKms(cfg) => {
+                        Box::new(key_provider::AwsSmKmsKeyProvider::new(cfg.clone()))
+                    }
+                };
+            provider
+                .load_private_key()
+                .await
+                .map_err(|e| eyre::eyre!("key provider error: {e}"))?
+        };
+        let private_key = PrivateKey::from_slice(key_bytes.as_ref())
+            .map_err(|e| eyre::eyre!("invalid private key bytes: {e}"))?;
         let public_key = self.get_public_key(&private_key);
         let address = self.get_address(&public_key);
         let signing_provider = self.get_signing_provider(private_key);
@@ -117,7 +134,6 @@ impl App {
             metrics,
         };
 
-        let emerald_config = self.load_emerald_config()?;
         let engine: Engine = {
             let engine_url = Url::parse(&emerald_config.ethereum_config.engine_authrpc_address)?;
             let jwt_path = PathBuf::from_str(&emerald_config.ethereum_config.jwt_token_path)?;
