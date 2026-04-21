@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum KeyProviderConfig {
     #[default]
@@ -9,7 +9,7 @@ pub enum KeyProviderConfig {
 }
 
 #[cfg(feature = "aws-sm-kms")]
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct AwsSmKmsConfig {
     pub secret_id: String,
     pub region: String,

@@ -10,6 +10,7 @@ publish    = { workspace = true }
 workspace = true
 
 [dependencies]
+key-provider            = { path = "../crates/key-provider" }
 malachitebft-core-types = { workspace = true }
 malachitebft-eth-types  = { workspace = true }
 malachitebft-eth-engine = { workspace = true }
