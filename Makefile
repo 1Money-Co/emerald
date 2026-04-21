@@ -30,7 +30,7 @@ testnet-config: testnet-clean build
 	./scripts/generate_testnet_config.sh --nodes $(words $(RETH_NODES)) --testnet-config-dir .testnet
 	cargo run --bin emerald -- testnet --home nodes --testnet-config .testnet/testnet_config.toml
 	ls nodes/*/config/priv_validator_key.json | xargs -I{} cargo run --bin emerald show-pubkey {} > nodes/validator_public_keys.txt
-	cargo run --bin emerald-utils genesis --public-keys-file ./nodes/validator_public_keys.txt --devnet
+	cargo run --bin emerald-utils genesis --public-keys-file ./nodes/validator_public_keys.txt --testnet
 
 testnet-reth-recreate:
 	docker compose down -v $(RETH_NODES)
