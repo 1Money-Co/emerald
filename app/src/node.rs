@@ -140,10 +140,7 @@ impl App {
 
         let prune_at_block_interval = emerald_config.prune_at_block_interval;
 
-        assert!(
-            prune_at_block_interval != 0,
-            "prune block interval cannot be 0"
-        );
+        assert_ne!(prune_at_block_interval, 0, "prune block interval cannot be 0");
 
         let state = State::new(
             genesis,

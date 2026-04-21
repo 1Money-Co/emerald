@@ -56,7 +56,7 @@ pub struct State {
     #[allow(dead_code)]
     ctx: EmeraldContext,
     pub signing_provider: K256Provider,
-    address: Address,
+    pub address: Address,
     pub store: Store,
     stream_nonce: u32,
     streams_map: PartStreamsMap,
