@@ -54,6 +54,7 @@ pub(crate) fn generate_genesis(
     chain_id: &u64,
     evm_genesis_output_file: &str,
     emerald_genesis_output_file: &str,
+    extra_alloc: &[(String, u64)],
 ) -> Result<()> {
     generate_evm_genesis(
         public_keys_file,
@@ -62,6 +63,7 @@ pub(crate) fn generate_genesis(
         testnet_balance,
         chain_id,
         evm_genesis_output_file,
+        extra_alloc,
     )?;
 
     generate_emerald_genesis(public_keys_file, emerald_genesis_output_file)?;
@@ -76,6 +78,7 @@ pub(crate) fn generate_evm_genesis(
     testnet_balance: &u64,
     chain_id: &u64,
     genesis_output_file: &str,
+    extra_alloc: &[(String, u64)],
 ) -> Result<()> {
     let mut alloc = BTreeMap::new();
     let signers = make_signers();
@@ -103,6 +106,19 @@ pub(crate) fn generate_evm_genesis(
                 },
             );
         }
+    }
+
+    for (addr_str, balance_eth) in extra_alloc {
+        let addr = Address::from_str(addr_str)
+            .map_err(|e| eyre!("invalid --alloc address '{}': {}", addr_str, e))?;
+        let amount = U256::from(*balance_eth) * U256::from(10).pow(U256::from(18));
+        alloc.insert(
+            addr,
+            GenesisAccount {
+                balance: amount,
+                ..Default::default()
+            },
+        );
     }
 
     let mut initial_validators = Vec::new();

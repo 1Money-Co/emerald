@@ -176,6 +176,7 @@ fn test_generate_evm_genesis_alloc_matches_expected_storage() -> eyre::Result<()
         genesis_path
             .to_str()
             .ok_or_else(|| eyre::eyre!("genesis path is not UTF-8"))?,
+        &[],
     )?;
 
     let genesis: Genesis = serde_json::from_slice(&fs::read(&genesis_path)?)?;
@@ -252,6 +253,7 @@ async fn test_anvil_boot_from_generated_genesis_proxy_and_impl_behavior() -> eyr
         genesis_path
             .to_str()
             .ok_or_else(|| eyre::eyre!("genesis path is not UTF-8"))?,
+        &[],
     )?;
 
     let genesis_path_str = genesis_path
@@ -321,6 +323,7 @@ async fn test_anvil_boot_from_generated_genesis_upgrade_succeeds()
         genesis_path
             .to_str()
             .ok_or_else(|| eyre::eyre!("genesis path is not UTF-8"))?,
+        &[],
     )?;
 
     let genesis_path_str = genesis_path
@@ -398,6 +401,7 @@ async fn test_anvil_genesis_owner_has_access_control_roles() -> eyre::Result<()>
         &0u64,
         &12345u64,
         genesis_path.to_str().unwrap(),
+        &[],
     )?;
 
     let anvil = Anvil::new()
@@ -469,6 +473,81 @@ async fn test_anvil_genesis_owner_has_access_control_roles() -> eyre::Result<()>
     assert!(receipt.status(), "updatePower should succeed for owner with VALIDATOR_MANAGER_ROLE");
 
     assert_eq!(vm.getValidator(validator_addr).call().await?.power, 9999u64);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Extra alloc tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_generate_evm_genesis_extra_alloc_funded() -> eyre::Result<()> {
+    let tmp = tempdir()?;
+    let keys_path = tmp.path().join("validator_keys.txt");
+    let genesis_path = tmp.path().join("genesis.json");
+
+    let validators = generate_validators_from_mnemonic(1)?;
+    write_validator_keys_file(&validators, &keys_path)?;
+
+    let other_addr: Address = address!("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
+    let extra_alloc = vec![
+        (format!("{TEST_OWNER_ADDRESS:#x}"), 100u64),
+        (format!("{other_addr:#x}"), 50u64),
+    ];
+
+    generate_evm_genesis(
+        keys_path.to_str().unwrap(),
+        &Some(format!("{TEST_OWNER_ADDRESS:#x}")),
+        &false,
+        &0u64,
+        &12345u64,
+        genesis_path.to_str().unwrap(),
+        &extra_alloc,
+    )?;
+
+    let genesis: Genesis = serde_json::from_slice(&fs::read(&genesis_path)?)?;
+    let eth = |n: u64| U256::from(n) * U256::from(10u64).pow(U256::from(18u64));
+
+    assert_eq!(
+        genesis.alloc.get(&TEST_OWNER_ADDRESS).map(|a| a.balance),
+        Some(eth(100)),
+        "poa owner should have 100 ETH from extra_alloc"
+    );
+    assert_eq!(
+        genesis.alloc.get(&other_addr).map(|a| a.balance),
+        Some(eth(50)),
+        "second address should have 50 ETH from extra_alloc"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_generate_evm_genesis_empty_extra_alloc_unchanged() -> eyre::Result<()> {
+    let tmp = tempdir()?;
+    let keys_path = tmp.path().join("validator_keys.txt");
+    let genesis_path = tmp.path().join("genesis.json");
+
+    let validators = generate_validators_from_mnemonic(1)?;
+    write_validator_keys_file(&validators, &keys_path)?;
+
+    generate_evm_genesis(
+        keys_path.to_str().unwrap(),
+        &Some(format!("{TEST_OWNER_ADDRESS:#x}")),
+        &false,
+        &0u64,
+        &12345u64,
+        genesis_path.to_str().unwrap(),
+        &[],
+    )?;
+
+    let genesis: Genesis = serde_json::from_slice(&fs::read(&genesis_path)?)?;
+    assert_eq!(
+        genesis.alloc.get(&TEST_OWNER_ADDRESS).map(|a| a.balance),
+        None,
+        "no extra_alloc means zero balance for owner"
+    );
 
     Ok(())
 }

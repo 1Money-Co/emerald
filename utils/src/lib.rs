@@ -30,15 +30,37 @@ impl Cli {
                 chain_id,
                 evm_genesis_output,
                 emerald_genesis_output,
-            } => generate_genesis(
-                public_keys_file,
-                poa_owner_address,
-                devnet,
-                devnet_balance,
-                chain_id,
-                evm_genesis_output,
-                emerald_genesis_output,
-            ),
+                alloc,
+            } => {
+                let extra: Vec<(String, u64)> = alloc
+                    .iter()
+                    .map(|entry| {
+                        let (addr, bal) = entry.split_once(':').ok_or_else(|| {
+                            color_eyre::eyre::eyre!(
+                                "invalid --alloc value '{}': expected format address:balance_eth",
+                                entry
+                            )
+                        })?;
+                        let balance: u64 = bal.parse().map_err(|_| {
+                            color_eyre::eyre::eyre!(
+                                "invalid balance in --alloc '{}': must be a non-negative integer",
+                                entry
+                            )
+                        })?;
+                        Ok((addr.to_string(), balance))
+                    })
+                    .collect::<Result<_>>()?;
+                generate_genesis(
+                    public_keys_file,
+                    poa_owner_address,
+                    devnet,
+                    devnet_balance,
+                    chain_id,
+                    evm_genesis_output,
+                    emerald_genesis_output,
+                    &extra,
+                )
+            }
             Commands::Spam(spam_cmd) => spam_cmd.run().await,
             Commands::Poa(poa_cmd) => poa_cmd.run().await,
             Commands::SpamContract(spam_contract_cmd) => spam_contract_cmd.run().await,
@@ -107,6 +129,13 @@ pub enum Commands {
             help = "Output path for the generated Emerald genesis file"
         )]
         emerald_genesis_output: String,
+
+        #[clap(
+            long,
+            value_name = "ADDRESS:BALANCE_ETH",
+            help = "Pre-fund an address at genesis (repeatable). Format: 0xADDR:AMOUNT_ETH"
+        )]
+        alloc: Vec<String>,
     },
 
     /// Spam transactions
