@@ -110,7 +110,7 @@ The code above replaces the default `consensus.p2p` section of nodes  0 and 1 to
     ```bash
     cargo run --bin emerald-utils genesis \
       --public-keys-file ./nodes/validator_public_keys.txt \
-      --devnet
+      --testnet
     ```
     
     - Creates `assets/genesis.json` with:

@@ -25,16 +25,18 @@ impl Cli {
             Commands::Genesis {
                 public_keys_file,
                 poa_owner_address,
-                devnet,
-                devnet_balance,
+                testnet,
+                token_owner_address,
+                mint_amount,
                 chain_id,
                 evm_genesis_output,
                 emerald_genesis_output,
             } => generate_genesis(
                 public_keys_file,
                 poa_owner_address,
-                devnet,
-                devnet_balance,
+                testnet,
+                token_owner_address,
+                mint_amount,
                 chain_id,
                 evm_genesis_output,
                 emerald_genesis_output,
@@ -62,7 +64,7 @@ pub enum Commands {
         #[clap(
             long,
             short = 'a',
-            required_unless_present = "devnet",
+            required_unless_present = "testnet",
             help = "Address of the Proof-of-Authority owner"
         )]
         poa_owner_address: Option<String>,
@@ -81,15 +83,22 @@ pub enum Commands {
             default_value_t = false,
             help = "Generate test addresses in genesis using mnemonic: 'test test test test test test test test test test test junk'"
         )]
-        devnet: bool,
+        testnet: bool,
+
+        #[clap(
+            long,
+            short = 'o',
+            help = "Address of the Token owner"
+        )]
+        token_owner_address: Option<String>,
 
         #[clap(
             long,
             short = 'b',
             default_value_t = 15_000_u64,
-            help = "Balance for each testnet wallet (default: 15000)"
+            help = "Gas tokens to mint (default: 15000)"
         )]
-        devnet_balance: u64,
+        mint_amount: u64,
 
         #[clap(
             long,

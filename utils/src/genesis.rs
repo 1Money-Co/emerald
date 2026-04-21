@@ -50,7 +50,8 @@ pub(crate) fn generate_genesis(
     public_keys_file: &str,
     poa_address_owner: &Option<String>,
     testnet: &bool,
-    testnet_balance: &u64,
+    token_owner: &Option<String>,
+    mint_amount: &u64,
     chain_id: &u64,
     evm_genesis_output_file: &str,
     emerald_genesis_output_file: &str,
@@ -59,7 +60,8 @@ pub(crate) fn generate_genesis(
         public_keys_file,
         poa_address_owner,
         testnet,
-        testnet_balance,
+        token_owner,
+        mint_amount,
         chain_id,
         evm_genesis_output_file,
     )?;
@@ -73,7 +75,8 @@ pub(crate) fn generate_evm_genesis(
     public_keys_file: &str,
     poa_address_owner: &Option<String>,
     testnet: &bool,
-    testnet_balance: &u64,
+    token_owner: &Option<String>,
+    mint_amount: &u64,
     chain_id: &u64,
     genesis_output_file: &str,
 ) -> Result<()> {
@@ -93,7 +96,7 @@ pub(crate) fn generate_evm_genesis(
             );
         }
 
-        let amount = U256::from(*testnet_balance) * U256::from(10).pow(U256::from(18));
+        let amount = U256::from(*mint_amount) * U256::from(10).pow(U256::from(18));
         for addr in &signer_addresses {
             alloc.insert(
                 *addr,
@@ -162,6 +165,22 @@ pub(crate) fn generate_evm_genesis(
         signers[0].address()
     } else {
         unreachable!("unable to determine PoA owner address");
+    };
+
+    // Parse token owner address and fund it
+    if let Some(addr_str) = token_owner {
+        let token_owner_address = Address::from_str(addr_str)
+            .map_err(|e| eyre!("invalid token owner address '{}': {}", addr_str, e))?;
+
+        let amount = U256::from(*mint_amount) * U256::from(10).pow(U256::from(18));
+        alloc.insert(
+            token_owner_address,
+            GenesisAccount {
+                balance: amount,
+                ..Default::default()
+            },
+        );
+
     };
 
     // Proxy at 0x2000: ERC1967Proxy runtime code + all contract storage

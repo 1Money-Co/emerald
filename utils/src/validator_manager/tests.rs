@@ -171,6 +171,7 @@ fn test_generate_evm_genesis_alloc_matches_expected_storage() -> eyre::Result<()
             .ok_or_else(|| eyre::eyre!("validator keys path is not UTF-8"))?,
         &owner,
         &testnet,
+        &None,
         &testnet_balance,
         &chain_id,
         genesis_path
@@ -247,6 +248,7 @@ async fn test_anvil_boot_from_generated_genesis_proxy_and_impl_behavior() -> eyr
             .ok_or_else(|| eyre::eyre!("validator keys path is not UTF-8"))?,
         &owner,
         &testnet,
+        &None,
         &testnet_balance,
         &chain_id,
         genesis_path
@@ -316,6 +318,7 @@ async fn test_anvil_boot_from_generated_genesis_upgrade_succeeds()
             .ok_or_else(|| eyre::eyre!("validator keys path is not UTF-8"))?,
         &owner,
         &testnet,
+        &None,
         &testnet_balance,
         &chain_id,
         genesis_path
@@ -395,6 +398,7 @@ async fn test_anvil_genesis_owner_has_access_control_roles() -> eyre::Result<()>
         keys_path.to_str().unwrap(),
         &owner,
         &false,
+        &None,
         &0u64,
         &12345u64,
         genesis_path.to_str().unwrap(),
@@ -508,7 +512,7 @@ async fn test_anvil_storage_comparison() -> eyre::Result<()> {
             .await?;
         assert_eq!(
             actual_value.to_be_bytes::<32>(),
-            (*expected_value),
+            *expected_value,
             "Storage mismatch at slot {slot}",
         );
     }
