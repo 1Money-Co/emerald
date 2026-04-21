@@ -29,5 +29,8 @@ default    = ["aws-sm-kms"]
 aws-sm-kms = ["dep:aws-config", "dep:aws-sdk-kms", "dep:aws-sdk-secretsmanager"]
 
 [dev-dependencies]
-tokio    = { workspace = true, features = ["rt", "macros"] }
+tokio    = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile = "3"
+aws-config             = { workspace = true }
+aws-sdk-kms            = { workspace = true }
+aws-sdk-secretsmanager = { workspace = true }
