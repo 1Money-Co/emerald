@@ -50,20 +50,20 @@ pub(crate) fn generate_genesis(
     public_keys_file: &str,
     poa_address_owner: &Option<String>,
     testnet: &bool,
-    testnet_balance: &u64,
+    token_owner: &Option<String>,
+    mint_amount: &u64,
     chain_id: &u64,
     evm_genesis_output_file: &str,
     emerald_genesis_output_file: &str,
-    extra_alloc: &[(String, u64)],
 ) -> Result<()> {
     generate_evm_genesis(
         public_keys_file,
         poa_address_owner,
         testnet,
-        testnet_balance,
+        token_owner,
+        mint_amount,
         chain_id,
         evm_genesis_output_file,
-        extra_alloc,
     )?;
 
     generate_emerald_genesis(public_keys_file, emerald_genesis_output_file)?;
@@ -75,10 +75,10 @@ pub(crate) fn generate_evm_genesis(
     public_keys_file: &str,
     poa_address_owner: &Option<String>,
     testnet: &bool,
-    testnet_balance: &u64,
+    token_owner: &Option<String>,
+    mint_amount: &u64,
     chain_id: &u64,
     genesis_output_file: &str,
-    extra_alloc: &[(String, u64)],
 ) -> Result<()> {
     let mut alloc = BTreeMap::new();
     let signers = make_signers();
@@ -96,7 +96,7 @@ pub(crate) fn generate_evm_genesis(
             );
         }
 
-        let amount = U256::from(*testnet_balance) * U256::from(10).pow(U256::from(18));
+        let amount = U256::from(*mint_amount) * U256::from(10).pow(U256::from(18));
         for addr in &signer_addresses {
             alloc.insert(
                 *addr,
@@ -106,19 +106,6 @@ pub(crate) fn generate_evm_genesis(
                 },
             );
         }
-    }
-
-    for (addr_str, balance_eth) in extra_alloc {
-        let addr = Address::from_str(addr_str)
-            .map_err(|e| eyre!("invalid --alloc address '{}': {}", addr_str, e))?;
-        let amount = U256::from(*balance_eth) * U256::from(10).pow(U256::from(18));
-        alloc.insert(
-            addr,
-            GenesisAccount {
-                balance: amount,
-                ..Default::default()
-            },
-        );
     }
 
     let mut initial_validators = Vec::new();
@@ -180,6 +167,21 @@ pub(crate) fn generate_evm_genesis(
         unreachable!("unable to determine PoA owner address");
     };
 
+    // Parse token owner address and fund it
+    if let Some(addr_str) = token_owner {
+        let token_owner_address = Address::from_str(addr_str)
+            .map_err(|e| eyre!("invalid token owner address '{}': {}", addr_str, e))?;
+
+        let amount = U256::from(*mint_amount) * U256::from(10).pow(U256::from(18));
+        alloc.insert(
+            token_owner_address,
+            GenesisAccount {
+                balance: amount,
+                ..Default::default()
+            },
+        );
+    };
+
     // Proxy at 0x2000: ERC1967Proxy runtime code + all contract storage
     let proxy_storage = generate_storage_data(
         initial_validators,
@@ -201,7 +203,9 @@ pub(crate) fn generate_evm_genesis(
     alloc.insert(
         GENESIS_VALIDATOR_MANAGER_IMPL_ACCOUNT,
         GenesisAccount {
-            code: Some(patched_impl_bytecode(GENESIS_VALIDATOR_MANAGER_IMPL_ACCOUNT)),
+            code: Some(patched_impl_bytecode(
+                GENESIS_VALIDATOR_MANAGER_IMPL_ACCOUNT,
+            )),
             storage: Some(generate_impl_storage()),
             ..Default::default()
         },

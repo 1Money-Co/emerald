@@ -25,42 +25,22 @@ impl Cli {
             Commands::Genesis {
                 public_keys_file,
                 poa_owner_address,
-                devnet,
-                devnet_balance,
+                testnet,
+                token_owner_address,
+                mint_amount,
                 chain_id,
                 evm_genesis_output,
                 emerald_genesis_output,
-                alloc,
-            } => {
-                let extra: Vec<(String, u64)> = alloc
-                    .iter()
-                    .map(|entry| {
-                        let (addr, bal) = entry.split_once(':').ok_or_else(|| {
-                            color_eyre::eyre::eyre!(
-                                "invalid --alloc value '{}': expected format address:balance_eth",
-                                entry
-                            )
-                        })?;
-                        let balance: u64 = bal.parse().map_err(|_| {
-                            color_eyre::eyre::eyre!(
-                                "invalid balance in --alloc '{}': must be a non-negative integer",
-                                entry
-                            )
-                        })?;
-                        Ok((addr.to_string(), balance))
-                    })
-                    .collect::<Result<_>>()?;
-                generate_genesis(
-                    public_keys_file,
-                    poa_owner_address,
-                    devnet,
-                    devnet_balance,
-                    chain_id,
-                    evm_genesis_output,
-                    emerald_genesis_output,
-                    &extra,
-                )
-            }
+            } => generate_genesis(
+                public_keys_file,
+                poa_owner_address,
+                testnet,
+                token_owner_address,
+                mint_amount,
+                chain_id,
+                evm_genesis_output,
+                emerald_genesis_output,
+            ),
             Commands::Spam(spam_cmd) => spam_cmd.run().await,
             Commands::Poa(poa_cmd) => poa_cmd.run().await,
             Commands::SpamContract(spam_contract_cmd) => spam_contract_cmd.run().await,
@@ -84,7 +64,7 @@ pub enum Commands {
         #[clap(
             long,
             short = 'a',
-            required_unless_present = "devnet",
+            required_unless_present = "testnet",
             help = "Address of the Proof-of-Authority owner"
         )]
         poa_owner_address: Option<String>,
@@ -103,15 +83,18 @@ pub enum Commands {
             default_value_t = false,
             help = "Generate test addresses in genesis using mnemonic: 'test test test test test test test test test test test junk'"
         )]
-        devnet: bool,
+        testnet: bool,
+
+        #[clap(long, short = 'o', help = "Address of the Token owner")]
+        token_owner_address: Option<String>,
 
         #[clap(
             long,
             short = 'b',
             default_value_t = 15_000_u64,
-            help = "Balance for each testnet wallet (default: 15000)"
+            help = "Gas tokens to mint (default: 15000)"
         )]
-        devnet_balance: u64,
+        mint_amount: u64,
 
         #[clap(
             long,
@@ -129,13 +112,6 @@ pub enum Commands {
             help = "Output path for the generated Emerald genesis file"
         )]
         emerald_genesis_output: String,
-
-        #[clap(
-            long,
-            value_name = "ADDRESS:BALANCE_ETH",
-            help = "Pre-fund an address at genesis (repeatable). Format: 0xADDR:AMOUNT_ETH"
-        )]
-        alloc: Vec<String>,
     },
 
     /// Spam transactions

@@ -108,10 +108,7 @@ fn test_erc7201_initializable_slot() {
 
 #[test]
 fn test_erc7201_access_control_slot() {
-    assert_eq!(
-        erc7201_slot(ACCESS_CONTROL_NAMESPACE),
-        ACCESS_CONTROL_SLOT
-    );
+    assert_eq!(erc7201_slot(ACCESS_CONTROL_NAMESPACE), ACCESS_CONTROL_SLOT);
 }
 
 #[test]
@@ -130,8 +127,7 @@ fn test_generate_storage_includes_access_control_roles() -> eyre::Result<()> {
     )?;
 
     let default_admin_role = alloy_primitives::B256::ZERO;
-    let true_val =
-        alloy_primitives::B256::from(U256::from(1u64).to_be_bytes::<32>());
+    let true_val = alloy_primitives::B256::from(U256::from(1u64).to_be_bytes::<32>());
 
     // DEFAULT_ADMIN_ROLE granted to owner
     let admin_slot = access_control_has_role_slot(default_admin_role, TEST_OWNER_ADDRESS);
@@ -171,12 +167,12 @@ fn test_generate_evm_genesis_alloc_matches_expected_storage() -> eyre::Result<()
             .ok_or_else(|| eyre::eyre!("validator keys path is not UTF-8"))?,
         &owner,
         &testnet,
+        &None,
         &testnet_balance,
         &chain_id,
         genesis_path
             .to_str()
             .ok_or_else(|| eyre::eyre!("genesis path is not UTF-8"))?,
-        &[],
     )?;
 
     let genesis: Genesis = serde_json::from_slice(&fs::read(&genesis_path)?)?;
@@ -195,10 +191,7 @@ fn test_generate_evm_genesis_alloc_matches_expected_storage() -> eyre::Result<()
         Some(&ValidatorManagerProxy::DEPLOYED_BYTECODE)
     );
     let expected_impl_bytecode = patched_impl_bytecode(GENESIS_VALIDATOR_MANAGER_IMPL_ACCOUNT);
-    assert_eq!(
-        impl_account.code.as_ref(),
-        Some(&expected_impl_bytecode)
-    );
+    assert_eq!(impl_account.code.as_ref(), Some(&expected_impl_bytecode));
 
     let expected_proxy_storage = generate_storage_data(
         with_genesis_power(&validators, 100),
@@ -207,7 +200,10 @@ fn test_generate_evm_genesis_alloc_matches_expected_storage() -> eyre::Result<()
     )?;
     let expected_impl_storage = generate_impl_storage();
 
-    assert_eq!(proxy_account.storage.as_ref(), Some(&expected_proxy_storage));
+    assert_eq!(
+        proxy_account.storage.as_ref(),
+        Some(&expected_proxy_storage)
+    );
     assert_eq!(impl_account.storage.as_ref(), Some(&expected_impl_storage));
 
     assert_eq!(
@@ -248,12 +244,12 @@ async fn test_anvil_boot_from_generated_genesis_proxy_and_impl_behavior() -> eyr
             .ok_or_else(|| eyre::eyre!("validator keys path is not UTF-8"))?,
         &owner,
         &testnet,
+        &None,
         &testnet_balance,
         &chain_id,
         genesis_path
             .to_str()
             .ok_or_else(|| eyre::eyre!("genesis path is not UTF-8"))?,
-        &[],
     )?;
 
     let genesis_path_str = genesis_path
@@ -284,8 +280,7 @@ async fn test_anvil_boot_from_generated_genesis_proxy_and_impl_behavior() -> eyr
     // requires the patched bytecode to have the correct implementation address.
     let uuid = vm_impl.proxiableUUID().call().await?;
     assert_eq!(
-        uuid,
-        EIP1967_IMPL_SLOT,
+        uuid, EIP1967_IMPL_SLOT,
         "proxiableUUID on implementation should return the EIP-1967 implementation slot"
     );
     let init_result = vm_impl.initialize(TEST_OWNER_ADDRESS).call().await;
@@ -299,8 +294,7 @@ async fn test_anvil_boot_from_generated_genesis_proxy_and_impl_behavior() -> eyr
 
 #[tokio::test]
 #[test_log::test]
-async fn test_anvil_boot_from_generated_genesis_upgrade_succeeds()
--> eyre::Result<()> {
+async fn test_anvil_boot_from_generated_genesis_upgrade_succeeds() -> eyre::Result<()> {
     let tmp = tempdir()?;
     let keys_path = tmp.path().join("validator_keys.txt");
     let genesis_path = tmp.path().join("genesis.json");
@@ -318,12 +312,12 @@ async fn test_anvil_boot_from_generated_genesis_upgrade_succeeds()
             .ok_or_else(|| eyre::eyre!("validator keys path is not UTF-8"))?,
         &owner,
         &testnet,
+        &None,
         &testnet_balance,
         &chain_id,
         genesis_path
             .to_str()
             .ok_or_else(|| eyre::eyre!("genesis path is not UTF-8"))?,
-        &[],
     )?;
 
     let genesis_path_str = genesis_path
@@ -398,10 +392,10 @@ async fn test_anvil_genesis_owner_has_access_control_roles() -> eyre::Result<()>
         keys_path.to_str().unwrap(),
         &owner,
         &false,
+        &None,
         &0u64,
         &12345u64,
         genesis_path.to_str().unwrap(),
-        &[],
     )?;
 
     let anvil = Anvil::new()
@@ -448,7 +442,10 @@ async fn test_anvil_genesis_owner_has_access_control_roles() -> eyre::Result<()>
         .await?
         .get_receipt()
         .await?;
-    assert!(receipt.status(), "unregister should succeed for owner with VALIDATOR_MANAGER_ROLE");
+    assert!(
+        receipt.status(),
+        "unregister should succeed for owner with VALIDATOR_MANAGER_ROLE"
+    );
 
     // Re-register (role-gated)
     let mut pubkey = Vec::with_capacity(65);
@@ -461,7 +458,10 @@ async fn test_anvil_genesis_owner_has_access_control_roles() -> eyre::Result<()>
         .await?
         .get_receipt()
         .await?;
-    assert!(receipt.status(), "register should succeed for owner with VALIDATOR_MANAGER_ROLE");
+    assert!(
+        receipt.status(),
+        "register should succeed for owner with VALIDATOR_MANAGER_ROLE"
+    );
 
     // Update power (role-gated)
     let receipt = vm
@@ -470,84 +470,12 @@ async fn test_anvil_genesis_owner_has_access_control_roles() -> eyre::Result<()>
         .await?
         .get_receipt()
         .await?;
-    assert!(receipt.status(), "updatePower should succeed for owner with VALIDATOR_MANAGER_ROLE");
+    assert!(
+        receipt.status(),
+        "updatePower should succeed for owner with VALIDATOR_MANAGER_ROLE"
+    );
 
     assert_eq!(vm.getValidator(validator_addr).call().await?.power, 9999u64);
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Extra alloc tests
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_generate_evm_genesis_extra_alloc_funded() -> eyre::Result<()> {
-    let tmp = tempdir()?;
-    let keys_path = tmp.path().join("validator_keys.txt");
-    let genesis_path = tmp.path().join("genesis.json");
-
-    let validators = generate_validators_from_mnemonic(1)?;
-    write_validator_keys_file(&validators, &keys_path)?;
-
-    let other_addr: Address = address!("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
-    let extra_alloc = vec![
-        (format!("{TEST_OWNER_ADDRESS:#x}"), 100u64),
-        (format!("{other_addr:#x}"), 50u64),
-    ];
-
-    generate_evm_genesis(
-        keys_path.to_str().unwrap(),
-        &Some(format!("{TEST_OWNER_ADDRESS:#x}")),
-        &false,
-        &0u64,
-        &12345u64,
-        genesis_path.to_str().unwrap(),
-        &extra_alloc,
-    )?;
-
-    let genesis: Genesis = serde_json::from_slice(&fs::read(&genesis_path)?)?;
-    let eth = |n: u64| U256::from(n) * U256::from(10u64).pow(U256::from(18u64));
-
-    assert_eq!(
-        genesis.alloc.get(&TEST_OWNER_ADDRESS).map(|a| a.balance),
-        Some(eth(100)),
-        "poa owner should have 100 ETH from extra_alloc"
-    );
-    assert_eq!(
-        genesis.alloc.get(&other_addr).map(|a| a.balance),
-        Some(eth(50)),
-        "second address should have 50 ETH from extra_alloc"
-    );
-
-    Ok(())
-}
-
-#[test]
-fn test_generate_evm_genesis_empty_extra_alloc_unchanged() -> eyre::Result<()> {
-    let tmp = tempdir()?;
-    let keys_path = tmp.path().join("validator_keys.txt");
-    let genesis_path = tmp.path().join("genesis.json");
-
-    let validators = generate_validators_from_mnemonic(1)?;
-    write_validator_keys_file(&validators, &keys_path)?;
-
-    generate_evm_genesis(
-        keys_path.to_str().unwrap(),
-        &Some(format!("{TEST_OWNER_ADDRESS:#x}")),
-        &false,
-        &0u64,
-        &12345u64,
-        genesis_path.to_str().unwrap(),
-        &[],
-    )?;
-
-    let genesis: Genesis = serde_json::from_slice(&fs::read(&genesis_path)?)?;
-    assert_eq!(
-        genesis.alloc.get(&TEST_OWNER_ADDRESS).map(|a| a.balance),
-        None,
-        "no extra_alloc means zero balance for owner"
-    );
 
     Ok(())
 }
@@ -577,7 +505,10 @@ async fn test_anvil_storage_comparison() -> eyre::Result<()> {
     // Generate expected storage (same function genesis uses)
     let expected_storage =
         generate_storage_data(validators.clone(), TEST_OWNER_ADDRESS, impl_address)?;
-    debug!("Generated {} expected storage slots", expected_storage.len());
+    debug!(
+        "Generated {} expected storage slots",
+        expected_storage.len()
+    );
 
     let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
 
@@ -587,7 +518,7 @@ async fn test_anvil_storage_comparison() -> eyre::Result<()> {
             .await?;
         assert_eq!(
             actual_value.to_be_bytes::<32>(),
-            (*expected_value),
+            *expected_value,
             "Storage mismatch at slot {slot}",
         );
     }
