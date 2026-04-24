@@ -71,15 +71,14 @@ impl App {
         let emerald_config = self.load_emerald_config()?;
 
         let key_bytes = {
-            let provider: Box<dyn key_provider::KeyProvider> =
-                match &emerald_config.key_provider {
-                    key_provider::KeyProviderConfig::File => {
-                        Box::new(key_provider::FileKeyProvider::new(&self.private_key_file))
-                    }
-                    key_provider::KeyProviderConfig::AwsSmKms(cfg) => {
-                        Box::new(key_provider::AwsSmKmsKeyProvider::new(cfg.clone()))
-                    }
-                };
+            let provider: Box<dyn key_provider::KeyProvider> = match &emerald_config.key_provider {
+                key_provider::KeyProviderConfig::File => {
+                    Box::new(key_provider::FileKeyProvider::new(&self.private_key_file))
+                }
+                key_provider::KeyProviderConfig::AwsSmKms(cfg) => {
+                    Box::new(key_provider::AwsSmKmsKeyProvider::new(cfg.clone()))
+                }
+            };
             provider
                 .load_private_key()
                 .await

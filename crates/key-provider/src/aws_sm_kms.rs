@@ -1,10 +1,23 @@
 use async_trait::async_trait;
-use base64::Engine as _;
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_kms::primitives::Blob;
+use base64::Engine as _;
+use tracing::{debug, info};
 use zeroize::Zeroizing;
 
-use crate::{KeyProvider, KeyProviderError, config::AwsSmKmsConfig};
+use crate::{config::AwsSmKmsConfig, KeyProvider, KeyProviderError};
+
+// Walk the std::error::Error source chain so callers see the root cause,
+// not just the outermost "dispatch failure" wrapper.
+fn full_error_chain(e: &dyn std::error::Error) -> String {
+    let mut msg = e.to_string();
+    let mut src = e.source();
+    while let Some(cause) = src {
+        msg.push_str(&format!(": {cause}"));
+        src = cause.source();
+    }
+    msg
+}
 
 pub struct AwsSmKmsKeyProvider {
     config: AwsSmKmsConfig,
@@ -19,7 +32,18 @@ impl AwsSmKmsKeyProvider {
 #[async_trait]
 impl KeyProvider for AwsSmKmsKeyProvider {
     async fn load_private_key(&self) -> Result<Zeroizing<[u8; 32]>, KeyProviderError> {
+        info!(
+            secret_id = %self.config.secret_id,
+            region    = %self.config.region,
+            "Loading private key from AWS Secrets Manager and KMS",
+        );
+
         // ── Step 1: fetch ciphertext blob from Secrets Manager ──────────────
+        debug!(
+            secret_id = %self.config.secret_id,
+            region    = %self.config.region,
+            "Fetching ciphertext from Secrets Manager",
+        );
         let sm_cfg = aws_config::defaults(BehaviorVersion::latest())
             .region(Region::new(self.config.region.clone()))
             .load()
@@ -31,12 +55,18 @@ impl KeyProvider for AwsSmKmsKeyProvider {
             .secret_id(&self.config.secret_id)
             .send()
             .await
-            .map_err(|e| KeyProviderError::SecretsManager(e.to_string()))?;
+            .map_err(|e| {
+                KeyProviderError::SecretsManager(format!(
+                    "GetSecretValue failed (secret_id={}, region={}): {}",
+                    self.config.secret_id,
+                    self.config.region,
+                    full_error_chain(&e),
+                ))
+            })?;
+        debug!("Ciphertext retrieved from Secrets Manager");
 
         let b64_ciphertext = resp.secret_string().ok_or_else(|| {
-            KeyProviderError::SecretsManager(
-                "GetSecretValue returned no secret string".into(),
-            )
+            KeyProviderError::SecretsManager("GetSecretValue returned no secret string".into())
         })?;
 
         // ── Step 2: base64-decode → raw KMS ciphertext blob ─────────────────
@@ -52,6 +82,11 @@ impl KeyProvider for AwsSmKmsKeyProvider {
             .kms_region
             .as_deref()
             .unwrap_or(&self.config.region);
+        debug!(
+            kms_key_id = %self.config.kms_key_id,
+            kms_region = %kms_region,
+            "Decrypting key material via KMS",
+        );
         let kms_cfg = aws_config::defaults(BehaviorVersion::latest())
             .region(Region::new(kms_region.to_string()))
             .load()
@@ -69,19 +104,23 @@ impl KeyProvider for AwsSmKmsKeyProvider {
             }
         }
 
-        let decrypt_resp = req
-            .send()
-            .await
-            .map_err(|e| KeyProviderError::Kms(e.to_string()))?;
-
-        let plaintext_blob = decrypt_resp.plaintext().ok_or_else(|| {
-            KeyProviderError::Kms("KMS Decrypt returned no plaintext".into())
+        let decrypt_resp = req.send().await.map_err(|e| {
+            KeyProviderError::Kms(format!(
+                "Decrypt failed (kms_key_id={}, region={}): {}",
+                self.config.kms_key_id,
+                kms_region,
+                full_error_chain(&e),
+            ))
         })?;
+        debug!("Key material decrypted by KMS");
+
+        let plaintext_blob = decrypt_resp
+            .plaintext()
+            .ok_or_else(|| KeyProviderError::Kms("KMS Decrypt returned no plaintext".into()))?;
 
         // ── Step 4: plaintext is hex(32-byte-key) → parse to [u8; 32] ───────
-        let hex_str = std::str::from_utf8(plaintext_blob.as_ref()).map_err(|_| {
-            KeyProviderError::ParseKey("KMS plaintext is not valid UTF-8".into())
-        })?;
+        let hex_str = std::str::from_utf8(plaintext_blob.as_ref())
+            .map_err(|_| KeyProviderError::ParseKey("KMS plaintext is not valid UTF-8".into()))?;
 
         let key_bytes = hex::decode(hex_str.trim())
             .map_err(|e| KeyProviderError::ParseKey(format!("KMS plaintext hex decode: {e}")))?;
@@ -90,6 +129,10 @@ impl KeyProvider for AwsSmKmsKeyProvider {
             KeyProviderError::ParseKey("KMS plaintext must decode to exactly 32 bytes".into())
         })?;
 
+        info!(
+            secret_id = %self.config.secret_id,
+            "Private key loaded successfully from AWS",
+        );
         Ok(Zeroizing::new(arr))
     }
 }
