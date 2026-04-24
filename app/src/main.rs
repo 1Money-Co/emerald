@@ -46,6 +46,12 @@ fn main() -> Result<()> {
         Commands::Testnet(cmd) => testnet(&args, cmd, logging),
         Commands::ShowPubkey(cmd) => cmd.run(),
         Commands::DistributedTestnet(_) => unimplemented!(),
+        // The `generate` subcommand supersedes the `testnet` subcommand for new
+        // deployments: it supports both plaintext file keys (same behaviour as
+        // `testnet`) and AWS SM+KMS-backed keys for deployments with higher
+        // key-security requirements.  The `testnet` subcommand is kept unchanged
+        // for backward compatibility with existing documentation and scripts; new
+        // deployments should use `generate`.
         Commands::Generate(cmd) => generate(cmd, logging),
     }
 }
