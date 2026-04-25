@@ -13,11 +13,22 @@ Optional arguments:
     --nodes                Number of nodes to include in the generated config
     --node-keys            Private key for a node (can be specified multiple times)
                           If provided, the number of nodes is inferred from the number of keys
+                          Mutually exclusive with --key-provider aws-sm-kms
     --fee-recipient        Fee recipient address
+
+    --key-provider         Key loading mechanism written into each node's config: file|aws-sm-kms
+                          Default: file
+    --env                  Deployment environment (e.g. Local, Devnet, Testnet, Mainnet)
+                          Embedded in the Secrets Manager secret ID (aws-sm-kms only):
+                          "1MoneyNetwork/<env>/Emerald<i+1>/SecretKey"
+                          Default: Mainnet
+    --region            AWS region for Secrets Manager (aws-sm-kms only, default: us-east-1)
+    --kms-key-id           KMS key ID or alias (required for aws-sm-kms)
+    --kms-region           KMS region if different from --region (optional)
 
     --custom-config-path  Path to .toml file containing IP addresses of the nodes. This IP will be used instead
                           of localhost for reth and eth authethication. Make sure they match the listening IPs of
-                          your execution client. 
+                          your execution client.
                           Sample format of file
                           [node0]
                           ip = "168.0.4.2"
@@ -34,6 +45,11 @@ testnet_config_dir=""
 node_keys=()
 fee_recipient="0x4242424242424242424242424242424242424242"
 custom_config_path=""
+key_provider="file"
+env="Mainnet"
+region="us-east-1"
+kms_key_id=""
+kms_region=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -82,6 +98,51 @@ while [[ $# -gt 0 ]]; do
             custom_config_path="${1#*=}"
             shift
             ;;
+        --key-provider)
+            [[ $# -ge 2 ]] || usage
+            key_provider="$2"
+            shift 2
+            ;;
+        --key-provider=*)
+            key_provider="${1#*=}"
+            shift
+            ;;
+        --env)
+            [[ $# -ge 2 ]] || usage
+            env="$2"
+            shift 2
+            ;;
+        --env=*)
+            env="${1#*=}"
+            shift
+            ;;
+        --region)
+            [[ $# -ge 2 ]] || usage
+            region="$2"
+            shift 2
+            ;;
+        --region=*)
+            region="${1#*=}"
+            shift
+            ;;
+        --kms-key-id)
+            [[ $# -ge 2 ]] || usage
+            kms_key_id="$2"
+            shift 2
+            ;;
+        --kms-key-id=*)
+            kms_key_id="${1#*=}"
+            shift
+            ;;
+        --kms-region)
+            [[ $# -ge 2 ]] || usage
+            kms_region="$2"
+            shift 2
+            ;;
+        --kms-region=*)
+            kms_region="${1#*=}"
+            shift
+            ;;
         -h|--help)
             usage
             ;;
@@ -121,6 +182,24 @@ if ! [[ "$fee_recipient" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
     echo "Invalid --fee-recipient: must be 0x followed by 40 hex characters" >&2
     echo "Example: 0x4242424242424242424242424242424242424242" >&2
     exit 2
+fi
+
+# Validate --key-provider value
+if [[ "$key_provider" != "file" && "$key_provider" != "aws-sm-kms" ]]; then
+    echo "--key-provider must be 'file' or 'aws-sm-kms'" >&2
+    exit 2
+fi
+
+# Validate aws-sm-kms requirements and mutual exclusions
+if [[ "$key_provider" == "aws-sm-kms" ]]; then
+    if [[ ${#node_keys[@]} -gt 0 ]]; then
+        echo "--node-keys and --key-provider aws-sm-kms are mutually exclusive" >&2
+        exit 2
+    fi
+    if [[ -z "$kms_key_id" ]]; then
+        echo "--kms-key-id is required when --key-provider aws-sm-kms" >&2
+        exit 2
+    fi
 fi
 
 TESTNET_DIR="$testnet_config_dir"
@@ -255,5 +334,17 @@ EOF
       fi
       if [[ -n "$fee_recipient" ]]; then
           echo "fee_recipient = \"$fee_recipient\"" >> "$TESTNET_DIR/config/$i/config.toml"
+      fi
+      if [[ "$key_provider" == "aws-sm-kms" ]]; then
+          {
+              printf '\n[key_provider]\n'
+              printf 'type       = "aws_sm_kms"\n'
+              printf 'secret_id  = "1MoneyNetwork/%s/Emerald%d/SecretKey"\n' "$env" "$((i + 1))"
+              printf 'region     = "%s"\n' "$region"
+              printf 'kms_key_id = "%s"\n' "$kms_key_id"
+              if [[ -n "$kms_region" ]]; then
+                  printf 'kms_region = "%s"\n' "$kms_region"
+              fi
+          } >> "$TESTNET_DIR/config/$i/config.toml"
       fi
 done

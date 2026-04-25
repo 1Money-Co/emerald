@@ -51,6 +51,7 @@ const TARGET_CRATES: &[&str] = &[
     "informalsystems_malachitebft",
     "malachitebft_eth",
     "emerald",
+    "key_provider",
 ];
 
 /// Build a tracing directive setting the log level for the

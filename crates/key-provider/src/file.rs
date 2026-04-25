@@ -1,8 +1,9 @@
-use std::path::PathBuf;
+use crate::{KeyProvider, KeyProviderError};
 use async_trait::async_trait;
 use base64::Engine as _;
+use std::path::PathBuf;
+use tracing::info;
 use zeroize::Zeroizing;
-use crate::{KeyProvider, KeyProviderError};
 
 pub struct FileKeyProvider {
     pub path: PathBuf,
@@ -22,7 +23,8 @@ struct PrivValidatorKeyFile {
 #[async_trait]
 impl KeyProvider for FileKeyProvider {
     async fn load_private_key(&self) -> Result<Zeroizing<[u8; 32]>, KeyProviderError> {
-        let contents = std::fs::read_to_string(&self.path)?;
+        let key_path = &self.path;
+        let contents = std::fs::read_to_string(key_path)?;
         let parsed: PrivValidatorKeyFile = serde_json::from_str(&contents)
             .map_err(|e| KeyProviderError::ParseKey(e.to_string()))?;
         let raw = base64::engine::general_purpose::STANDARD
@@ -31,6 +33,7 @@ impl KeyProvider for FileKeyProvider {
         let arr: [u8; 32] = raw
             .try_into()
             .map_err(|_| KeyProviderError::ParseKey("key must be exactly 32 bytes".into()))?;
+        info!(?key_path, "Private key loaded successfully from local file");
         Ok(Zeroizing::new(arr))
     }
 }
