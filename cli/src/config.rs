@@ -56,6 +56,11 @@ pub struct EmeraldConfig {
     #[serde(default = "prune_at_interval_default")]
     pub prune_at_block_interval: u64,
 
+    /// Key provider configuration (file-based or AWS SM+KMS).
+    /// Defaults to file-based for backward compatibility.
+    #[serde(default)]
+    pub key_provider: key_provider::KeyProviderConfig,
+
     // Application set min_block_time forcing the app to sleep
     // before moving onto the next height.
     // Malachite does not have a notion of min_block_time, thus
@@ -160,6 +165,58 @@ impl NodeConfig for Config {
 
     fn value_sync_mut(&mut self) -> &mut ValueSyncConfig {
         &mut self.value_sync
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emerald_config_defaults_to_file_key_provider() {
+        let toml = r#"
+moniker = "node-0"
+fee_recipient = "0x0000000000000000000000000000000000000000"
+
+[ethereum_config]
+execution_authrpc_address = "http://127.0.0.1:8551"
+engine_authrpc_address    = "http://127.0.0.1:8552"
+jwt_token_path            = "./assets/jwt.hex"
+"#;
+        let cfg: EmeraldConfig = toml::from_str(toml).unwrap();
+        assert!(matches!(
+            cfg.key_provider,
+            key_provider::KeyProviderConfig::File
+        ));
+    }
+
+    #[test]
+    fn emerald_config_parses_aws_sm_kms_key_provider() {
+        let toml = r#"
+moniker = "node-0"
+fee_recipient = "0x0000000000000000000000000000000000000000"
+
+[ethereum_config]
+execution_authrpc_address = "http://127.0.0.1:8551"
+engine_authrpc_address    = "http://127.0.0.1:8552"
+jwt_token_path            = "./assets/jwt.hex"
+
+[key_provider]
+type       = "aws_sm_kms"
+secret_id  = "emerald/mainnet/node-0/key"
+region     = "ap-east-1"
+kms_key_id = "alias/emerald-validator-keys"
+"#;
+        let cfg: EmeraldConfig = toml::from_str(toml).unwrap();
+        match &cfg.key_provider {
+            key_provider::KeyProviderConfig::AwsSmKms(c) => {
+                assert_eq!(c.secret_id, "emerald/mainnet/node-0/key");
+                assert_eq!(c.region, "ap-east-1");
+                assert_eq!(c.kms_key_id, "alias/emerald-validator-keys");
+                assert!(c.kms_region.is_none());
+            }
+            other => panic!("expected AwsSmKms, got {:?}", other),
+        }
     }
 }
 

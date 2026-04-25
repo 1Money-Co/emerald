@@ -6,6 +6,7 @@ members = [
   "cli",
   "contracts",
   "crates/core",
+  "crates/key-provider",
   "engine",
   "utils",
   "types",
@@ -111,6 +112,10 @@ tracing-subscriber = { version = "0.3.22", features = [ "env-filter" ] }
 url                = "2"
 k256               = { version = "0.13" }
 test-log           = { version = "0.2", features = [ "trace" ] }
+aws-config               = { version = "1" }
+aws-sdk-kms              = { version = "1" }
+aws-sdk-secretsmanager   = { version = "1" }
+zeroize                  = { version = "1", features = ["derive"] }
 
 [workspace.dependencies.malachitebft-app]
 package = "informalsystems-malachitebft-app"

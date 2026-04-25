@@ -85,11 +85,7 @@ pub enum Commands {
         )]
         testnet: bool,
 
-        #[clap(
-            long,
-            short = 'o',
-            help = "Address of the Token owner"
-        )]
+        #[clap(long, short = 'o', help = "Address of the Token owner")]
         token_owner_address: Option<String>,
 
         #[clap(

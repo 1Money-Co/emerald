@@ -13,6 +13,7 @@ use directories::BaseDirs;
 use malachitebft_config::{LogFormat, LogLevel};
 
 use crate::cmd::distributed_testnet::DistributedTestnetCmd;
+use crate::cmd::generate::GenerateCmd;
 use crate::cmd::init::InitCmd;
 use crate::cmd::show_pubkey::ShowPubkeyCmd;
 use crate::cmd::start::StartCmd;
@@ -63,6 +64,10 @@ pub enum Commands {
 
     /// Extract secp256k1 public key from a file containing a Secp256k1 private key
     ShowPubkey(ShowPubkeyCmd),
+
+    /// Generate per-node configs (file or AWS SM+KMS key provider).
+    #[command(arg_required_else_help = true)]
+    Generate(GenerateCmd),
 }
 
 impl Default for Commands {

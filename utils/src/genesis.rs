@@ -180,7 +180,6 @@ pub(crate) fn generate_evm_genesis(
                 ..Default::default()
             },
         );
-
     };
 
     // Proxy at 0x2000: ERC1967Proxy runtime code + all contract storage
@@ -204,7 +203,9 @@ pub(crate) fn generate_evm_genesis(
     alloc.insert(
         GENESIS_VALIDATOR_MANAGER_IMPL_ACCOUNT,
         GenesisAccount {
-            code: Some(patched_impl_bytecode(GENESIS_VALIDATOR_MANAGER_IMPL_ACCOUNT)),
+            code: Some(patched_impl_bytecode(
+                GENESIS_VALIDATOR_MANAGER_IMPL_ACCOUNT,
+            )),
             storage: Some(generate_impl_storage()),
             ..Default::default()
         },
