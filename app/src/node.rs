@@ -3,7 +3,7 @@
 
 use core::str::FromStr;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use color_eyre::eyre;
@@ -69,6 +69,7 @@ impl App {
         let _enter = span.enter();
 
         let emerald_config = self.load_emerald_config()?;
+        log_emerald_config(&self.emerald_config_file, &emerald_config);
 
         let key_bytes = {
             let provider: Box<dyn key_provider::KeyProvider> = match &emerald_config.key_provider {
@@ -292,8 +293,63 @@ impl Node for App {
     }
 
     async fn run(self) -> eyre::Result<()> {
+        self.log_startup_fields();
         let handles = self.start().await?;
         handles.app.await.map_err(Into::into)
+    }
+}
+
+impl App {
+    fn log_startup_fields(&self) {
+        tracing::info!(
+            home_dir = %self.home_dir.display(),
+            genesis_file = %self.genesis_file.display(),
+            emerald_config_file = %self.emerald_config_file.display(),
+            private_key_file = %self.private_key_file.display(),
+            start_height = ?self.start_height,
+            "Starting Emerald node",
+        );
+    }
+}
+
+fn log_emerald_config(path: &Path, config: &EmeraldConfig) {
+    tracing::info!(
+        config_file = %path.display(),
+        moniker = %config.moniker,
+        execution_authrpc_address = %config.ethereum_config.execution_authrpc_address,
+        engine_authrpc_address = %config.ethereum_config.engine_authrpc_address,
+        jwt_token_path = %config.ethereum_config.jwt_token_path,
+        eth_genesis_path = %config.ethereum_config.eth_genesis_path,
+        key_provider = key_provider_kind(&config.key_provider),
+        min_block_time = ?config.min_block_time,
+        fee_recipient = ?config.fee_recipient,
+        el_node_type = ?config.el_node_type,
+        retry_config = ?config.retry_config,
+        num_certificates_to_retain = config.num_certificates_to_retain,
+        prune_at_block_interval = config.prune_at_block_interval,
+        num_temp_blocks_retained = config.num_temp_blocks_retained,
+        emerald_config = ?config,
+        "Loaded Emerald configuration",
+    );
+}
+
+fn key_provider_kind(config: &key_provider::KeyProviderConfig) -> &'static str {
+    match config {
+        key_provider::KeyProviderConfig::File => "file",
+        key_provider::KeyProviderConfig::AwsSmKms(_) => "aws_sm_kms",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_provider_kind;
+
+    #[test]
+    fn key_provider_kind_names_file_provider() {
+        assert_eq!(
+            key_provider_kind(&key_provider::KeyProviderConfig::File),
+            "file"
+        );
     }
 }
 
