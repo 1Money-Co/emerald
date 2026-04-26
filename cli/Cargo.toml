@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 key-provider            = { path = "../crates/key-provider" }
+emerald-build-info      = { workspace = true }
 malachitebft-core-types = { workspace = true }
 malachitebft-eth-types  = { workspace = true }
 malachitebft-eth-engine = { workspace = true }

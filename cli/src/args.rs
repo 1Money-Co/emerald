@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use directories::BaseDirs;
+use emerald_build_info::build_info;
 use malachitebft_config::{LogFormat, LogLevel};
 
 use crate::cmd::distributed_testnet::DistributedTestnetCmd;
@@ -26,7 +27,13 @@ const GENESIS_FILE: &str = "genesis.json";
 const PRIV_VALIDATOR_KEY_FILE: &str = "priv_validator_key.json";
 
 #[derive(Parser, Clone, Debug, Default)]
-#[command(version, about, long_about = None)]
+#[command(
+    name = "emerald",
+    version,
+    long_version = build_info::CLAP_LONG_VERSION,
+    about,
+    long_about = None
+)]
 pub struct Args {
     /// Home directory for Malachite (default: `$HOME/.emerald-devnet`)
     #[arg(long, global = true, value_name = "HOME_DIR")]
@@ -134,5 +141,26 @@ impl Args {
     /// configuration folder.
     pub fn get_priv_validator_key_file_path(&self) -> Result<PathBuf, Error> {
         Ok(self.get_config_dir()?.join(PRIV_VALIDATOR_KEY_FILE))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::Args;
+
+    #[test]
+    fn long_version_includes_build_metadata() {
+        let cmd = Args::command();
+        let long_version = cmd
+            .get_long_version()
+            .expect("long version should be configured")
+            .to_string();
+
+        assert!(long_version.contains(env!("CARGO_PKG_VERSION")));
+        assert!(long_version.contains("commit"));
+        assert!(long_version.contains("branch"));
+        assert_eq!(cmd.get_name(), "emerald");
     }
 }

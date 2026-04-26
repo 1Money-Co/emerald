@@ -5,6 +5,7 @@ members = [
   "app",
   "cli",
   "contracts",
+  "crates/build-info",
   "crates/core",
   "crates/key-provider",
   "engine",
@@ -61,6 +62,7 @@ std_instead_of_core           = "deny"
 
 [workspace.dependencies]
 emerald                 = { version = "0.0.1", path = "app" }
+emerald-build-info      = { version = "0.0.1", path = "crates/build-info" }
 emerald-contracts       = { version = "0.0.1", path = "contracts" }
 emerald-core            = { version = "0.0.1", path = "crates/core" }
 malachitebft-eth-cli    = { version = "0.0.1", path = "cli" }
