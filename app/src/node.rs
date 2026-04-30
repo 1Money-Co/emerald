@@ -25,6 +25,7 @@ use malachitebft_eth_types::secp256k1::{K256Provider, PrivateKey, PublicKey};
 use malachitebft_eth_types::{Address, EmeraldContext, Genesis, Height, Validator, ValidatorSet};
 use rand::{CryptoRng, RngCore};
 use tokio::task::JoinHandle;
+use tracing::info;
 use url::Url;
 
 // Use the same types used for integration tests.
@@ -89,6 +90,12 @@ impl App {
             .map_err(|e| eyre::eyre!("invalid private key bytes: {e}"))?;
         let public_key = self.get_public_key(&private_key);
         let address = self.get_address(&public_key);
+        let public_key_hex = public_key_hex(&public_key);
+        info!(
+            public_key = %public_key_hex,
+            ?address,
+            "loaded node public key and address"
+        );
         let signing_provider = self.get_signing_provider(private_key);
         let ctx = EmeraldContext::new();
 
@@ -340,9 +347,20 @@ fn key_provider_kind(config: &key_provider::KeyProviderConfig) -> &'static str {
     }
 }
 
+fn public_key_hex(public_key: &PublicKey) -> String {
+    let uncompressed = public_key.inner().to_encoded_point(false);
+    let bytes = uncompressed.as_bytes();
+
+    debug_assert_eq!(bytes.len(), 65);
+    debug_assert_eq!(bytes[0], 0x04);
+
+    format!("0x{}", hex::encode(&bytes[1..]))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::key_provider_kind;
+    use super::{key_provider_kind, public_key_hex};
+    use malachitebft_eth_types::secp256k1::PrivateKey;
 
     #[test]
     fn key_provider_kind_names_file_provider() {
@@ -350,6 +368,20 @@ mod tests {
             key_provider_kind(&key_provider::KeyProviderConfig::File),
             "file"
         );
+    }
+
+    #[test]
+    fn public_key_hex_uses_show_pubkey_format() {
+        let private_key = PrivateKey::from_slice(&[7_u8; 32]).unwrap();
+        let public_key = private_key.public_key();
+        let encoded = public_key_hex(&public_key);
+
+        assert!(encoded.starts_with("0x"));
+        let encoded_bytes = hex::decode(encoded.strip_prefix("0x").unwrap()).unwrap();
+        let uncompressed = public_key.inner().to_encoded_point(false);
+
+        assert_eq!(encoded_bytes.len(), 64);
+        assert_eq!(encoded_bytes, &uncompressed.as_bytes()[1..]);
     }
 }
 
