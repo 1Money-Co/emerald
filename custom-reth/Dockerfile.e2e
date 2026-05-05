@@ -30,6 +30,8 @@ RUN apt-get update -qq && \
 
 RUN mkdir -p /app/conf /app/data /app/logs
 
+WORKDIR /app
+
 COPY --from=builder /build/target/release/custom-reth /usr/local/bin/custom-reth
 
 ENTRYPOINT ["/usr/local/bin/custom-reth"]

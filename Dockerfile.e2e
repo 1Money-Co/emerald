@@ -41,9 +41,19 @@ RUN apt-get update -qq && \
 
 RUN useradd -m emerald -s /bin/bash
 
-WORKDIR /home/emerald
+WORKDIR /app
 
-RUN mkdir -p /home/emerald/.emerald /app/conf /app/data /app/logs && \
+RUN mkdir -p \
+      /home/emerald/.emerald \
+      /app/config \
+      /app/data \
+      /app/logs \
+      /app/node \
+      /app/shared/emerald \
+      /app/shared/reth && \
+    ln -s /app/node/config.toml /app/config/config.toml && \
+    ln -s /app/node/priv_validator_key.json /app/config/priv_validator_key.json && \
+    ln -s /app/shared/emerald/genesis.json /app/config/genesis.json && \
     chown -R emerald:emerald /home/emerald /app
 
 COPY --from=builder /app/target/release/emerald /usr/local/bin/emerald
