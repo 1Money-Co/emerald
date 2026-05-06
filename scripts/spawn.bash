@@ -5,8 +5,10 @@
 # - the home directory for the nodes configuration folders
 
 function help {
-    echo "Usage: spawn.sh [--help] --nodes NODES_COUNT --home NODES_HOME [--app APP_BINARY] [--no-reset] [--no-wait]"
+    echo "Usage: spawn.sh [--help] --nodes NODES_COUNT --home NODES_HOME [--app APP_BINARY] [--no-reset] [--no-wait] [--progress-check-delay SECONDS]"
 }
+
+PROGRESS_CHECK_DELAY=5
 
 # Parse arguments
 while [[ "$#" -gt 0 ]]; do
@@ -18,10 +20,16 @@ while [[ "$#" -gt 0 ]]; do
         --no-reset) NO_RESET=1 ;;
         --no-delay) NO_DELAY=1 ;;
         --no-wait) NO_WAIT=1 ;;
+        --progress-check-delay) PROGRESS_CHECK_DELAY="$2"; shift ;;
         *) echo "Unknown parameter passed: $1"; help; exit 1 ;;
     esac
     shift
 done
+
+if [[ ! "$PROGRESS_CHECK_DELAY" =~ ^[0-9]+$ || "$PROGRESS_CHECK_DELAY" -le 0 ]]; then
+    echo "--progress-check-delay must be a positive integer number of seconds"
+    exit 1
+fi
 
 # Check required arguments
 if [[ -z "$NODES_COUNT" ]]; then
@@ -80,7 +88,7 @@ function wait_for_reth {
 function check_reth_progress {
     NODE_PORT=$1
     INITIAL_BLOCK=$(cast block-number --rpc-url 127.0.0.1:$NODE_PORT)
-    sleep 5
+    sleep "$PROGRESS_CHECK_DELAY"
     NEW_BLOCK=$(cast block-number --rpc-url 127.0.0.1:$NODE_PORT)
     if [[ ! $INITIAL_BLOCK -lt $NEW_BLOCK ]]; then
         echo "No new blocks mined on node at port $NODE_PORT. Exiting with error."
