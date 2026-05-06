@@ -1,5 +1,6 @@
 use core::time::Duration;
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Result};
 use emerald::node::{App as EmeraldApp, AppRuntime};
@@ -143,6 +144,7 @@ impl EmeraldDriver {
             emerald_config_file,
             private_key_file,
             start_height: Some(EmeraldHeight::new(0)),
+            resolved_private_key: Arc::new(OnceLock::new()),
         })
     }
 
