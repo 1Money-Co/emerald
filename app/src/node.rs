@@ -279,9 +279,15 @@ impl Node for App {
         // it. Non-engine subcommands (init/testnet/generate) leave the cache
         // empty and fall through to the on-disk file.
         if let Some(pk) = self.resolved_private_key.get() {
+            info!("Using cached private key pre-loaded in build_runtime");
             return Ok(pk.clone());
         }
+
         let private_key = std::fs::read_to_string(&self.private_key_file)?;
+        info!(
+            "Loading private key from file: {}",
+            self.private_key_file.display()
+        );
         serde_json::from_str(&private_key).map_err(Into::into)
     }
 
