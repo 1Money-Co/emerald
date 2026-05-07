@@ -4,6 +4,7 @@
 use core::str::FromStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use color_eyre::eyre;
@@ -43,6 +44,13 @@ pub struct App {
     pub emerald_config_file: PathBuf,
     pub private_key_file: PathBuf,
     pub start_height: Option<Height>,
+    /// Private key resolved through `emerald_config.key_provider` at the top of
+    /// `build_runtime`. The sync `Node::load_private_key_file` callback (invoked
+    /// inside `start_engine`) reads from here so that network keypair, consensus
+    /// signing provider, and `State` all share the same key — including in the
+    /// AWS SM+KMS provider mode where the file on disk is not the source of truth.
+    /// Stays empty for non-engine subcommands (init/testnet/generate).
+    pub resolved_private_key: Arc<OnceLock<PrivateKey>>,
 }
 
 /// Components needed to run the application
@@ -72,22 +80,21 @@ impl App {
         let emerald_config = self.load_emerald_config()?;
         log_emerald_config(&self.emerald_config_file, &emerald_config);
 
-        let key_bytes = {
-            let provider: Box<dyn key_provider::KeyProvider> = match &emerald_config.key_provider {
-                key_provider::KeyProviderConfig::File => {
-                    Box::new(key_provider::FileKeyProvider::new(&self.private_key_file))
-                }
-                key_provider::KeyProviderConfig::AwsSmKms(cfg) => {
-                    Box::new(key_provider::AwsSmKmsKeyProvider::new(cfg.clone()))
-                }
-            };
-            provider
-                .load_private_key()
-                .await
-                .map_err(|e| eyre::eyre!("key provider error: {e}"))?
-        };
+        // Resolve the private key once, via the configured provider. Caching it
+        // in `resolved_private_key` makes the sync `Node::load_private_key_file`
+        // callback invoked inside `start_engine` see the same key — without this,
+        // the AWS SM+KMS provider mode would still fall back to the on-disk file
+        // for the libp2p keypair and consensus signing provider.
+        let key_bytes = build_key_provider(&emerald_config, &self.private_key_file)
+            .load_private_key()
+            .await
+            .map_err(|e| eyre::eyre!("key provider error: {e}"))?;
         let private_key = PrivateKey::from_slice(key_bytes.as_ref())
             .map_err(|e| eyre::eyre!("invalid private key bytes: {e}"))?;
+        self.resolved_private_key
+            .set(private_key.clone())
+            .map_err(|_| eyre::eyre!("private key already resolved"))?;
+
         let public_key = self.get_public_key(&private_key);
         let address = self.get_address(&public_key);
         let public_key_hex = public_key_hex(&public_key);
@@ -266,7 +273,21 @@ impl Node for App {
     }
 
     fn load_private_key_file(&self) -> eyre::Result<Self::PrivateKeyFile> {
+        // Engine path (Commands::Start): `build_runtime` has already resolved
+        // the key through the configured provider — return the cached copy so
+        // the libp2p keypair, consensus signing provider, and `State` all share
+        // it. Non-engine subcommands (init/testnet/generate) leave the cache
+        // empty and fall through to the on-disk file.
+        if let Some(pk) = self.resolved_private_key.get() {
+            info!("Using cached private key pre-loaded in build_runtime");
+            return Ok(pk.clone());
+        }
+
         let private_key = std::fs::read_to_string(&self.private_key_file)?;
+        info!(
+            "Loading private key from file: {}",
+            self.private_key_file.display()
+        );
         serde_json::from_str(&private_key).map_err(Into::into)
     }
 
@@ -344,6 +365,23 @@ fn key_provider_kind(config: &key_provider::KeyProviderConfig) -> &'static str {
     match config {
         key_provider::KeyProviderConfig::File => "file",
         key_provider::KeyProviderConfig::AwsSmKms(_) => "aws_sm_kms",
+    }
+}
+
+/// Build the configured `KeyProvider`. The `File` variant takes its path from
+/// the CLI (`priv_validator_key.json`) since `EmeraldConfig::File` doesn't
+/// carry a path of its own.
+fn build_key_provider(
+    config: &EmeraldConfig,
+    file_fallback: &Path,
+) -> Box<dyn key_provider::KeyProvider> {
+    match &config.key_provider {
+        key_provider::KeyProviderConfig::File => {
+            Box::new(key_provider::FileKeyProvider::new(file_fallback))
+        }
+        key_provider::KeyProviderConfig::AwsSmKms(cfg) => {
+            Box::new(key_provider::AwsSmKmsKeyProvider::new(cfg.clone()))
+        }
     }
 }
 

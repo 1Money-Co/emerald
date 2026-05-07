@@ -1,3 +1,5 @@
+use std::sync::{Arc, OnceLock};
+
 use color_eyre::eyre::{eyre, Result};
 use emerald::node::App;
 use malachitebft_app_channel::app::node::Node;
@@ -84,6 +86,7 @@ fn start(args: &Args, cmd: &StartCmd, logging: config::LoggingConfig) -> Result<
         emerald_config_file: args.get_emerald_config_file()?,
         private_key_file: args.get_priv_validator_key_file_path()?,
         start_height: cmd.start_height.map(Height::new),
+        resolved_private_key: Arc::new(OnceLock::new()),
     };
 
     // Start the node
@@ -100,6 +103,7 @@ fn init(args: &Args, cmd: &InitCmd, logging: config::LoggingConfig) -> Result<()
         emerald_config_file: args.get_emerald_config_file()?,
         private_key_file: args.get_priv_validator_key_file_path()?,
         start_height: Some(Height::new(1)), // We always start at height 1
+        resolved_private_key: Arc::new(OnceLock::new()),
     };
 
     cmd.run(
@@ -120,6 +124,7 @@ fn generate(cmd: &GenerateCmd, logging: config::LoggingConfig) -> Result<()> {
         emerald_config_file: Default::default(),
         private_key_file: Default::default(),
         start_height: Some(Height::new(1)),
+        resolved_private_key: Arc::new(OnceLock::new()),
     };
     cmd.run(&app, logging)
         .map_err(|error| eyre!("Failed to run generate command: {error:?}"))
@@ -134,6 +139,7 @@ fn testnet(args: &Args, cmd: &TestnetCmd, logging: config::LoggingConfig) -> Res
         emerald_config_file: args.get_emerald_config_file()?,
         private_key_file: args.get_priv_validator_key_file_path()?,
         start_height: Some(Height::new(1)), // We always start at height 1
+        resolved_private_key: Arc::new(OnceLock::new()),
     };
 
     cmd.run(&app, &args.get_home_dir()?, logging)
