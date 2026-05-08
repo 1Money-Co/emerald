@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1
+
+FROM rust:1.91.1-bookworm AS builder
+
+WORKDIR /app
+
+RUN apt-get update -qq && \
+    apt-get install -yqq --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      clang \
+      curl \
+      git \
+      libclang-dev \
+      libssl-dev \
+      llvm-dev \
+      pkg-config \
+      protobuf-compiler && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN curl -sSL https://foundry.paradigm.xyz | bash && \
+    /root/.foundry/bin/foundryup
+
+ENV PATH="/root/.foundry/bin:${PATH}"
+
+COPY . .
+
+RUN cargo build --release --locked --bin emerald
+RUN cargo build --release --locked --bin emerald-utils
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update -qq && \
+    apt-get install -yqq --no-install-recommends \
+      ca-certificates \
+      curl \
+      jq \
+      libssl3 \
+      procps && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m emerald -s /bin/bash
+
+WORKDIR /app
+
+RUN mkdir -p \
+      /home/emerald/.emerald \
+      /app/config \
+      /app/data \
+      /app/logs \
+      /app/node \
+      /app/shared/emerald \
+      /app/shared/reth && \
+    ln -s /app/node/config.toml /app/config/config.toml && \
+    ln -s /app/node/priv_validator_key.json /app/config/priv_validator_key.json && \
+    ln -s /app/shared/emerald/genesis.json /app/config/genesis.json && \
+    chown -R emerald:emerald /home/emerald /app
+
+COPY --from=builder /app/target/release/emerald /usr/local/bin/emerald
+COPY --from=builder /app/target/release/emerald-utils /usr/local/bin/emerald-utils
+
+USER emerald:emerald
+
+ENTRYPOINT ["/usr/local/bin/emerald"]
