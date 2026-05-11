@@ -25,6 +25,7 @@ ENV PATH="/root/.foundry/bin:${PATH}"
 
 COPY . .
 
+RUN forge build
 RUN cargo build --release --locked --bin emerald
 RUN cargo build --release --locked --bin emerald-utils
 
