@@ -235,7 +235,7 @@ pub async fn on_get_value(
                     .generate_block(
                         &Some(latest_block),
                         &emerald_config.retry_config,
-                        &emerald_config.fee_recipient,
+                        &state.address, // suggest our address for the block reward
                         state.get_fork(latest_block.timestamp),
                     )
                     .await?;
