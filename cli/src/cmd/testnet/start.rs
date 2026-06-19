@@ -11,7 +11,6 @@ use clap::Parser;
 use color_eyre::eyre::{eyre, Context as _};
 use color_eyre::Result;
 use malachitebft_app::node::{CanGeneratePrivateKey, CanMakeGenesis, CanMakePrivateKeyFile, Node};
-use malachitebft_config::LoggingConfig;
 use malachitebft_core_types::{Context, SigningScheme};
 use malachitebft_eth_types::Address;
 use serde_json::{json, Value};
@@ -20,6 +19,7 @@ use tracing::info;
 use super::reth::{self, RethProcess};
 use super::types::RethNode;
 use crate::cmd::testnet::rpc::RpcClient;
+use crate::config::LoggingConfig;
 use crate::utils::retry::retry_with_timeout;
 
 type PrivateKey<C> = <<C as Context>::SigningScheme as SigningScheme>::PrivateKey;

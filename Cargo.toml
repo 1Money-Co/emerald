@@ -101,6 +101,7 @@ prost-build        = "0.13"
 prost-types        = "0.14"
 rand               = { version = "0.8.5", features = [ "std_rng" ] }
 redb               = "2.4.0"
+rolling-file       = "0.2"
 serde              = "1.0"
 serde_json         = "1.0"
 sha3               = "0.10"
@@ -110,7 +111,7 @@ tokio              = "1.49.0"
 toml               = "0.8.23"
 tracing            = "0.1.41"
 tracing-appender   = "0.2.3"
-tracing-subscriber = { version = "0.3.22", features = [ "env-filter" ] }
+tracing-subscriber = { version = "0.3.22", features = [ "env-filter", "time" ] }
 url                = "2"
 k256               = { version = "0.13" }
 test-log           = { version = "0.2", features = [ "trace" ] }

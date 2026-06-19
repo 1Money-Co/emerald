@@ -9,12 +9,13 @@ use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use directories::BaseDirs;
 use malachitebft_app::node::{CanGeneratePrivateKey, CanMakeGenesis, CanMakePrivateKeyFile, Node};
-use malachitebft_config::*;
+use malachitebft_config::{BootstrapProtocol, RuntimeConfig, Selector, TransportProtocol};
 use malachitebft_core_types::{Context, SigningScheme};
 use serde::Deserialize;
 use tracing::info;
 
 use crate::args::Args;
+use crate::config::LoggingConfig;
 use crate::error::Error;
 use crate::file::{save_config, save_genesis, save_priv_validator_key};
 
@@ -247,7 +248,7 @@ where
                 num_inbound_peers,
                 ephemeral_connection_timeout_ms,
                 transport,
-                logging,
+                logging.clone(),
                 moniker,
             ),
         )?;

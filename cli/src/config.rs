@@ -1,15 +1,57 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use color_eyre::eyre;
 use malachitebft_app::node::NodeConfig;
 pub use malachitebft_config::{
-    BootstrapProtocol, ConsensusConfig, DiscoveryConfig, LoggingConfig, MempoolConfig,
+    BootstrapProtocol, ConsensusConfig, DiscoveryConfig, LogFormat, LogLevel, MempoolConfig,
     MempoolLoadConfig, MetricsConfig, P2pConfig, PubSubProtocol, RuntimeConfig, ScoringStrategy,
     Selector, TestConfig, TimeoutConfig, TransportProtocol, ValuePayload, ValueSyncConfig,
 };
 use malachitebft_eth_types::{Address, RetryConfig};
 use serde::{Deserialize, Serialize};
 use tokio::time::Duration;
+
+pub const DEFAULT_LOG_FILE_MAX_SIZE_BYTES: u64 = 200 * 1024 * 1024;
+pub const DEFAULT_LOG_FILE_MAX_FILES: usize = 10;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    pub log_level: LogLevel,
+    pub log_format: LogFormat,
+
+    /// Optional active log file path. When omitted, Emerald logs only to stdout.
+    #[serde(default)]
+    pub file_path: Option<PathBuf>,
+
+    /// Maximum active log file size before rolling to a numbered backup.
+    #[serde(default = "default_log_file_max_size_bytes")]
+    pub file_max_size_bytes: u64,
+
+    /// Number of rolled files to retain.
+    #[serde(default = "default_log_file_max_files")]
+    pub file_max_files: usize,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        let malachite = malachitebft_config::LoggingConfig::default();
+        Self {
+            log_level: malachite.log_level,
+            log_format: malachite.log_format,
+            file_path: None,
+            file_max_size_bytes: DEFAULT_LOG_FILE_MAX_SIZE_BYTES,
+            file_max_files: DEFAULT_LOG_FILE_MAX_FILES,
+        }
+    }
+}
+
+fn default_log_file_max_size_bytes() -> u64 {
+    DEFAULT_LOG_FILE_MAX_SIZE_BYTES
+}
+
+fn default_log_file_max_files() -> usize {
+    DEFAULT_LOG_FILE_MAX_FILES
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -168,9 +210,49 @@ impl NodeConfig for Config {
     }
 }
 
+pub fn load_config(path: impl AsRef<Path>, prefix: Option<&str>) -> eyre::Result<Config> {
+    ::config::Config::builder()
+        .add_source(::config::File::from(path.as_ref()))
+        .add_source(
+            ::config::Environment::with_prefix(prefix.unwrap_or("MALACHITE")).separator("__"),
+        )
+        .build()?
+        .try_deserialize()
+        .map_err(Into::into)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logging_config_defaults_to_stdout_only_with_size_rotation_defaults() {
+        let cfg = LoggingConfig::default();
+
+        assert_eq!(cfg.file_path, None);
+        assert_eq!(cfg.file_max_size_bytes, DEFAULT_LOG_FILE_MAX_SIZE_BYTES);
+        assert_eq!(cfg.file_max_files, DEFAULT_LOG_FILE_MAX_FILES);
+    }
+
+    #[test]
+    fn config_parses_logging_file_rotation_fields() {
+        let toml = r#"
+log_level = "info"
+log_format = "json"
+file_path = "/var/log/emerald/emerald.log"
+file_max_size_bytes = 4096
+file_max_files = 3
+"#;
+
+        let cfg: LoggingConfig = toml::from_str(toml).unwrap();
+
+        assert_eq!(
+            cfg.file_path.as_deref(),
+            Some(Path::new("/var/log/emerald/emerald.log"))
+        );
+        assert_eq!(cfg.file_max_size_bytes, 4096);
+        assert_eq!(cfg.file_max_files, 3);
+    }
 
     #[test]
     fn emerald_config_defaults_to_file_key_provider() {
@@ -215,18 +297,7 @@ kms_key_id = "alias/emerald-validator-keys"
                 assert_eq!(c.kms_key_id, "alias/emerald-validator-keys");
                 assert!(c.kms_region.is_none());
             }
-            other => panic!("expected AwsSmKms, got {:?}", other),
+            other => panic!("expected AwsSmKms, got {other:?}"),
         }
     }
-}
-
-pub fn load_config(path: impl AsRef<Path>, prefix: Option<&str>) -> eyre::Result<Config> {
-    ::config::Config::builder()
-        .add_source(::config::File::from(path.as_ref()))
-        .add_source(
-            ::config::Environment::with_prefix(prefix.unwrap_or("MALACHITE")).separator("__"),
-        )
-        .build()?
-        .try_deserialize()
-        .map_err(Into::into)
 }
