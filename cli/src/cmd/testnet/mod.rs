@@ -5,8 +5,9 @@ use std::path::Path;
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use malachitebft_app::node::{CanGeneratePrivateKey, CanMakeGenesis, CanMakePrivateKeyFile, Node};
-use malachitebft_config::LoggingConfig;
 use malachitebft_core_types::{Context, SigningScheme};
+
+use crate::config::LoggingConfig;
 
 mod add_node;
 pub mod config;

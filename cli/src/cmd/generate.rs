@@ -1,10 +1,11 @@
-use std::{fs, path::PathBuf};
+use std::fs;
+use std::path::PathBuf;
 
 use clap::Parser;
 use color_eyre::eyre::{eyre, Result, WrapErr};
-use malachitebft_config::LoggingConfig;
 
 use crate::cmd::shared::{KeyProviderType, P2pOptions};
+use crate::config::LoggingConfig;
 
 pub(crate) enum KeyProviderSection<'a> {
     File,
@@ -148,7 +149,10 @@ where
     match cmd.key_provider {
         KeyProviderType::File => {
             let private_keys = crate::new::generate_private_keys(node, cmd.nodes, false);
-            let public_keys = private_keys.iter().map(|pk| node.get_public_key(pk)).collect();
+            let public_keys = private_keys
+                .iter()
+                .map(|pk| node.get_public_key(pk))
+                .collect();
             let genesis = crate::new::generate_genesis(node, public_keys, false);
             crate::file::save_genesis(node, &assets_dir.join("emerald_genesis.json"), &genesis)?;
 
@@ -169,7 +173,7 @@ where
                         cmd.p2p.num_inbound_peers,
                         cmd.p2p.ephemeral_connection_timeout_ms,
                         cmd.p2p.transport,
-                        logging,
+                        logging.clone(),
                         moniker.clone(),
                     ),
                 )?;
@@ -247,7 +251,7 @@ where
                         cmd.p2p.num_inbound_peers,
                         cmd.p2p.ephemeral_connection_timeout_ms,
                         cmd.p2p.transport,
-                        logging,
+                        logging.clone(),
                         moniker.clone(),
                     ),
                 )?;

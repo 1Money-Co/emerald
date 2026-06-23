@@ -4,6 +4,18 @@
 # Moniker prefix used when creating the Malachite configuration file
 moniker = "test-0"
 
+[logging]
+# Log level: "trace", "debug", "info", "warn", or "error"
+log_level = "info"
+
+# Log format: "plaintext" or "json"
+log_format = "plaintext"
+
+# Optional size-rotated log file. Stdout logging remains enabled when this is set.
+# file_path = "/var/log/emerald/emerald.log"
+file_max_size_bytes = 209715200
+file_max_files = 10
+
 [ethereum_config]
 # RPC endpoint for Ethereum execution client
 execution_authrpc_address = "http://localhost:8645"

@@ -47,6 +47,28 @@ pub struct Args {
     #[arg(long, global = true, value_name = "LOG_FORMAT")]
     pub log_format: Option<LogFormat>,
 
+    /// Optional active log file path for size-based rolling file logs
+    #[arg(long, env = "EMERALD_LOG_FILE", global = true, value_name = "LOG_FILE")]
+    pub log_file: Option<PathBuf>,
+
+    /// Maximum active log file size in bytes before rolling
+    #[arg(
+        long,
+        env = "EMERALD_LOG_FILE_MAX_SIZE_BYTES",
+        global = true,
+        value_name = "BYTES"
+    )]
+    pub log_file_max_size_bytes: Option<u64>,
+
+    /// Number of rolled log files to retain
+    #[arg(
+        long,
+        env = "EMERALD_LOG_FILE_MAX_FILES",
+        global = true,
+        value_name = "COUNT"
+    )]
+    pub log_file_max_files: Option<usize>,
+
     /// Emerald configuration file (default: `~/.emerald/config/config.toml`)
     #[arg(long, global = true, value_name = "CONFIG_FILE")]
     pub config: Option<PathBuf>,

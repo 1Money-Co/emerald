@@ -210,7 +210,7 @@ where
                 ephemeral_connection_timeout_ms,
                 bootstrap_set_size,
                 transport,
-                logging,
+                logging.clone(),
                 emerald_config,
             ),
         )?;
