@@ -347,7 +347,6 @@ fn log_emerald_config(path: &Path, config: &EmeraldConfig) {
         eth_genesis_path = %config.ethereum_config.eth_genesis_path,
         key_provider = key_provider_kind(&config.key_provider),
         min_block_time = ?config.min_block_time,
-        fee_recipient = ?config.fee_recipient,
         el_node_type = ?config.el_node_type,
         retry_config = ?config.retry_config,
         num_certificates_to_retain = config.num_certificates_to_retain,
