@@ -24,6 +24,10 @@ pub enum ElNodeType {
     Custom,
 }
 
+// `fee_recipient` below is deprecated; `#[allow(deprecated)]` keeps the derived
+// impls from tripping the `deprecated` lint (denied in CI) while still warning
+// on hand-written accesses elsewhere.
+#[allow(deprecated)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EmeraldConfig {
     /// A custom human-readable name for this node
@@ -69,8 +73,14 @@ pub struct EmeraldConfig {
     #[serde(with = "humantime_serde", default = "default_min_block_time")]
     pub min_block_time: Duration,
 
-    // Address used to receive fees
-    pub fee_recipient: Address,
+    /// Deprecated: no longer has any effect. Block rewards are sent to the
+    /// proposing validator's own address, not to a configured recipient.
+    /// Retained (optional) only for backward compatibility with existing configs.
+    #[deprecated(
+        note = "fee_recipient has no effect; block rewards go to the proposing validator's address"
+    )]
+    #[serde(default)]
+    pub fee_recipient: Option<Address>,
 
     /// Emerald will store up to num_temp_blocks_retained
     /// blocks locally and then delete them. This data
