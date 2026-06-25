@@ -228,6 +228,39 @@ kms_key_id = "alias/emerald-validator-keys"
             other => panic!("expected AwsSmKms, got {:?}", other),
         }
     }
+
+    #[test]
+    #[allow(deprecated)] // intentionally exercises the deprecated `fee_recipient` field
+    fn emerald_config_parses_without_fee_recipient() {
+        // Omitting `fee_recipient` must still parse now that the field is optional.
+        let toml = r#"
+moniker = "node-0"
+
+[ethereum_config]
+execution_authrpc_address = "http://127.0.0.1:8551"
+engine_authrpc_address    = "http://127.0.0.1:8552"
+jwt_token_path            = "./assets/jwt.hex"
+"#;
+        let cfg: EmeraldConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.fee_recipient, None);
+    }
+
+    #[test]
+    #[allow(deprecated)] // intentionally exercises the deprecated `fee_recipient` field
+    fn emerald_config_parses_fee_recipient_into_some_when_present() {
+        // A config that still sets `fee_recipient` continues to parse (into `Some`).
+        let toml = r#"
+moniker = "node-0"
+fee_recipient = "0x0000000000000000000000000000000000000000"
+
+[ethereum_config]
+execution_authrpc_address = "http://127.0.0.1:8551"
+engine_authrpc_address    = "http://127.0.0.1:8552"
+jwt_token_path            = "./assets/jwt.hex"
+"#;
+        let cfg: EmeraldConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.fee_recipient.is_some());
+    }
 }
 
 pub fn load_config(path: impl AsRef<Path>, prefix: Option<&str>) -> eyre::Result<Config> {
