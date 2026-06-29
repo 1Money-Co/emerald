@@ -1,3 +1,10 @@
+// Use jemalloc as the global allocator on non-MSVC targets. glibc's default
+// malloc is not aggressive about returning freed memory to the OS, which keeps
+// RSS elevated for long-running nodes; jemalloc reclaims more eagerly.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use color_eyre::eyre::{eyre, Result};
 use emerald::node::App;
 use malachitebft_app_channel::app::node::Node;
