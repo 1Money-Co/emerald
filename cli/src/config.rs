@@ -135,6 +135,13 @@ pub struct EmeraldConfig {
     /// Default: 10
     #[serde(default = "default_num_temp_blocks_retained")]
     pub num_temp_blocks_retained: u64,
+
+    /// Size, in bytes, of the redb storage cache.
+    /// Caps the in-memory cache redb keeps for the store database, which
+    /// otherwise grows toward redb's default and keeps RSS elevated.
+    /// Default: 512 MiB.
+    #[serde(default = "default_redb_cache_size_bytes")]
+    pub redb_cache_size_bytes: usize,
 }
 
 fn default_min_block_time() -> Duration {
@@ -150,6 +157,10 @@ fn prune_at_interval_default() -> u64 {
 
 fn default_num_temp_blocks_retained() -> u64 {
     10
+}
+
+fn default_redb_cache_size_bytes() -> usize {
+    512 * 1024 * 1024
 }
 
 fn default_eth_gensesis_path() -> String {

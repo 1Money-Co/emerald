@@ -11,6 +11,8 @@ fee_recipient = "0x4242424242424242424242424242424242424242"
 num_certificates_to_retain = 64000
 num_temp_blocks_retained = 0
 prune_at_block_interval = 5
+# Size, in bytes, of the redb storage cache. Default: 512 MiB.
+redb_cache_size_bytes = 536870912
 
 [retry_config]
 initial_delay = "100ms"

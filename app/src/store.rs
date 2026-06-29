@@ -110,9 +110,16 @@ struct Db {
 }
 
 impl Db {
-    fn new(path: impl AsRef<Path>, metrics: DbMetrics) -> Result<Self, StoreError> {
+    fn new(
+        path: impl AsRef<Path>,
+        cache_size_bytes: usize,
+        metrics: DbMetrics,
+    ) -> Result<Self, StoreError> {
         Ok(Self {
-            db: redb::Database::create(path).map_err(StoreError::Database)?,
+            db: redb::Database::builder()
+                .set_cache_size(cache_size_bytes)
+                .create(path)
+                .map_err(StoreError::Database)?,
             metrics,
         })
     }
@@ -723,11 +730,15 @@ pub struct Store {
 impl Store {
     /// Opens a new store at the given path with the provided metrics.
     /// Called by the application when initializing the store.
-    pub async fn open(path: impl AsRef<Path>, metrics: DbMetrics) -> Result<Self, StoreError> {
+    pub async fn open(
+        path: impl AsRef<Path>,
+        cache_size_bytes: usize,
+        metrics: DbMetrics,
+    ) -> Result<Self, StoreError> {
         let path = path.as_ref().to_owned();
 
         tokio::task::spawn_blocking(move || {
-            let db = Db::new(path, metrics)?;
+            let db = Db::new(path, cache_size_bytes, metrics)?;
             db.create_tables()?;
             Ok(Self { db: Arc::new(db) })
         })
@@ -968,7 +979,12 @@ mod tests {
     /// Returns both the Db and the TempDir (must be kept alive for the DB to remain valid).
     fn create_test_db(name: &str) -> (Db, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::new(dir.path().join(format!("{name}.redb")), DbMetrics::new()).unwrap();
+        let db = Db::new(
+            dir.path().join(format!("{name}.redb")),
+            1024 * 1024,
+            DbMetrics::new(),
+        )
+        .unwrap();
         db.create_tables().unwrap();
         (db, dir)
     }

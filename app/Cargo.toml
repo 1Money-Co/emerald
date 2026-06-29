@@ -49,5 +49,10 @@ tracing         = { workspace = true }
 url             = { workspace = true }
 humantime-serde = { workspace = true }
 
+# jemalloc reclaims freed memory to the OS more aggressively than glibc malloc,
+# keeping RSS lower for the long-running node. Not available on MSVC targets.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
 [dev-dependencies]
 tempfile = "3"
