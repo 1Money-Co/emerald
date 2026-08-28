@@ -654,34 +654,52 @@ impl State {
             .unwrap_or(Ok(None))
     }
 
-    /// Retrieves a previously built proposal value for the given height and round.
-    /// Called by the consensus engine to re-use a previously built value.
-    /// There should be at most one proposal for a given height and round when the proposer is not byzantine.
-    /// We assume this implementation is not byzantine and we are the proposer for the given height and round.
-    /// Therefore there must be a single proposal for the rounds where we are the proposer, with the proposer address matching our own.
-    pub async fn get_previous_proposal_by_value_and_proposer(
+    /// Prepares a stored proposal for restreaming and records the re-proposal at the current round.
+    pub async fn prepare_restream_proposal(
         &self,
         height: Height,
-        round: Round,
+        proposal_round: Round,
+        current_round: Round,
         value_id: ValueId,
-        address: Address,
-    ) -> eyre::Result<Option<LocallyProposedValue<EmeraldContext>>> {
-        let proposal = self
+    ) -> eyre::Result<Option<(LocallyProposedValue<EmeraldContext>, Bytes)>> {
+        let Some(proposal) = self
             .store
-            .get_undecided_proposal(height, round, value_id)
-            .await?;
-        match proposal {
-            Some(prop) => {
-                if prop.proposer.eq(&address) {
-                    let lp: LocallyProposedValue<EmeraldContext> =
-                        LocallyProposedValue::new(prop.height, prop.round, prop.value);
-                    Ok(Some(lp))
-                } else {
-                    Ok(None)
-                }
-            }
-            None => Ok(None),
+            .get_undecided_proposal(height, proposal_round, value_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let bytes = self
+            .store
+            .get_block_data(height, proposal_round, value_id)
+            .await?
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "Block data not found for restream proposal at height {height}, \
+                     proposal round {proposal_round}, value {value_id}"
+                )
+            })?;
+
+        if proposal_round != current_round {
+            // Store::insert_undecided_proposal is insert-if-absent. If genuine peer metadata already exists for this
+            // key, this write adds the block data but cannot overwrite that proposal's authoritative proposer.
+            let current_round_proposal = ProposedValue {
+                height: proposal.height,
+                round: current_round,
+                valid_round: proposal_round,
+                proposer: self.address,
+                value: proposal.value.clone(),
+                validity: Validity::Valid,
+            };
+            self.store_undecided_value(&current_round_proposal, bytes.clone())
+                .await?;
         }
+
+        Ok(Some((
+            LocallyProposedValue::new(proposal.height, current_round, proposal.value),
+            bytes,
+        )))
     }
 
     // /// Make up a new value to propose
@@ -919,4 +937,268 @@ pub fn assemble_value_from_parts(parts: ProposalParts) -> (ProposedValue<Emerald
 /// Decodes a Value from its byte representation using ProtobufCodec
 pub fn decode_value(bytes: Bytes) -> Result<Value, ProtoError> {
     ProtobufCodec.decode(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use malachitebft_app_channel::{AppMsg, Channels, NetworkMsg};
+    use malachitebft_eth_types::secp256k1::PrivateKey;
+    use malachitebft_eth_types::Validator;
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::app::on_restream_proposal;
+    use crate::metrics::{DbMetrics, Metrics};
+
+    async fn make_test_state() -> (State, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("store.redb"), 1024 * 1024, DbMetrics::new())
+            .await
+            .unwrap();
+
+        let private_key = PrivateKey::from_slice(&[1_u8; 32]).unwrap();
+        let public_key = private_key.public_key();
+        let address = Address::from_public_key(&public_key);
+        let genesis = Genesis {
+            validator_set: ValidatorSet::new([Validator::new(public_key, 1)]),
+        };
+
+        let mut emerald_config: EmeraldConfig = toml::from_str(
+            r#"
+moniker = "restream-test"
+
+[ethereum_config]
+execution_authrpc_address = "http://127.0.0.1:8551"
+engine_authrpc_address = "http://127.0.0.1:8552"
+jwt_token_path = "./assets/jwt.hex"
+"#,
+        )
+        .unwrap();
+        let eth_genesis_path = dir.path().join("genesis.json");
+        std::fs::write(&eth_genesis_path, "{}").unwrap();
+        emerald_config.ethereum_config.eth_genesis_path = eth_genesis_path.display().to_string();
+
+        let state = State::new(
+            genesis,
+            EmeraldContext::new(),
+            K256Provider::new(private_key),
+            address,
+            Height::new(1426),
+            store,
+            StateMetrics {
+                txs_count: 0,
+                chain_bytes: 0,
+                elapsed_seconds: 0,
+                metrics: Metrics::new(),
+            },
+            emerald_config,
+        );
+
+        (state, dir)
+    }
+
+    fn make_test_channels() -> (
+        Channels<EmeraldContext>,
+        tokio::task::JoinHandle<ProposalInit>,
+    ) {
+        let (_consensus_tx, consensus_rx) = mpsc::channel(1);
+        let (network_tx, mut network_rx) = mpsc::channel::<NetworkMsg<EmeraldContext>>(1);
+        let (requests_tx, _requests_rx) = mpsc::channel(1);
+
+        let proposal_init = tokio::spawn(async move {
+            let mut proposal_init = None;
+            while let Some(NetworkMsg::PublishProposalPart(message)) = network_rx.recv().await {
+                if proposal_init.is_none() {
+                    proposal_init = message
+                        .content
+                        .into_data()
+                        .and_then(|part| part.as_init().cloned());
+                }
+            }
+
+            proposal_init.expect("streamed proposal must contain ProposalInit")
+        });
+
+        (
+            Channels {
+                consensus: consensus_rx,
+                network: network_tx,
+                events: Default::default(),
+                requests: requests_tx,
+            },
+            proposal_init,
+        )
+    }
+
+    #[tokio::test]
+    async fn restream_proposal_stores_reproposal_at_current_round() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let proposal_round = Round::new(0);
+        let current_round = Round::new(1);
+        let bytes = Bytes::from(vec![0xAB; CHUNK_SIZE * 17]);
+        let value = Value::new(bytes.clone());
+        let original_proposer = Address::new([2_u8; 20]);
+        assert_ne!(original_proposer, state.address);
+
+        let stored_proposal = ProposedValue {
+            height,
+            round: proposal_round,
+            valid_round: Round::Nil,
+            proposer: original_proposer,
+            value: value.clone(),
+            validity: Validity::Valid,
+        };
+        state
+            .store_undecided_value(&stored_proposal, bytes.clone())
+            .await
+            .unwrap();
+
+        let (mut channels, proposal_init) = make_test_channels();
+
+        on_restream_proposal(
+            AppMsg::RestreamProposal {
+                height,
+                round: current_round,
+                valid_round: proposal_round,
+                address: original_proposer,
+                value_id: value.id(),
+            },
+            &mut state,
+            &mut channels,
+        )
+        .await
+        .unwrap();
+
+        let current_round_proposal = state
+            .store
+            .get_undecided_proposal(height, current_round, value.id())
+            .await
+            .unwrap()
+            .expect("restreamed proposal must be stored at the current round");
+        assert_eq!(current_round_proposal.height, height);
+        assert_eq!(current_round_proposal.round, current_round);
+        assert_eq!(current_round_proposal.valid_round, proposal_round);
+        assert_eq!(current_round_proposal.proposer, state.address);
+        assert_eq!(current_round_proposal.value, value);
+
+        let current_round_bytes = state
+            .store
+            .get_block_data(height, current_round, value.id())
+            .await
+            .unwrap()
+            .expect("restreamed block data must be stored at the current round");
+        assert_eq!(current_round_bytes, bytes);
+
+        drop(channels);
+        let init = proposal_init.await.unwrap();
+
+        assert_eq!(init.height, height);
+        assert_eq!(init.round, current_round);
+        assert_eq!(init.pol_round, proposal_round);
+        assert_eq!(init.proposer, state.address);
+    }
+
+    #[tokio::test]
+    async fn restream_proposal_returns_none_when_proposal_is_missing() {
+        let (state, _dir) = make_test_state().await;
+
+        let result = state
+            .prepare_restream_proposal(
+                Height::new(1426),
+                Round::new(0),
+                Round::new(1),
+                ValueId::new(42),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn restream_proposal_errors_when_block_data_is_missing() {
+        let (state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let proposal_round = Round::new(0);
+        let value = Value::new(Bytes::from_static(b"missing-block-data"));
+        let stored_proposal = ProposedValue {
+            height,
+            round: proposal_round,
+            valid_round: Round::Nil,
+            proposer: Address::new([2_u8; 20]),
+            value: value.clone(),
+            validity: Validity::Valid,
+        };
+        state
+            .store
+            .store_undecided_proposal(stored_proposal)
+            .await
+            .unwrap();
+
+        let error = match state
+            .prepare_restream_proposal(height, proposal_round, Round::new(1), value.id())
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("missing block data must be an error"),
+        };
+
+        assert!(error
+            .to_string()
+            .contains("Block data not found for restream proposal"));
+        assert!(error.to_string().contains("1426"));
+    }
+
+    #[tokio::test]
+    async fn restream_proposal_preserves_nil_valid_round_in_proposal_init() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(10);
+        let bytes = Bytes::from_static(b"hidden-lock-block");
+        let value = Value::new(bytes.clone());
+        let stored_proposal = ProposedValue {
+            height,
+            round,
+            valid_round: Round::Nil,
+            proposer: state.address,
+            value: value.clone(),
+            validity: Validity::Valid,
+        };
+        state
+            .store_undecided_value(&stored_proposal, bytes)
+            .await
+            .unwrap();
+
+        let (mut channels, proposal_init) = make_test_channels();
+
+        on_restream_proposal(
+            AppMsg::RestreamProposal {
+                height,
+                round,
+                valid_round: Round::Nil,
+                address: state.address,
+                value_id: value.id(),
+            },
+            &mut state,
+            &mut channels,
+        )
+        .await
+        .unwrap();
+
+        drop(channels);
+        let init = proposal_init.await.unwrap();
+
+        assert_eq!(init.height, height);
+        assert_eq!(init.round, round);
+        assert_eq!(init.pol_round, Round::Nil);
+
+        let current_round_proposal = state
+            .store
+            .get_undecided_proposal(height, round, value.id())
+            .await
+            .unwrap()
+            .expect("current-round proposal must remain stored");
+        assert_eq!(current_round_proposal.valid_round, Round::Nil);
+    }
 }
