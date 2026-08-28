@@ -610,7 +610,7 @@ pub async fn on_restream_proposal(
         height,
         round,
         valid_round,
-        address,
+        address: _,
         value_id,
     } = restream_proposal
     else {
@@ -625,21 +625,12 @@ pub async fn on_restream_proposal(
     };
     info!(%height, %proposal_round, "Restreaming existing proposal...");
 
-    //let (proposal, bytes) =
     match state
-        .get_previous_proposal_by_value_and_proposer(height, round, value_id, address)
+        .get_restream_proposal(height, proposal_round, round, value_id)
         .await?
     {
-        Some(proposal) => {
+        Some((proposal, bytes)) => {
             info!(value = %proposal.value.id(), "Re-using previously built value");
-            // Fetch the block data for the previously built value
-            let bytes = state
-                .store
-                .get_block_data(height, round, proposal.value.id())
-                .await?
-                .ok_or_else(|| eyre!("Block data not found for previously built value"))?;
-            // Now what's left to do is to break down the value to propose into parts,
-            // and send those parts over the network to our peers, for them to re-assemble the full value.
             for stream_message in state.stream_proposal(proposal, bytes, proposal_round) {
                 debug!(%height, %round, "Streaming proposal part: {stream_message:?}");
                 channels
@@ -651,7 +642,13 @@ pub async fn on_restream_proposal(
             debug!(%height, %round, "✅ Re-sent proposal");
         }
         None => {
-            debug!(%height, %round, "✅ No proposal to re-send");
+            warn!(
+                %height,
+                %round,
+                %proposal_round,
+                %value_id,
+                "No proposal to re-send"
+            );
         }
     }
 
