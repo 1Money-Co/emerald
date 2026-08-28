@@ -926,10 +926,11 @@ pub fn decode_value(bytes: Bytes) -> Result<Value, ProtoError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::metrics::{DbMetrics, Metrics};
     use malachitebft_eth_types::secp256k1::PrivateKey;
     use malachitebft_eth_types::Validator;
+
+    use super::*;
+    use crate::metrics::{DbMetrics, Metrics};
 
     async fn make_test_state() -> (State, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
