@@ -283,7 +283,9 @@ impl Db {
         let tx = self.db.begin_write()?;
         {
             let mut table = tx.open_table(UNDECIDED_PROPOSALS_TABLE)?;
-            // Only insert if no value exists at this key
+            // Keep the first accepted proposal authoritative for this key. Restream preparation may later try to
+            // persist locally reconstructed metadata for the same value; overwriting the original proposer would
+            // violate the proposer identity expected by consensus.
             if table.get(&key)?.is_none() {
                 table.insert(key, value.to_vec())?;
             }

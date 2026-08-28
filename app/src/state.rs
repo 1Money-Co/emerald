@@ -682,6 +682,8 @@ impl State {
             })?;
 
         if proposal_round != current_round {
+            // Store::insert_undecided_proposal is insert-if-absent. If genuine peer metadata already exists for this
+            // key, this write adds the block data but cannot overwrite that proposal's authoritative proposer.
             let current_round_proposal = ProposedValue {
                 height: proposal.height,
                 round: current_round,
@@ -994,13 +996,46 @@ jwt_token_path = "./assets/jwt.hex"
         (state, dir)
     }
 
+    fn make_test_channels() -> (
+        Channels<EmeraldContext>,
+        tokio::task::JoinHandle<ProposalInit>,
+    ) {
+        let (_consensus_tx, consensus_rx) = mpsc::channel(1);
+        let (network_tx, mut network_rx) = mpsc::channel::<NetworkMsg<EmeraldContext>>(1);
+        let (requests_tx, _requests_rx) = mpsc::channel(1);
+
+        let proposal_init = tokio::spawn(async move {
+            let mut proposal_init = None;
+            while let Some(NetworkMsg::PublishProposalPart(message)) = network_rx.recv().await {
+                if proposal_init.is_none() {
+                    proposal_init = message
+                        .content
+                        .into_data()
+                        .and_then(|part| part.as_init().cloned());
+                }
+            }
+
+            proposal_init.expect("streamed proposal must contain ProposalInit")
+        });
+
+        (
+            Channels {
+                consensus: consensus_rx,
+                network: network_tx,
+                events: Default::default(),
+                requests: requests_tx,
+            },
+            proposal_init,
+        )
+    }
+
     #[tokio::test]
     async fn restream_proposal_stores_reproposal_at_current_round() {
         let (mut state, _dir) = make_test_state().await;
         let height = Height::new(1426);
         let proposal_round = Round::new(0);
         let current_round = Round::new(1);
-        let bytes = Bytes::from_static(b"round-zero-block");
+        let bytes = Bytes::from(vec![0xAB; CHUNK_SIZE * 17]);
         let value = Value::new(bytes.clone());
         let original_proposer = Address::new([2_u8; 20]);
         assert_ne!(original_proposer, state.address);
@@ -1018,15 +1053,7 @@ jwt_token_path = "./assets/jwt.hex"
             .await
             .unwrap();
 
-        let (_consensus_tx, consensus_rx) = mpsc::channel(1);
-        let (network_tx, mut network_rx) = mpsc::channel(16);
-        let (requests_tx, _requests_rx) = mpsc::channel(1);
-        let mut channels: Channels<EmeraldContext> = Channels {
-            consensus: consensus_rx,
-            network: network_tx,
-            events: Default::default(),
-            requests: requests_tx,
-        };
+        let (mut channels, proposal_init) = make_test_channels();
 
         on_restream_proposal(
             AppMsg::RestreamProposal {
@@ -1062,12 +1089,8 @@ jwt_token_path = "./assets/jwt.hex"
             .expect("restreamed block data must be stored at the current round");
         assert_eq!(current_round_bytes, bytes);
 
-        let NetworkMsg::PublishProposalPart(message) = network_rx.recv().await.unwrap();
-        let init = message
-            .content
-            .into_data()
-            .and_then(|part| part.as_init().cloned())
-            .expect("the first streamed proposal part must be ProposalInit");
+        drop(channels);
+        let init = proposal_init.await.unwrap();
 
         assert_eq!(init.height, height);
         assert_eq!(init.round, current_round);
@@ -1146,15 +1169,7 @@ jwt_token_path = "./assets/jwt.hex"
             .await
             .unwrap();
 
-        let (_consensus_tx, consensus_rx) = mpsc::channel(1);
-        let (network_tx, mut network_rx) = mpsc::channel(16);
-        let (requests_tx, _requests_rx) = mpsc::channel(1);
-        let mut channels: Channels<EmeraldContext> = Channels {
-            consensus: consensus_rx,
-            network: network_tx,
-            events: Default::default(),
-            requests: requests_tx,
-        };
+        let (mut channels, proposal_init) = make_test_channels();
 
         on_restream_proposal(
             AppMsg::RestreamProposal {
@@ -1170,12 +1185,8 @@ jwt_token_path = "./assets/jwt.hex"
         .await
         .unwrap();
 
-        let NetworkMsg::PublishProposalPart(message) = network_rx.recv().await.unwrap();
-        let init = message
-            .content
-            .into_data()
-            .and_then(|part| part.as_init().cloned())
-            .expect("the first streamed proposal part must be ProposalInit");
+        drop(channels);
+        let init = proposal_init.await.unwrap();
 
         assert_eq!(init.height, height);
         assert_eq!(init.round, round);
