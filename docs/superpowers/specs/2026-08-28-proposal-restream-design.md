@@ -101,6 +101,28 @@ continues through the consensus-message processing path rather than being treate
 
 On success, the handler retains the existing `Re-using previously built value` info log and completion debug log.
 
+## Known Storage Trade-off
+
+The existing undecided block-data table is keyed by `(height, round, value_id)`. Persisting a re-proposal under its
+current round therefore stores another complete execution payload. Because temporary data is pruned only after a
+successful commit, storage growth at a height that continues advancing rounds is approximately:
+
+```text
+additional bytes per node = re-proposal rounds x execution payload bytes
+```
+
+There is no protocol-level upper bound if the height never decides. This PR accepts that risk to keep the liveness
+repair independent of a redb storage redesign; [issue #318][issue-318] tracks deduplicating payloads across rounds.
+
+Before rollout, operators must choose a maximum recovery-round budget based on the largest expected execution payload
+and reserve at least that product in free disk space, in addition to the node's normal disk reserve. Alert on both
+round count and free disk. If the budget is reached without a decision, stop expanding the rollout and investigate
+before the reserved space is consumed. Restarting a node is not cleanup because the undecided data is persistent.
+
+The expected ordinary path is substantially smaller: once a fixed validator is selected proposer, its valid-value
+re-proposal should decide and the next commit prunes temporary data. That expectation is not treated as a storage
+bound.
+
 ## Testing
 
 Add deterministic async tests around the handler and state helper using a temporary real store and Malachite
@@ -139,3 +161,4 @@ This is a liveness-only change to proposal publication. It requires no coordinat
 protocol version bump, or genesis change. Mixed old and new nodes use the existing proposal-part receive path.
 
 [issue-314]: https://github.com/1Money-Co/1money-interoperability-protocol/issues/314
+[issue-318]: https://github.com/1Money-Co/1money-interoperability-protocol/issues/318

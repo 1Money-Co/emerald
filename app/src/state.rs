@@ -974,8 +974,9 @@ jwt_token_path = "./assets/jwt.hex"
 "#,
         )
         .unwrap();
-        emerald_config.ethereum_config.eth_genesis_path =
-            format!("{}/../assets/genesis.json", env!("CARGO_MANIFEST_DIR"));
+        let eth_genesis_path = dir.path().join("genesis.json");
+        std::fs::write(&eth_genesis_path, "{}").unwrap();
+        emerald_config.ethereum_config.eth_genesis_path = eth_genesis_path.display().to_string();
 
         let state = State::new(
             genesis,
