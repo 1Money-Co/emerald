@@ -17,6 +17,10 @@ For a request such as `height = 1426`, `round = 1`, and `valid_round = 0`, the c
 2. Requires the stored proposal's original proposer to equal the current re-proposer.
 3. Reuses the stored round in `LocallyProposedValue`, causing `ProposalInit.round` to remain 0.
 4. Logs a missing proposal only at debug level, making a fatal inability to restream easy to miss.
+5. Does not store a re-proposed value under the current round, so a successful decision makes `on_decided` fail its
+   certificate-round block-data lookup on the re-proposer.
+6. Uses the storage lookup round as `ProposalInit.pol_round`; when `valid_round` is nil, this emits the current round
+   instead of nil and prevents peers from voting for the proposal.
 
 The result is that no peer can assemble the round-1 proposal. Validators repeatedly time out and advance rounds
 without deciding the height.
@@ -28,7 +32,9 @@ without deciding the height.
 - Preserve the earlier round separately as `ProposalInit.pol_round`.
 - Allow a validator to re-propose a value originally proposed by a different validator.
 - Make missing proposal metadata operationally visible.
-- Add deterministic regression coverage for the complete stored-value-to-streamed-parts transformation.
+- Store the reconstructed proposal and block bytes under the current round for decision and commit processing.
+- Preserve `valid_round` exactly in `ProposalInit.pol_round`, including the nil hidden-lock case.
+- Add deterministic handler-level coverage for the complete stored-value-to-streamed-parts transformation.
 
 ## Non-Goals
 
@@ -48,10 +54,18 @@ Replace `State::get_previous_proposal_by_value_and_proposer` with a focused help
 - `current_round`: the round for which the value is being re-proposed; and
 - `value_id`: the value selected by the consensus engine.
 
-The helper returns either no stored proposal or a tuple containing:
+The helper prepares a restream and returns either no stored proposal or a tuple containing:
 
 - a `LocallyProposedValue` whose height and value come from storage and whose round is `current_round`; and
 - the block bytes loaded from the same `(height, proposal_round, value_id)` storage key.
+
+When `proposal_round` differs from `current_round`, the helper also stores a reconstructed `ProposedValue` and the
+block bytes under `(height, current_round, value_id)`. The reconstructed proposal uses the local node as proposer and
+`proposal_round` as `valid_round`. This mirrors the state peers build from the streamed proposal and makes the data
+available to certificate-round lookups in `on_decided` and `commit`.
+
+When both rounds are equal, the proposal is already stored under the current round. The helper does not rewrite it,
+which preserves a nil `valid_round` in the hidden-lock path.
 
 The helper does not accept or compare a proposer address. A valid value can be re-proposed by a validator other than
 its original proposer.
@@ -67,10 +81,10 @@ The handler ignores the `address` field from `AppMsg::RestreamProposal` and pass
 and `value_id` to the new state helper.
 
 On success, the handler passes the reconstructed value and stored bytes to
-`State::stream_proposal(value, bytes, proposal_round)`. `make_proposal_parts` therefore emits:
+`State::stream_proposal(value, bytes, valid_round)`. `make_proposal_parts` therefore emits:
 
 - `ProposalInit.round = current_round`; and
-- `ProposalInit.pol_round = proposal_round`.
+- `ProposalInit.pol_round = valid_round`.
 
 The stream continues to use the local node's address and a fresh nonce-derived stream ID. The receive path is
 unchanged.
@@ -89,21 +103,23 @@ On success, the handler retains the existing `Re-using previously built value` i
 
 ## Testing
 
-Add deterministic async tests around the state helper using a temporary real store.
+Add deterministic async tests around the handler and state helper using a temporary real store and Malachite
+application channels.
 
 The primary regression test will:
 
 1. Store proposal metadata and block data at round 0.
 2. Give the stored proposal an original proposer different from the local node that will restream it.
 3. Request the value with `proposal_round = 0` and `current_round = 1`.
-4. Assert retrieval returns the same value and bytes with the local proposal round rewritten to 1.
-5. Stream the result with polka round 0.
+4. Invoke `on_restream_proposal` for round 1 with valid round 0.
+5. Assert the proposal and block bytes are stored under round 1 with the local proposer and valid round 0.
 6. Inspect the emitted init part and assert `round = 1` and `pol_round = 0`.
 
 Additional cases will assert:
 
 - missing proposal metadata returns `None`; and
-- present proposal metadata with missing block data returns a contextual error.
+- present proposal metadata with missing block data returns a contextual error; and
+- a nil `valid_round` remains nil in the emitted `ProposalInit`.
 
 The tests guard emitted restream behavior rather than the exact text of tracing messages. This protects the liveness
 contract without coupling the suite to log wording.

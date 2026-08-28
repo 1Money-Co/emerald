@@ -13,6 +13,19 @@ as `pol_round`; deterministic state tests cover the full storage-to-`ProposalIni
 
 **Spec:** `docs/superpowers/specs/2026-08-28-proposal-restream-design.md`
 
+## Review Amendment (2026-08-28)
+
+The implementation review found two reachable cases omitted from the original plan. The final implementation:
+
+- renames the state boundary to `prepare_restream_proposal` and stores the reconstructed proposal plus block bytes
+  under the current round before publishing it;
+- passes `valid_round`, not the storage lookup round, to `stream_proposal`; and
+- exercises both paths through `on_restream_proposal`, including current-round persistence and a nil `valid_round`.
+
+These amendments supersede the helper signature, handler snippet, and three-test expectation below. The required
+workspace gates remain listed as commands to run; their `Expected: PASS` text is the intended gate, not a claim about
+the repository's pre-existing lint and formatting baseline.
+
 ## Global Constraints
 
 - Start from branch `seb/fix-proposal-restream`, which is derived from `origin/om-emerald` at `e2cbc98`.

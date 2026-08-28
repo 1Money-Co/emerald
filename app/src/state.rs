@@ -654,8 +654,8 @@ impl State {
             .unwrap_or(Ok(None))
     }
 
-    /// Retrieves a stored proposal and prepares it for restreaming in the current round.
-    pub async fn get_restream_proposal(
+    /// Prepares a stored proposal for restreaming and records the re-proposal at the current round.
+    pub async fn prepare_restream_proposal(
         &self,
         height: Height,
         proposal_round: Round,
@@ -680,6 +680,19 @@ impl State {
                      proposal round {proposal_round}, value {value_id}"
                 )
             })?;
+
+        if proposal_round != current_round {
+            let current_round_proposal = ProposedValue {
+                height: proposal.height,
+                round: current_round,
+                valid_round: proposal_round,
+                proposer: self.address,
+                value: proposal.value.clone(),
+                validity: Validity::Valid,
+            };
+            self.store_undecided_value(&current_round_proposal, bytes.clone())
+                .await?;
+        }
 
         Ok(Some((
             LocallyProposedValue::new(proposal.height, current_round, proposal.value),
@@ -926,10 +939,13 @@ pub fn decode_value(bytes: Bytes) -> Result<Value, ProtoError> {
 
 #[cfg(test)]
 mod tests {
+    use malachitebft_app_channel::{AppMsg, Channels, NetworkMsg};
     use malachitebft_eth_types::secp256k1::PrivateKey;
     use malachitebft_eth_types::Validator;
+    use tokio::sync::mpsc;
 
     use super::*;
+    use crate::app::on_restream_proposal;
     use crate::metrics::{DbMetrics, Metrics};
 
     async fn make_test_state() -> (State, tempfile::TempDir) {
@@ -979,7 +995,7 @@ jwt_token_path = "./assets/jwt.hex"
     }
 
     #[tokio::test]
-    async fn restream_proposal_uses_stored_round_and_current_round() {
+    async fn restream_proposal_stores_reproposal_at_current_round() {
         let (mut state, _dir) = make_test_state().await;
         let height = Height::new(1426);
         let proposal_round = Round::new(0);
@@ -1002,26 +1018,56 @@ jwt_token_path = "./assets/jwt.hex"
             .await
             .unwrap();
 
-        let (restreamed, restreamed_bytes) = state
-            .get_restream_proposal(height, proposal_round, current_round, value.id())
+        let (_consensus_tx, consensus_rx) = mpsc::channel(1);
+        let (network_tx, mut network_rx) = mpsc::channel(16);
+        let (requests_tx, _requests_rx) = mpsc::channel(1);
+        let mut channels: Channels<EmeraldContext> = Channels {
+            consensus: consensus_rx,
+            network: network_tx,
+            events: Default::default(),
+            requests: requests_tx,
+        };
+
+        on_restream_proposal(
+            AppMsg::RestreamProposal {
+                height,
+                round: current_round,
+                valid_round: proposal_round,
+                address: original_proposer,
+                value_id: value.id(),
+            },
+            &mut state,
+            &mut channels,
+        )
+        .await
+        .unwrap();
+
+        let current_round_proposal = state
+            .store
+            .get_undecided_proposal(height, current_round, value.id())
             .await
             .unwrap()
-            .unwrap();
+            .expect("restreamed proposal must be stored at the current round");
+        assert_eq!(current_round_proposal.height, height);
+        assert_eq!(current_round_proposal.round, current_round);
+        assert_eq!(current_round_proposal.valid_round, proposal_round);
+        assert_eq!(current_round_proposal.proposer, state.address);
+        assert_eq!(current_round_proposal.value, value);
 
-        assert_eq!(restreamed.height, height);
-        assert_eq!(restreamed.round, current_round);
-        assert_eq!(restreamed.value, value);
-        assert_eq!(restreamed_bytes, bytes);
+        let current_round_bytes = state
+            .store
+            .get_block_data(height, current_round, value.id())
+            .await
+            .unwrap()
+            .expect("restreamed block data must be stored at the current round");
+        assert_eq!(current_round_bytes, bytes);
 
-        let init = state
-            .stream_proposal(restreamed, restreamed_bytes, proposal_round)
-            .find_map(|message| {
-                message
-                    .content
-                    .into_data()
-                    .and_then(|part| part.as_init().cloned())
-            })
-            .unwrap();
+        let NetworkMsg::PublishProposalPart(message) = network_rx.recv().await.unwrap();
+        let init = message
+            .content
+            .into_data()
+            .and_then(|part| part.as_init().cloned())
+            .expect("the first streamed proposal part must be ProposalInit");
 
         assert_eq!(init.height, height);
         assert_eq!(init.round, current_round);
@@ -1034,7 +1080,7 @@ jwt_token_path = "./assets/jwt.hex"
         let (state, _dir) = make_test_state().await;
 
         let result = state
-            .get_restream_proposal(
+            .prepare_restream_proposal(
                 Height::new(1426),
                 Round::new(0),
                 Round::new(1),
@@ -1067,7 +1113,7 @@ jwt_token_path = "./assets/jwt.hex"
             .unwrap();
 
         let error = match state
-            .get_restream_proposal(height, proposal_round, Round::new(1), value.id())
+            .prepare_restream_proposal(height, proposal_round, Round::new(1), value.id())
             .await
         {
             Err(error) => error,
@@ -1078,5 +1124,69 @@ jwt_token_path = "./assets/jwt.hex"
             .to_string()
             .contains("Block data not found for restream proposal"));
         assert!(error.to_string().contains("1426"));
+    }
+
+    #[tokio::test]
+    async fn restream_proposal_preserves_nil_valid_round_in_proposal_init() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(10);
+        let bytes = Bytes::from_static(b"hidden-lock-block");
+        let value = Value::new(bytes.clone());
+        let stored_proposal = ProposedValue {
+            height,
+            round,
+            valid_round: Round::Nil,
+            proposer: state.address,
+            value: value.clone(),
+            validity: Validity::Valid,
+        };
+        state
+            .store_undecided_value(&stored_proposal, bytes)
+            .await
+            .unwrap();
+
+        let (_consensus_tx, consensus_rx) = mpsc::channel(1);
+        let (network_tx, mut network_rx) = mpsc::channel(16);
+        let (requests_tx, _requests_rx) = mpsc::channel(1);
+        let mut channels: Channels<EmeraldContext> = Channels {
+            consensus: consensus_rx,
+            network: network_tx,
+            events: Default::default(),
+            requests: requests_tx,
+        };
+
+        on_restream_proposal(
+            AppMsg::RestreamProposal {
+                height,
+                round,
+                valid_round: Round::Nil,
+                address: state.address,
+                value_id: value.id(),
+            },
+            &mut state,
+            &mut channels,
+        )
+        .await
+        .unwrap();
+
+        let NetworkMsg::PublishProposalPart(message) = network_rx.recv().await.unwrap();
+        let init = message
+            .content
+            .into_data()
+            .and_then(|part| part.as_init().cloned())
+            .expect("the first streamed proposal part must be ProposalInit");
+
+        assert_eq!(init.height, height);
+        assert_eq!(init.round, round);
+        assert_eq!(init.pol_round, Round::Nil);
+
+        let current_round_proposal = state
+            .store
+            .get_undecided_proposal(height, round, value.id())
+            .await
+            .unwrap()
+            .expect("current-round proposal must remain stored");
+        assert_eq!(current_round_proposal.valid_round, Round::Nil);
     }
 }

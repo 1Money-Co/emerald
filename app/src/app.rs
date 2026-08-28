@@ -626,12 +626,12 @@ pub async fn on_restream_proposal(
     info!(%height, %proposal_round, "Restreaming existing proposal...");
 
     match state
-        .get_restream_proposal(height, proposal_round, round, value_id)
+        .prepare_restream_proposal(height, proposal_round, round, value_id)
         .await?
     {
         Some((proposal, bytes)) => {
             info!(value = %proposal.value.id(), "Re-using previously built value");
-            for stream_message in state.stream_proposal(proposal, bytes, proposal_round) {
+            for stream_message in state.stream_proposal(proposal, bytes, valid_round) {
                 debug!(%height, %round, "Streaming proposal part: {stream_message:?}");
                 channels
                     .network
