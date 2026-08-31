@@ -1,3 +1,6 @@
+use core::time::Duration;
+use std::time::{Instant, SystemTime};
+
 use alloy_rpc_types_engine::ExecutionPayloadV3;
 use bytes::Bytes;
 use color_eyre::eyre::{self, eyre, OptionExt};
@@ -11,10 +14,11 @@ use malachitebft_eth_engine::engine::Engine;
 use malachitebft_eth_engine::json_structures::ExecutionBlock;
 use malachitebft_eth_types::EmeraldContext;
 use ssz::{Decode, Encode};
-use tokio::time::Instant;
+use tokio::time::Instant as TokioInstant;
 use tracing::{debug, error, info, warn};
 
 use crate::bootstrap::{initialize_state_from_existing_block, initialize_state_from_genesis};
+use crate::metrics::ConsensusMetrics;
 use crate::payload::validate_execution_payload;
 use crate::state::{decode_value, State};
 use crate::sync_handler::get_decided_value_for_sync;
@@ -104,7 +108,19 @@ pub async fn on_started_round(
         unreachable!("on_started_round called with non-StartedRound message");
     };
 
-    info!(%height, %round, %proposer, ?role, "🟢🟢 Started round");
+    state
+        .metrics
+        .consensus
+        .set_round_started_timestamp(SystemTime::now());
+
+    info!(
+        event = "consensus_round_started",
+        %height,
+        %round,
+        %proposer,
+        ?role,
+        "🟢🟢 Started round"
+    );
 
     // The consensus_height stored in state should match
     // the one in the StartedRound message
@@ -121,7 +137,7 @@ pub async fn on_started_round(
     state.consensus_round = round;
 
     if state.consensus_round == Round::ZERO {
-        state.last_block_time = Instant::now();
+        state.last_block_time = TokioInstant::now();
     }
 
     let pending_parts = state
@@ -327,6 +343,159 @@ pub async fn on_received_proposal_part(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DecisionStage {
+    Preparation,
+    BlockDataRead,
+    PayloadValidation,
+    ForkchoiceUpdate,
+    Commit,
+    BlockStatsPersistence,
+    ValidatorSetRead,
+    Completion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AwaitedStage {
+    BlockDataRead,
+    PayloadValidation,
+    ForkchoiceUpdate,
+    Commit,
+    BlockStatsPersistence,
+    ValidatorSetRead,
+}
+
+impl From<AwaitedStage> for DecisionStage {
+    fn from(stage: AwaitedStage) -> Self {
+        match stage {
+            AwaitedStage::BlockDataRead => Self::BlockDataRead,
+            AwaitedStage::PayloadValidation => Self::PayloadValidation,
+            AwaitedStage::ForkchoiceUpdate => Self::ForkchoiceUpdate,
+            AwaitedStage::Commit => Self::Commit,
+            AwaitedStage::BlockStatsPersistence => Self::BlockStatsPersistence,
+            AwaitedStage::ValidatorSetRead => Self::ValidatorSetRead,
+        }
+    }
+}
+
+impl DecisionStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparation => "preparation",
+            Self::BlockDataRead => "block_data_read",
+            Self::PayloadValidation => "payload_validation",
+            Self::ForkchoiceUpdate => "forkchoice_update",
+            Self::Commit => "commit",
+            Self::BlockStatsPersistence => "block_stats_persistence",
+            Self::ValidatorSetRead => "validator_set_read",
+            Self::Completion => "completion",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DecisionTimings {
+    current_stage: DecisionStage,
+    block_data_read: Option<Duration>,
+    payload_validation: Option<Duration>,
+    forkchoice_update: Option<Duration>,
+    commit: Option<Duration>,
+    block_stats_persistence: Option<Duration>,
+    validator_set_read: Option<Duration>,
+}
+
+impl Default for DecisionTimings {
+    fn default() -> Self {
+        Self {
+            current_stage: DecisionStage::Preparation,
+            block_data_read: None,
+            payload_validation: None,
+            forkchoice_update: None,
+            commit: None,
+            block_stats_persistence: None,
+            validator_set_read: None,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct DecisionSummary {
+    outcome: &'static str,
+    failed_stage: Option<&'static str>,
+    duration_seconds: f64,
+    block_data_read_duration_seconds: Option<f64>,
+    payload_validation_duration_seconds: Option<f64>,
+    forkchoice_update_duration_seconds: Option<f64>,
+    commit_duration_seconds: Option<f64>,
+    block_stats_persistence_duration_seconds: Option<f64>,
+    validator_set_read_duration_seconds: Option<f64>,
+}
+
+impl DecisionTimings {
+    fn enter_awaited(&mut self, stage: AwaitedStage) {
+        self.current_stage = stage.into();
+    }
+
+    fn enter_preparation(&mut self) {
+        self.current_stage = DecisionStage::Preparation;
+    }
+
+    fn enter_completion(&mut self) {
+        self.current_stage = DecisionStage::Completion;
+    }
+
+    fn observe(&mut self, stage: AwaitedStage, duration: Duration, metrics: &ConsensusMetrics) {
+        match stage {
+            AwaitedStage::BlockDataRead => {
+                self.block_data_read = Some(duration);
+                metrics.observe_block_data_read(duration);
+            }
+            AwaitedStage::PayloadValidation => {
+                self.payload_validation = Some(duration);
+                metrics.observe_payload_validation(duration);
+            }
+            AwaitedStage::ForkchoiceUpdate => {
+                self.forkchoice_update = Some(duration);
+                metrics.observe_forkchoice_update(duration);
+            }
+            AwaitedStage::Commit => {
+                self.commit = Some(duration);
+                metrics.observe_commit(duration);
+            }
+            AwaitedStage::BlockStatsPersistence => {
+                self.block_stats_persistence = Some(duration);
+                metrics.observe_block_stats_persistence(duration);
+            }
+            AwaitedStage::ValidatorSetRead => {
+                self.validator_set_read = Some(duration);
+                metrics.observe_validator_set_read(duration);
+            }
+        }
+    }
+
+    fn summary(&self, total: Duration, succeeded: bool) -> DecisionSummary {
+        DecisionSummary {
+            outcome: if succeeded { "success" } else { "error" },
+            failed_stage: (!succeeded).then_some(self.current_stage.as_str()),
+            duration_seconds: total.as_secs_f64(),
+            block_data_read_duration_seconds: self.block_data_read.map(|value| value.as_secs_f64()),
+            payload_validation_duration_seconds: self
+                .payload_validation
+                .map(|value| value.as_secs_f64()),
+            forkchoice_update_duration_seconds: self
+                .forkchoice_update
+                .map(|value| value.as_secs_f64()),
+            commit_duration_seconds: self.commit.map(|value| value.as_secs_f64()),
+            block_stats_persistence_duration_seconds: self
+                .block_stats_persistence
+                .map(|value| value.as_secs_f64()),
+            validator_set_read_duration_seconds: self
+                .validator_set_read
+                .map(|value| value.as_secs_f64()),
+        }
+    }
+}
+
 /// Handle Decided messages from the consensus engine
 ///
 /// Notifies the application that consensus has decided on a value.
@@ -348,6 +517,58 @@ pub async fn on_decided(
     engine: &Engine,
     emerald_config: &EmeraldConfig,
 ) -> eyre::Result<()> {
+    let AppMsg::Decided { certificate, .. } = &decided else {
+        unreachable!("on_decided called with non-Decided message");
+    };
+    let height = certificate.height;
+    let round = certificate.round;
+    let value_id = certificate.value_id;
+
+    let metrics = state.metrics.consensus.clone();
+    let mut timings = DecisionTimings::default();
+    let started = Instant::now();
+    let result = on_decided_inner(
+        decided,
+        state,
+        engine,
+        emerald_config,
+        &metrics,
+        &mut timings,
+    )
+    .await;
+    let total = started.elapsed();
+    metrics.observe_total(total);
+
+    let summary = timings.summary(total, result.is_ok());
+    info!(
+        event = "on_decided_timing",
+        %height,
+        %round,
+        %value_id,
+        outcome = summary.outcome,
+        failed_stage = summary.failed_stage,
+        duration_seconds = summary.duration_seconds,
+        block_data_read_duration_seconds = summary.block_data_read_duration_seconds,
+        payload_validation_duration_seconds = summary.payload_validation_duration_seconds,
+        forkchoice_update_duration_seconds = summary.forkchoice_update_duration_seconds,
+        commit_duration_seconds = summary.commit_duration_seconds,
+        block_stats_persistence_duration_seconds =
+            summary.block_stats_persistence_duration_seconds,
+        validator_set_read_duration_seconds = summary.validator_set_read_duration_seconds,
+        "on_decided timing"
+    );
+
+    result
+}
+
+async fn on_decided_inner(
+    decided: AppMsg<EmeraldContext>,
+    state: &mut State,
+    engine: &Engine,
+    emerald_config: &EmeraldConfig,
+    metrics: &ConsensusMetrics,
+    timings: &mut DecisionTimings,
+) -> eyre::Result<()> {
     let AppMsg::Decided {
         certificate, reply, ..
     } = decided
@@ -365,10 +586,13 @@ pub async fn on_decided(
 
     // The consensus engine only sends Decided messages for values (proposals)
     // that were completely received by the local node
-    let block_bytes = state
-        .get_block_data(height, round, value_id)
-        .await
-        .ok_or_eyre("app: certificate should have associated block data")?;
+    timings.enter_awaited(AwaitedStage::BlockDataRead);
+    let started = Instant::now();
+    let block_bytes = state.get_block_data(height, round, value_id).await;
+    timings.observe(AwaitedStage::BlockDataRead, started.elapsed(), metrics);
+    let block_bytes =
+        block_bytes.ok_or_eyre("app: certificate should have associated block data")?;
+    timings.enter_preparation();
     debug!("🎁 block size: {:?}, height: {}", block_bytes.len(), height);
 
     // Decode bytes into execution payload (a block) and get relevant fields
@@ -393,6 +617,8 @@ pub async fn on_decided(
     assert_eq!(latest_block_hash, parent_block_hash);
 
     // Validate the execution payload (uses cache internally)
+    timings.enter_awaited(AwaitedStage::PayloadValidation);
+    let started = Instant::now();
     let validity = validate_execution_payload(
         state.validated_cache_mut(),
         &block_bytes,
@@ -401,7 +627,9 @@ pub async fn on_decided(
         engine,
         &emerald_config.retry_config,
     )
-    .await?;
+    .await;
+    timings.observe(AwaitedStage::PayloadValidation, started.elapsed(), metrics);
+    let validity = validity?;
 
     if validity == Validity::Invalid {
         return Err(eyre!("Block validation failed for hash: {}", block_hash));
@@ -414,9 +642,13 @@ pub async fn on_decided(
 
     // Notify the EL of the new block.
     // Update the execution head state to this block.
+    timings.enter_awaited(AwaitedStage::ForkchoiceUpdate);
+    let started = Instant::now();
     let latest_valid_hash = engine
         .set_latest_forkchoice_state(block_hash, &emerald_config.retry_config)
-        .await?;
+        .await;
+    timings.observe(AwaitedStage::ForkchoiceUpdate, started.elapsed(), metrics);
+    let latest_valid_hash = latest_valid_hash?;
     debug!(
         "🚀 Forkchoice updated to height {} for block hash={} and latest_valid_hash={}",
         height, block_hash, latest_valid_hash
@@ -424,17 +656,29 @@ pub async fn on_decided(
 
     // When that happens, we store the decided value in our store
     // TODO: we should return an error reply if commit fails
-    state.commit(certificate).await?;
+    timings.enter_awaited(AwaitedStage::Commit);
+    let started = Instant::now();
+    let commit_result = state.commit(certificate).await;
+    timings.observe(AwaitedStage::Commit, started.elapsed(), metrics);
+    commit_result?;
 
     // Calculate and log per-block statistics
     let block_time_secs = state.previous_block_commit_time.elapsed().as_secs_f64();
-    state
+    timings.enter_awaited(AwaitedStage::BlockStatsPersistence);
+    let started = Instant::now();
+    let stats_result = state
         .log_block_stats(height, tx_count, block_bytes.len(), block_time_secs)
-        .await?;
+        .await;
+    timings.observe(
+        AwaitedStage::BlockStatsPersistence,
+        started.elapsed(),
+        metrics,
+    );
+    stats_result?;
 
     // Update previous_block_commit_time to track when this block was committed
     // This is used to calculate per-block TPS for the next block
-    state.previous_block_commit_time = Instant::now();
+    state.previous_block_commit_time = TokioInstant::now();
 
     // Save the latest block
     state.latest_block = Some(ExecutionBlock {
@@ -451,8 +695,13 @@ pub async fn on_decided(
     state.consensus_round = Round::ZERO;
 
     // Get the new validator set for the next height and update the local state
+    timings.enter_awaited(AwaitedStage::ValidatorSetRead);
+    let started = Instant::now();
     let new_validator_set =
-        read_validators_from_contract(engine.eth.url().as_ref(), &latest_valid_hash).await?;
+        read_validators_from_contract(engine.eth.url().as_ref(), &latest_valid_hash).await;
+    timings.observe(AwaitedStage::ValidatorSetRead, started.elapsed(), metrics);
+    let new_validator_set = new_validator_set?;
+    timings.enter_completion();
     debug!("🌈 Got validator set: {:?}", new_validator_set);
     state.set_validator_set(state.consensus_height, new_validator_set);
 
@@ -794,4 +1043,95 @@ pub async fn run(
     // from consensus has been closed, meaning that the consensus actor has died.
     // We can do nothing but return an error here.
     Err(eyre!("Consensus channel closed unexpectedly"))
+}
+
+#[cfg(test)]
+mod tests {
+    use core::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn decision_timings_build_success_summary() {
+        let metrics = ConsensusMetrics::new();
+        let mut timings = DecisionTimings::default();
+        for stage in [
+            AwaitedStage::BlockDataRead,
+            AwaitedStage::PayloadValidation,
+            AwaitedStage::ForkchoiceUpdate,
+            AwaitedStage::Commit,
+            AwaitedStage::BlockStatsPersistence,
+            AwaitedStage::ValidatorSetRead,
+        ] {
+            timings.enter_awaited(stage);
+            timings.observe(stage, Duration::from_millis(2), &metrics);
+        }
+        timings.enter_completion();
+
+        let summary = timings.summary(Duration::from_millis(20), true);
+
+        assert_eq!(summary.outcome, "success");
+        assert_eq!(summary.failed_stage, None);
+        assert_eq!(summary.duration_seconds, 0.02);
+        assert_eq!(summary.block_data_read_duration_seconds, Some(0.002));
+        assert_eq!(summary.payload_validation_duration_seconds, Some(0.002));
+        assert_eq!(summary.forkchoice_update_duration_seconds, Some(0.002));
+        assert_eq!(summary.commit_duration_seconds, Some(0.002));
+        assert_eq!(
+            summary.block_stats_persistence_duration_seconds,
+            Some(0.002)
+        );
+        assert_eq!(summary.validator_set_read_duration_seconds, Some(0.002));
+    }
+
+    #[test]
+    fn decision_timings_build_error_summary_without_unreached_stages() {
+        let metrics = ConsensusMetrics::new();
+        let mut timings = DecisionTimings::default();
+        timings.enter_awaited(AwaitedStage::BlockDataRead);
+        timings.observe(
+            AwaitedStage::BlockDataRead,
+            Duration::from_millis(1),
+            &metrics,
+        );
+        timings.enter_awaited(AwaitedStage::PayloadValidation);
+        timings.observe(
+            AwaitedStage::PayloadValidation,
+            Duration::from_millis(3),
+            &metrics,
+        );
+        timings.enter_awaited(AwaitedStage::ForkchoiceUpdate);
+
+        let summary = timings.summary(Duration::from_millis(10), false);
+
+        assert_eq!(summary.outcome, "error");
+        assert_eq!(summary.failed_stage, Some("forkchoice_update"));
+        assert_eq!(summary.block_data_read_duration_seconds, Some(0.001));
+        assert_eq!(summary.payload_validation_duration_seconds, Some(0.003));
+        assert_eq!(summary.forkchoice_update_duration_seconds, None);
+        assert_eq!(summary.commit_duration_seconds, None);
+        assert_eq!(summary.block_stats_persistence_duration_seconds, None);
+        assert_eq!(summary.validator_set_read_duration_seconds, None);
+    }
+
+    #[test]
+    fn decision_stage_names_are_stable() {
+        let cases = [
+            (DecisionStage::Preparation, "preparation"),
+            (AwaitedStage::BlockDataRead.into(), "block_data_read"),
+            (AwaitedStage::PayloadValidation.into(), "payload_validation"),
+            (AwaitedStage::ForkchoiceUpdate.into(), "forkchoice_update"),
+            (AwaitedStage::Commit.into(), "commit"),
+            (
+                AwaitedStage::BlockStatsPersistence.into(),
+                "block_stats_persistence",
+            ),
+            (AwaitedStage::ValidatorSetRead.into(), "validator_set_read"),
+            (DecisionStage::Completion, "completion"),
+        ];
+
+        for (stage, expected) in cases {
+            assert_eq!(stage.as_str(), expected);
+        }
+    }
 }

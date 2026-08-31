@@ -175,7 +175,10 @@ impl App {
 
         let prune_at_block_interval = emerald_config.prune_at_block_interval;
 
-        assert_ne!(prune_at_block_interval, 0, "prune block interval cannot be 0");
+        assert_ne!(
+            prune_at_block_interval, 0,
+            "prune block interval cannot be 0"
+        );
 
         let state = State::new(
             genesis,
@@ -396,34 +399,6 @@ fn public_key_hex(public_key: &PublicKey) -> String {
     format!("0x{}", hex::encode(&bytes[1..]))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{key_provider_kind, public_key_hex};
-    use malachitebft_eth_types::secp256k1::PrivateKey;
-
-    #[test]
-    fn key_provider_kind_names_file_provider() {
-        assert_eq!(
-            key_provider_kind(&key_provider::KeyProviderConfig::File),
-            "file"
-        );
-    }
-
-    #[test]
-    fn public_key_hex_uses_show_pubkey_format() {
-        let private_key = PrivateKey::from_slice(&[7_u8; 32]).unwrap();
-        let public_key = private_key.public_key();
-        let encoded = public_key_hex(&public_key);
-
-        assert!(encoded.starts_with("0x"));
-        let encoded_bytes = hex::decode(encoded.strip_prefix("0x").unwrap()).unwrap();
-        let uncompressed = public_key.inner().to_encoded_point(false);
-
-        assert_eq!(encoded_bytes.len(), 64);
-        assert_eq!(encoded_bytes, &uncompressed.as_bytes()[1..]);
-    }
-}
-
 impl CanMakeGenesis for App {
     fn make_genesis(&self, validators: Vec<(PublicKey, VotingPower)>) -> Self::Genesis {
         let validators = validators
@@ -448,5 +423,34 @@ impl CanGeneratePrivateKey for App {
 impl CanMakePrivateKeyFile for App {
     fn make_private_key_file(&self, private_key: PrivateKey) -> Self::PrivateKeyFile {
         private_key
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use malachitebft_eth_types::secp256k1::PrivateKey;
+
+    use super::{key_provider_kind, public_key_hex};
+
+    #[test]
+    fn key_provider_kind_names_file_provider() {
+        assert_eq!(
+            key_provider_kind(&key_provider::KeyProviderConfig::File),
+            "file"
+        );
+    }
+
+    #[test]
+    fn public_key_hex_uses_show_pubkey_format() {
+        let private_key = PrivateKey::from_slice(&[7_u8; 32]).unwrap();
+        let public_key = private_key.public_key();
+        let encoded = public_key_hex(&public_key);
+
+        assert!(encoded.starts_with("0x"));
+        let encoded_bytes = hex::decode(encoded.strip_prefix("0x").unwrap()).unwrap();
+        let uncompressed = public_key.inner().to_encoded_point(false);
+
+        assert_eq!(encoded_bytes.len(), 64);
+        assert_eq!(encoded_bytes, &uncompressed.as_bytes()[1..]);
     }
 }
