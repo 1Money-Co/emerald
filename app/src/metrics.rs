@@ -409,7 +409,9 @@ impl ConsensusMetrics {
     }
 
     pub fn observe_block_stats_persistence(&self, duration: Duration) {
-        self.0.block_stats_persistence.observe(duration.as_secs_f64());
+        self.0
+            .block_stats_persistence
+            .observe(duration.as_secs_f64());
     }
 
     pub fn observe_validator_set_read(&self, duration: Duration) {
@@ -461,8 +463,9 @@ impl Default for Metrics {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use metrics::prometheus::encoding::text::encode;
+
+    use super::*;
 
     const DECISION_METRIC_NAMES: [&str; 7] = [
         "on_decided_block_data_read_duration_seconds",
@@ -499,12 +502,8 @@ mod tests {
             assert!(output.contains(&format!("{full_name}_sum 1.0")));
         }
 
-        assert!(output.contains(
-            "app_channel_on_decided_duration_seconds_bucket{le=\"0.001\"}"
-        ));
-        assert!(output.contains(
-            "app_channel_on_decided_duration_seconds_bucket{le=\"131.072\"}"
-        ));
+        assert!(output.contains("app_channel_on_decided_duration_seconds_bucket{le=\"0.001\"}"));
+        assert!(output.contains("app_channel_on_decided_duration_seconds_bucket{le=\"131.072\"}"));
 
         for forbidden in [
             "height=",
