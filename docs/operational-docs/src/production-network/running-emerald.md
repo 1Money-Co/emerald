@@ -161,8 +161,7 @@ histogram_quantile(
 The first query preserves the validator `moniker`. The second aggregates the entire validator fleet.
 
 The application also emits one `on_decided_timing` event per `on_decided` return. Every event includes `height`,
-`round`, `value_id`, `outcome`, and `total_duration_seconds`. Successful events also include every completed stage
-duration:
+`round`, `value_id`, `outcome`, and `duration_seconds`. Successful events also include every completed stage duration:
 
 - `block_data_read_duration_seconds`
 - `payload_validation_duration_seconds`
