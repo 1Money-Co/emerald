@@ -21,9 +21,13 @@ awaited redb operations on the same critical path. The code logs when a node sta
 a stable machine-oriented name, and Emerald does not expose application metrics for the six decision stages or their
 total latency.
 
-All checked-in mainnet validator TOMLs already configure `timeout_prevote = "5s"` and
-`timeout_prevote_delta = "500ms"`. Changing generated defaults would therefore not improve nodes using those explicit
-files. This design measures the live behavior first and leaves timeout changes for a later evidence-based decision.
+As verified for this design on 2026-08-31, `1money-interoperability-protocol` `origin/main` commit `256497c` has
+`timeout_prevote = "5s"` and `timeout_prevote_delta = "500ms"` in all 13 checked-in mainnet validator TOMLs under
+`deployment/mainnet/nodes/*/config/config.toml`; the deployment-introducing commit `d5b5bbb` has the same values.
+The interop e2e TOMLs and Emerald's generated/example defaults remain at 1 second, and `cicd-manifests` contains no
+`timeout_prevote` key. Checked-in TOMLs therefore do not prove which configuration is live, so rollout measurements
+must include the deployed configuration snapshot. This design measures live behavior first and leaves timeout changes
+for a later evidence-based decision.
 
 ## Goals
 
@@ -31,7 +35,8 @@ files. This design measures the live behavior first and leaves timeout changes f
 - Record stage latency even when the awaited operation returns an error.
 - Emit one structured summary event for each normally completed decision attempt, whether it succeeds or returns an
   error.
-- Make exact cross-validator round-entry skew calculable from structured logs.
+- Make current cross-validator round-entry skew directly calculable in Prometheus, while retaining structured logs for
+  per-height and per-round correlation.
 - Keep Prometheus cardinality bounded and preserve current consensus behavior.
 - Document how operators collect the data required for the next phase of issue #315.
 
@@ -62,9 +67,16 @@ Register these histograms under the existing `app_channel` registry prefix:
 - `on_decided_validator_set_read_duration_seconds`
 - `on_decided_duration_seconds`
 
-Each histogram uses 18 exponential buckets beginning at 1 millisecond and doubling through 131.072 seconds, followed
-by the Prometheus `+Inf` bucket. The range provides useful resolution for cached validation and database writes while
+Each histogram uses 21 exponential buckets beginning at 100 microseconds and doubling through 104.8576 seconds,
+followed by the Prometheus `+Inf` bucket. The range separates cache hits and fast database operations while still
 covering the configured 10-20 second execution retry windows and multi-stage outliers.
+
+Register one additional gauge under the same prefix:
+
+- `consensus_round_started_timestamp_seconds`
+
+The gauge records the Unix timestamp when the application most recently handled `StartedRound`. It carries only the
+existing bounded `moniker` label.
 
 Height, round, value ID, block hash, proposer, result, and failure stage must not be metric labels. The registry's
 existing bounded `moniker` label remains unchanged.
@@ -142,6 +154,10 @@ Keep its existing height, round, proposer, role, and message. Do not emit a seco
 clocks, the round-entry skew for a `(height, round)` is the latest event timestamp minus the earliest event timestamp
 across validator monikers.
 
+At the same point, set `app_channel_consensus_round_started_timestamp_seconds` from `SystemTime`. Once all validator
+series refer to the same round, current fleet skew is directly queryable as `max(metric) - min(metric)`. Structured
+events remain the source for historical per-height and per-round correlation.
+
 ## Data Flow
 
 ```text
@@ -158,8 +174,10 @@ wrapper records total histogram -- emits one success/error summary -- returns un
 
 Malachite StartedRound message
         |
+        +--------------------------- sets latest round-start timestamp gauge
+        |
         v
-existing Started round log ------- adds stable event field for cross-node correlation
+existing Started round log ------- adds stable event field for historical cross-node correlation
 ```
 
 The metrics handle is cloned before entering the inner handler. The timing accumulator is local to one decision
@@ -169,10 +187,10 @@ attempt and is not persisted. Metrics and logs are observational outputs only an
 
 Extend Emerald's operational documentation with:
 
-- the seven full `app_channel_*` metric names and their units;
+- the seven histogram names and the round-start timestamp gauge, with their units;
 - the `on_decided_timing` and `consensus_round_started` event schemas;
 - example Prometheus queries for per-node and fleet-wide P50, P95, and P99 latency;
-- the log aggregation calculation for per-height round-entry skew; and
+- direct PromQL for current round-entry skew plus the log calculation for historical per-height skew; and
 - the requirement to keep validator clocks synchronized before interpreting timestamp differences.
 
 Do not add a dashboard in this change. Production monitoring ownership and query syntax are not established in the
@@ -185,9 +203,9 @@ Emerald repository, so the documentation should describe portable Prometheus and
 Use a fresh local registry to register `ConsensusMetrics`, observe representative values, and render the Prometheus
 text format. Assert:
 
-- all seven metric families are registered under the expected names;
+- all seven histogram families and the timestamp gauge are registered under the expected names;
 - recorded counts and sums appear;
-- the 1 millisecond and 131.072 second bucket boundaries appear; and
+- the 100 microsecond and 104.8576 second bucket boundaries appear; and
 - no height, round, value, hash, proposer, result, or failure-stage labels exist.
 
 ### Timing-model tests
@@ -222,7 +240,7 @@ so every node emits the same schema.
 
 After rollout:
 
-1. Verify all seven histogram families are scraped for every validator moniker.
+1. Verify all seven histogram families and the round-start timestamp gauge are scraped for every validator moniker.
 2. Verify one `on_decided_timing` event is emitted for each normal decision attempt.
 3. Verify `consensus_round_started` appears at each round boundary.
 4. Collect at least 24 hours of P50, P95, and P99 stage and total latency per validator and across the fleet.

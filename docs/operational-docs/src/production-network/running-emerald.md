@@ -132,6 +132,7 @@ high-cardinality time series.
 | `app_channel_on_decided_block_stats_persistence_duration_seconds` | Persist cumulative block statistics. |
 | `app_channel_on_decided_validator_set_read_duration_seconds` | Read the next validator set at the decided hash. |
 | `app_channel_on_decided_duration_seconds` | Complete application handling of the `Decided` message. |
+| `app_channel_consensus_round_started_timestamp_seconds` | Unix timestamp of the latest application round start. |
 
 Use the same PromQL pattern for any stage histogram by swapping the metric name and changing the quantile to `0.50`,
 `0.95`, or `0.99`.
@@ -174,7 +175,16 @@ Failed events include `failed_stage` instead of unreached duration fields. The b
 `preparation`, `block_data_read`, `payload_validation`, `forkchoice_update`, `commit`,
 `block_stats_persistence`, `validator_set_read`, and `completion`.
 
-Round-entry skew uses the existing `consensus_round_started` event and synchronized clocks:
+With synchronized validator clocks, query the current round-entry skew directly from Prometheus after all validator
+series have advanced to the same `(height, round)`:
+
+```promql
+max(app_channel_consensus_round_started_timestamp_seconds)
+- min(app_channel_consensus_round_started_timestamp_seconds)
+```
+
+The gauge has one bounded series per validator `moniker`. It intentionally does not label height or round, so use the
+existing `consensus_round_started` events for historical per-height and per-round correlation:
 
 ```text
 round_entry_skew(height, round) =

@@ -1,4 +1,5 @@
 use core::time::Duration;
+use std::time::{Instant, SystemTime};
 
 use alloy_rpc_types_engine::ExecutionPayloadV3;
 use bytes::Bytes;
@@ -13,7 +14,7 @@ use malachitebft_eth_engine::engine::Engine;
 use malachitebft_eth_engine::json_structures::ExecutionBlock;
 use malachitebft_eth_types::EmeraldContext;
 use ssz::{Decode, Encode};
-use tokio::time::Instant;
+use tokio::time::Instant as TokioInstant;
 use tracing::{debug, error, info, warn};
 
 use crate::bootstrap::{initialize_state_from_existing_block, initialize_state_from_genesis};
@@ -107,6 +108,11 @@ pub async fn on_started_round(
         unreachable!("on_started_round called with non-StartedRound message");
     };
 
+    state
+        .metrics
+        .consensus
+        .set_round_started_timestamp(SystemTime::now());
+
     info!(
         event = "consensus_round_started",
         %height,
@@ -131,7 +137,7 @@ pub async fn on_started_round(
     state.consensus_round = round;
 
     if state.consensus_round == Round::ZERO {
-        state.last_block_time = Instant::now();
+        state.last_block_time = TokioInstant::now();
     }
 
     let pending_parts = state
@@ -337,21 +343,6 @@ pub async fn on_received_proposal_part(
     Ok(())
 }
 
-/// Handle Decided messages from the consensus engine
-///
-/// Notifies the application that consensus has decided on a value.
-///
-/// This message includes a commit certificate containing the ID of
-/// the value that was decided on, the height and round at which it was decided,
-/// and the aggregated signatures of the validators that committed to it.
-/// It also includes to the vote extensions received for that height.
-///
-/// In response to this message, the application MUST send a [`Next`]
-/// message back to consensus, instructing it to either start the next height if
-/// the application was able to commit the decided value, or to restart the current height
-/// otherwise.
-///
-/// If the application does not reply, consensus will stall.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DecisionStage {
     Preparation,
@@ -362,6 +353,29 @@ enum DecisionStage {
     BlockStatsPersistence,
     ValidatorSetRead,
     Completion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AwaitedStage {
+    BlockDataRead,
+    PayloadValidation,
+    ForkchoiceUpdate,
+    Commit,
+    BlockStatsPersistence,
+    ValidatorSetRead,
+}
+
+impl From<AwaitedStage> for DecisionStage {
+    fn from(stage: AwaitedStage) -> Self {
+        match stage {
+            AwaitedStage::BlockDataRead => Self::BlockDataRead,
+            AwaitedStage::PayloadValidation => Self::PayloadValidation,
+            AwaitedStage::ForkchoiceUpdate => Self::ForkchoiceUpdate,
+            AwaitedStage::Commit => Self::Commit,
+            AwaitedStage::BlockStatsPersistence => Self::BlockStatsPersistence,
+            AwaitedStage::ValidatorSetRead => Self::ValidatorSetRead,
+        }
+    }
 }
 
 impl DecisionStage {
@@ -418,38 +432,43 @@ struct DecisionSummary {
 }
 
 impl DecisionTimings {
-    fn enter(&mut self, stage: DecisionStage) {
-        self.current_stage = stage;
+    fn enter_awaited(&mut self, stage: AwaitedStage) {
+        self.current_stage = stage.into();
     }
 
-    fn observe(&mut self, stage: DecisionStage, duration: Duration, metrics: &ConsensusMetrics) {
+    fn enter_preparation(&mut self) {
+        self.current_stage = DecisionStage::Preparation;
+    }
+
+    fn enter_completion(&mut self) {
+        self.current_stage = DecisionStage::Completion;
+    }
+
+    fn observe(&mut self, stage: AwaitedStage, duration: Duration, metrics: &ConsensusMetrics) {
         match stage {
-            DecisionStage::BlockDataRead => {
+            AwaitedStage::BlockDataRead => {
                 self.block_data_read = Some(duration);
                 metrics.observe_block_data_read(duration);
             }
-            DecisionStage::PayloadValidation => {
+            AwaitedStage::PayloadValidation => {
                 self.payload_validation = Some(duration);
                 metrics.observe_payload_validation(duration);
             }
-            DecisionStage::ForkchoiceUpdate => {
+            AwaitedStage::ForkchoiceUpdate => {
                 self.forkchoice_update = Some(duration);
                 metrics.observe_forkchoice_update(duration);
             }
-            DecisionStage::Commit => {
+            AwaitedStage::Commit => {
                 self.commit = Some(duration);
                 metrics.observe_commit(duration);
             }
-            DecisionStage::BlockStatsPersistence => {
+            AwaitedStage::BlockStatsPersistence => {
                 self.block_stats_persistence = Some(duration);
                 metrics.observe_block_stats_persistence(duration);
             }
-            DecisionStage::ValidatorSetRead => {
+            AwaitedStage::ValidatorSetRead => {
                 self.validator_set_read = Some(duration);
                 metrics.observe_validator_set_read(duration);
-            }
-            DecisionStage::Preparation | DecisionStage::Completion => {
-                unreachable!("non-awaited decision stage cannot be observed")
             }
         }
     }
@@ -477,6 +496,21 @@ impl DecisionTimings {
     }
 }
 
+/// Handle Decided messages from the consensus engine
+///
+/// Notifies the application that consensus has decided on a value.
+///
+/// This message includes a commit certificate containing the ID of
+/// the value that was decided on, the height and round at which it was decided,
+/// and the aggregated signatures of the validators that committed to it.
+/// It also includes to the vote extensions received for that height.
+///
+/// In response to this message, the application MUST send a [`Next`]
+/// message back to consensus, instructing it to either start the next height if
+/// the application was able to commit the decided value, or to restart the current height
+/// otherwise.
+///
+/// If the application does not reply, consensus will stall.
 pub async fn on_decided(
     decided: AppMsg<EmeraldContext>,
     state: &mut State,
@@ -552,13 +586,13 @@ async fn on_decided_inner(
 
     // The consensus engine only sends Decided messages for values (proposals)
     // that were completely received by the local node
-    timings.enter(DecisionStage::BlockDataRead);
+    timings.enter_awaited(AwaitedStage::BlockDataRead);
     let started = Instant::now();
     let block_bytes = state.get_block_data(height, round, value_id).await;
-    timings.observe(DecisionStage::BlockDataRead, started.elapsed(), metrics);
+    timings.observe(AwaitedStage::BlockDataRead, started.elapsed(), metrics);
     let block_bytes =
         block_bytes.ok_or_eyre("app: certificate should have associated block data")?;
-    timings.enter(DecisionStage::Preparation);
+    timings.enter_preparation();
     debug!("🎁 block size: {:?}, height: {}", block_bytes.len(), height);
 
     // Decode bytes into execution payload (a block) and get relevant fields
@@ -583,7 +617,7 @@ async fn on_decided_inner(
     assert_eq!(latest_block_hash, parent_block_hash);
 
     // Validate the execution payload (uses cache internally)
-    timings.enter(DecisionStage::PayloadValidation);
+    timings.enter_awaited(AwaitedStage::PayloadValidation);
     let started = Instant::now();
     let validity = validate_execution_payload(
         state.validated_cache_mut(),
@@ -594,7 +628,7 @@ async fn on_decided_inner(
         &emerald_config.retry_config,
     )
     .await;
-    timings.observe(DecisionStage::PayloadValidation, started.elapsed(), metrics);
+    timings.observe(AwaitedStage::PayloadValidation, started.elapsed(), metrics);
     let validity = validity?;
 
     if validity == Validity::Invalid {
@@ -608,12 +642,12 @@ async fn on_decided_inner(
 
     // Notify the EL of the new block.
     // Update the execution head state to this block.
-    timings.enter(DecisionStage::ForkchoiceUpdate);
+    timings.enter_awaited(AwaitedStage::ForkchoiceUpdate);
     let started = Instant::now();
     let latest_valid_hash = engine
         .set_latest_forkchoice_state(block_hash, &emerald_config.retry_config)
         .await;
-    timings.observe(DecisionStage::ForkchoiceUpdate, started.elapsed(), metrics);
+    timings.observe(AwaitedStage::ForkchoiceUpdate, started.elapsed(), metrics);
     let latest_valid_hash = latest_valid_hash?;
     debug!(
         "🚀 Forkchoice updated to height {} for block hash={} and latest_valid_hash={}",
@@ -622,21 +656,21 @@ async fn on_decided_inner(
 
     // When that happens, we store the decided value in our store
     // TODO: we should return an error reply if commit fails
-    timings.enter(DecisionStage::Commit);
+    timings.enter_awaited(AwaitedStage::Commit);
     let started = Instant::now();
     let commit_result = state.commit(certificate).await;
-    timings.observe(DecisionStage::Commit, started.elapsed(), metrics);
+    timings.observe(AwaitedStage::Commit, started.elapsed(), metrics);
     commit_result?;
 
     // Calculate and log per-block statistics
     let block_time_secs = state.previous_block_commit_time.elapsed().as_secs_f64();
-    timings.enter(DecisionStage::BlockStatsPersistence);
+    timings.enter_awaited(AwaitedStage::BlockStatsPersistence);
     let started = Instant::now();
     let stats_result = state
         .log_block_stats(height, tx_count, block_bytes.len(), block_time_secs)
         .await;
     timings.observe(
-        DecisionStage::BlockStatsPersistence,
+        AwaitedStage::BlockStatsPersistence,
         started.elapsed(),
         metrics,
     );
@@ -644,7 +678,7 @@ async fn on_decided_inner(
 
     // Update previous_block_commit_time to track when this block was committed
     // This is used to calculate per-block TPS for the next block
-    state.previous_block_commit_time = Instant::now();
+    state.previous_block_commit_time = TokioInstant::now();
 
     // Save the latest block
     state.latest_block = Some(ExecutionBlock {
@@ -661,13 +695,13 @@ async fn on_decided_inner(
     state.consensus_round = Round::ZERO;
 
     // Get the new validator set for the next height and update the local state
-    timings.enter(DecisionStage::ValidatorSetRead);
+    timings.enter_awaited(AwaitedStage::ValidatorSetRead);
     let started = Instant::now();
     let new_validator_set =
         read_validators_from_contract(engine.eth.url().as_ref(), &latest_valid_hash).await;
-    timings.observe(DecisionStage::ValidatorSetRead, started.elapsed(), metrics);
+    timings.observe(AwaitedStage::ValidatorSetRead, started.elapsed(), metrics);
     let new_validator_set = new_validator_set?;
-    timings.enter(DecisionStage::Completion);
+    timings.enter_completion();
     debug!("🌈 Got validator set: {:?}", new_validator_set);
     state.set_validator_set(state.consensus_height, new_validator_set);
 
@@ -686,97 +720,6 @@ async fn on_decided_inner(
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use core::time::Duration;
-
-    use super::*;
-
-    #[test]
-    fn decision_timings_build_success_summary() {
-        let metrics = ConsensusMetrics::new();
-        let mut timings = DecisionTimings::default();
-        for stage in [
-            DecisionStage::BlockDataRead,
-            DecisionStage::PayloadValidation,
-            DecisionStage::ForkchoiceUpdate,
-            DecisionStage::Commit,
-            DecisionStage::BlockStatsPersistence,
-            DecisionStage::ValidatorSetRead,
-        ] {
-            timings.enter(stage);
-            timings.observe(stage, Duration::from_millis(2), &metrics);
-        }
-        timings.enter(DecisionStage::Completion);
-
-        let summary = timings.summary(Duration::from_millis(20), true);
-
-        assert_eq!(summary.outcome, "success");
-        assert_eq!(summary.failed_stage, None);
-        assert_eq!(summary.duration_seconds, 0.02);
-        assert_eq!(summary.block_data_read_duration_seconds, Some(0.002));
-        assert_eq!(summary.payload_validation_duration_seconds, Some(0.002));
-        assert_eq!(summary.forkchoice_update_duration_seconds, Some(0.002));
-        assert_eq!(summary.commit_duration_seconds, Some(0.002));
-        assert_eq!(
-            summary.block_stats_persistence_duration_seconds,
-            Some(0.002)
-        );
-        assert_eq!(summary.validator_set_read_duration_seconds, Some(0.002));
-    }
-
-    #[test]
-    fn decision_timings_build_error_summary_without_unreached_stages() {
-        let metrics = ConsensusMetrics::new();
-        let mut timings = DecisionTimings::default();
-        timings.enter(DecisionStage::BlockDataRead);
-        timings.observe(
-            DecisionStage::BlockDataRead,
-            Duration::from_millis(1),
-            &metrics,
-        );
-        timings.enter(DecisionStage::PayloadValidation);
-        timings.observe(
-            DecisionStage::PayloadValidation,
-            Duration::from_millis(3),
-            &metrics,
-        );
-        timings.enter(DecisionStage::ForkchoiceUpdate);
-
-        let summary = timings.summary(Duration::from_millis(10), false);
-
-        assert_eq!(summary.outcome, "error");
-        assert_eq!(summary.failed_stage, Some("forkchoice_update"));
-        assert_eq!(summary.block_data_read_duration_seconds, Some(0.001));
-        assert_eq!(summary.payload_validation_duration_seconds, Some(0.003));
-        assert_eq!(summary.forkchoice_update_duration_seconds, None);
-        assert_eq!(summary.commit_duration_seconds, None);
-        assert_eq!(summary.block_stats_persistence_duration_seconds, None);
-        assert_eq!(summary.validator_set_read_duration_seconds, None);
-    }
-
-    #[test]
-    fn decision_stage_names_are_stable() {
-        let cases = [
-            (DecisionStage::Preparation, "preparation"),
-            (DecisionStage::BlockDataRead, "block_data_read"),
-            (DecisionStage::PayloadValidation, "payload_validation"),
-            (DecisionStage::ForkchoiceUpdate, "forkchoice_update"),
-            (DecisionStage::Commit, "commit"),
-            (
-                DecisionStage::BlockStatsPersistence,
-                "block_stats_persistence",
-            ),
-            (DecisionStage::ValidatorSetRead, "validator_set_read"),
-            (DecisionStage::Completion, "completion"),
-        ];
-
-        for (stage, expected) in cases {
-            assert_eq!(stage.as_str(), expected);
-        }
-    }
 }
 
 /// Handle ProcessSyncedValue messages from the consensus engine
@@ -1100,4 +1043,95 @@ pub async fn run(
     // from consensus has been closed, meaning that the consensus actor has died.
     // We can do nothing but return an error here.
     Err(eyre!("Consensus channel closed unexpectedly"))
+}
+
+#[cfg(test)]
+mod tests {
+    use core::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn decision_timings_build_success_summary() {
+        let metrics = ConsensusMetrics::new();
+        let mut timings = DecisionTimings::default();
+        for stage in [
+            AwaitedStage::BlockDataRead,
+            AwaitedStage::PayloadValidation,
+            AwaitedStage::ForkchoiceUpdate,
+            AwaitedStage::Commit,
+            AwaitedStage::BlockStatsPersistence,
+            AwaitedStage::ValidatorSetRead,
+        ] {
+            timings.enter_awaited(stage);
+            timings.observe(stage, Duration::from_millis(2), &metrics);
+        }
+        timings.enter_completion();
+
+        let summary = timings.summary(Duration::from_millis(20), true);
+
+        assert_eq!(summary.outcome, "success");
+        assert_eq!(summary.failed_stage, None);
+        assert_eq!(summary.duration_seconds, 0.02);
+        assert_eq!(summary.block_data_read_duration_seconds, Some(0.002));
+        assert_eq!(summary.payload_validation_duration_seconds, Some(0.002));
+        assert_eq!(summary.forkchoice_update_duration_seconds, Some(0.002));
+        assert_eq!(summary.commit_duration_seconds, Some(0.002));
+        assert_eq!(
+            summary.block_stats_persistence_duration_seconds,
+            Some(0.002)
+        );
+        assert_eq!(summary.validator_set_read_duration_seconds, Some(0.002));
+    }
+
+    #[test]
+    fn decision_timings_build_error_summary_without_unreached_stages() {
+        let metrics = ConsensusMetrics::new();
+        let mut timings = DecisionTimings::default();
+        timings.enter_awaited(AwaitedStage::BlockDataRead);
+        timings.observe(
+            AwaitedStage::BlockDataRead,
+            Duration::from_millis(1),
+            &metrics,
+        );
+        timings.enter_awaited(AwaitedStage::PayloadValidation);
+        timings.observe(
+            AwaitedStage::PayloadValidation,
+            Duration::from_millis(3),
+            &metrics,
+        );
+        timings.enter_awaited(AwaitedStage::ForkchoiceUpdate);
+
+        let summary = timings.summary(Duration::from_millis(10), false);
+
+        assert_eq!(summary.outcome, "error");
+        assert_eq!(summary.failed_stage, Some("forkchoice_update"));
+        assert_eq!(summary.block_data_read_duration_seconds, Some(0.001));
+        assert_eq!(summary.payload_validation_duration_seconds, Some(0.003));
+        assert_eq!(summary.forkchoice_update_duration_seconds, None);
+        assert_eq!(summary.commit_duration_seconds, None);
+        assert_eq!(summary.block_stats_persistence_duration_seconds, None);
+        assert_eq!(summary.validator_set_read_duration_seconds, None);
+    }
+
+    #[test]
+    fn decision_stage_names_are_stable() {
+        let cases = [
+            (DecisionStage::Preparation, "preparation"),
+            (AwaitedStage::BlockDataRead.into(), "block_data_read"),
+            (AwaitedStage::PayloadValidation.into(), "payload_validation"),
+            (AwaitedStage::ForkchoiceUpdate.into(), "forkchoice_update"),
+            (AwaitedStage::Commit.into(), "commit"),
+            (
+                AwaitedStage::BlockStatsPersistence.into(),
+                "block_stats_persistence",
+            ),
+            (AwaitedStage::ValidatorSetRead.into(), "validator_set_read"),
+            (DecisionStage::Completion, "completion"),
+        ];
+
+        for (stage, expected) in cases {
+            assert_eq!(stage.as_str(), expected);
+        }
+    }
 }

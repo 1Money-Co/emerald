@@ -6,12 +6,13 @@
 **Goal:** Add bounded Prometheus histograms and structured logs that measure every awaited `on_decided` stage, total
 decision-processing latency, and cross-validator round-entry skew without changing consensus behavior.
 
-**Architecture:** Extend Emerald's existing application metrics container with seven fixed histograms. Keep public
+**Architecture:** Extend Emerald's existing application metrics container with seven fixed histograms and one
+round-start timestamp gauge. Keep public
 `on_decided` as a telemetry wrapper around a behavior-preserving inner handler, and use a local timing accumulator to
 record successful and failed stages before the original result propagates. Give the existing round-start log a stable
 event field and document portable production queries.
 
-**Tech Stack:** Rust, Tokio `Instant`, `tracing`, Malachite `SharedRegistry`, `prometheus-client`, mdBook.
+**Tech Stack:** Rust, `std::time::Instant`, `tracing`, Malachite `SharedRegistry`, `prometheus-client`, mdBook.
 
 **Spec:** `docs/superpowers/specs/2026-08-31-on-decided-telemetry-design.md`
 
@@ -20,8 +21,9 @@ event field and document portable production queries.
 - Do not change consensus timeouts, generated timeout defaults, operation ordering, retry policy, or validator-set
   derivation.
 - Do not change consensus messages, wire formats, persistent storage, or existing error and panic behavior.
-- Register seven fixed histograms under `app_channel`; retain only the existing bounded `moniker` metric label.
-- Use 18 exponential buckets from 0.001 seconds through 131.072 seconds, plus `+Inf`.
+- Register seven fixed histograms and one gauge under `app_channel`; retain only the existing bounded `moniker`
+  metric label.
+- Use 21 exponential buckets from 0.0001 seconds through 104.8576 seconds, plus `+Inf`.
 - Emit one `on_decided_timing` event for each normal `Ok` or `Err` return and no duplicate round-start event.
 - Keep height, round, value ID, block hash, proposer, outcome, and failure stage out of metric labels.
 - Do not add a Grafana dashboard or production-specific log-query syntax.
@@ -42,7 +44,7 @@ handler's control flow, while reusable Prometheus instruments remain in `metrics
 
 ---
 
-### Task 1: Add Fixed Consensus Decision Histograms
+### Task 1: Add Fixed Consensus Decision Metrics
 
 **Files:**
 
@@ -54,7 +56,7 @@ handler's control flow, while reusable Prometheus instruments remain in `metrics
 - Consumes: `metrics::SharedRegistry`, `metrics::Registry`, `Histogram`, and `core::time::Duration`.
 - Produces: `ConsensusMetrics::{new,register,observe_block_data_read,observe_payload_validation,
   observe_forkchoice_update,observe_commit,observe_block_stats_persistence,observe_validator_set_read,
-  observe_total}`.
+  observe_total,set_round_started_timestamp}`.
 - Produces: `Metrics::consensus: ConsensusMetrics` for Task 2.
 
 - [ ] **Step 1: Write a failing Prometheus exposition test**
@@ -105,10 +107,13 @@ mod tests {
         }
 
         assert!(output.contains(
-            "app_channel_on_decided_duration_seconds_bucket{le=\"0.001\"}"
+            "app_channel_on_decided_duration_seconds_bucket{le=\"0.0001\"}"
         ));
         assert!(output.contains(
-            "app_channel_on_decided_duration_seconds_bucket{le=\"131.072\"}"
+            "app_channel_on_decided_duration_seconds_bucket{le=\"104.8576\"}"
+        ));
+        assert!(output.contains(
+            "# TYPE app_channel_consensus_round_started_timestamp_seconds gauge"
         ));
 
         for forbidden in [
@@ -146,7 +151,7 @@ private and expose duration-based observation methods:
 use metrics::{Registry, SharedRegistry};
 
 fn decision_latency_buckets() -> impl Iterator<Item = f64> {
-    exponential_buckets(0.001, 2.0, 18)
+    exponential_buckets(0.0001, 2.0, 21)
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +166,7 @@ struct ConsensusMetricsInner {
     block_stats_persistence: Histogram,
     validator_set_read: Histogram,
     total: Histogram,
+    round_started_timestamp: Gauge<f64, AtomicU64>,
 }
 
 impl ConsensusMetrics {
@@ -173,6 +179,7 @@ impl ConsensusMetrics {
             block_stats_persistence: Histogram::new(decision_latency_buckets()),
             validator_set_read: Histogram::new(decision_latency_buckets()),
             total: Histogram::new(decision_latency_buckets()),
+            round_started_timestamp: Gauge::default(),
         }))
     }
 
@@ -218,6 +225,11 @@ impl ConsensusMetrics {
             "Total on_decided processing time (seconds)",
             self.0.total.clone(),
         );
+        registry.register(
+            "consensus_round_started_timestamp_seconds",
+            "Unix timestamp when the application started its latest consensus round",
+            self.0.round_started_timestamp.clone(),
+        );
     }
 
     pub fn observe_block_data_read(&self, duration: Duration) {
@@ -248,6 +260,14 @@ impl ConsensusMetrics {
 
     pub fn observe_total(&self, duration: Duration) {
         self.0.total.observe(duration.as_secs_f64());
+    }
+
+    pub fn set_round_started_timestamp(&self, timestamp: SystemTime) {
+        let seconds_since_epoch = timestamp
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        self.0.round_started_timestamp.set(seconds_since_epoch);
     }
 }
 
@@ -296,7 +316,7 @@ Run:
 cargo test -p emerald --lib metrics::tests:: -- --nocapture
 ```
 
-Expected: the exposition test passes and reports all seven histogram families.
+Expected: the exposition test passes and reports all seven histogram families plus the round-start timestamp gauge.
 
 - [ ] **Step 6: Commit the metrics component**
 
@@ -319,10 +339,11 @@ git commit -m "feat(app): add decision latency metrics"
 **Interfaces:**
 
 - Consumes: `State::metrics.consensus` and every observation method produced by Task 1.
-- Produces: private `DecisionStage`, `DecisionTimings`, and `DecisionSummary` types.
+- Produces: private `DecisionStage`, `AwaitedStage`, `DecisionTimings`, and `DecisionSummary` types.
 - Produces: public `on_decided` telemetry wrapper with the unchanged external signature.
 - Produces: private `on_decided_inner` containing the original decision behavior and stage observations.
-- Produces: structured `event = "on_decided_timing"` and `event = "consensus_round_started"` logs.
+- Produces: structured `event = "on_decided_timing"` and `event = "consensus_round_started"` logs plus the
+  round-start timestamp gauge update.
 
 - [ ] **Step 1: Write failing timing-model tests**
 
@@ -341,17 +362,17 @@ mod tests {
         let metrics = ConsensusMetrics::new();
         let mut timings = DecisionTimings::default();
         for stage in [
-            DecisionStage::BlockDataRead,
-            DecisionStage::PayloadValidation,
-            DecisionStage::ForkchoiceUpdate,
-            DecisionStage::Commit,
-            DecisionStage::BlockStatsPersistence,
-            DecisionStage::ValidatorSetRead,
+            AwaitedStage::BlockDataRead,
+            AwaitedStage::PayloadValidation,
+            AwaitedStage::ForkchoiceUpdate,
+            AwaitedStage::Commit,
+            AwaitedStage::BlockStatsPersistence,
+            AwaitedStage::ValidatorSetRead,
         ] {
-            timings.enter(stage);
+            timings.enter_awaited(stage);
             timings.observe(stage, Duration::from_millis(2), &metrics);
         }
-        timings.enter(DecisionStage::Completion);
+        timings.enter_completion();
 
         let summary = timings.summary(Duration::from_millis(20), true);
 
@@ -370,19 +391,19 @@ mod tests {
     fn decision_timings_build_error_summary_without_unreached_stages() {
         let metrics = ConsensusMetrics::new();
         let mut timings = DecisionTimings::default();
-        timings.enter(DecisionStage::BlockDataRead);
+        timings.enter_awaited(AwaitedStage::BlockDataRead);
         timings.observe(
-            DecisionStage::BlockDataRead,
+            AwaitedStage::BlockDataRead,
             Duration::from_millis(1),
             &metrics,
         );
-        timings.enter(DecisionStage::PayloadValidation);
+        timings.enter_awaited(AwaitedStage::PayloadValidation);
         timings.observe(
-            DecisionStage::PayloadValidation,
+            AwaitedStage::PayloadValidation,
             Duration::from_millis(3),
             &metrics,
         );
-        timings.enter(DecisionStage::ForkchoiceUpdate);
+        timings.enter_awaited(AwaitedStage::ForkchoiceUpdate);
 
         let summary = timings.summary(Duration::from_millis(10), false);
 
@@ -400,15 +421,15 @@ mod tests {
     fn decision_stage_names_are_stable() {
         let cases = [
             (DecisionStage::Preparation, "preparation"),
-            (DecisionStage::BlockDataRead, "block_data_read"),
-            (DecisionStage::PayloadValidation, "payload_validation"),
-            (DecisionStage::ForkchoiceUpdate, "forkchoice_update"),
-            (DecisionStage::Commit, "commit"),
+            (AwaitedStage::BlockDataRead.into(), "block_data_read"),
+            (AwaitedStage::PayloadValidation.into(), "payload_validation"),
+            (AwaitedStage::ForkchoiceUpdate.into(), "forkchoice_update"),
+            (AwaitedStage::Commit.into(), "commit"),
             (
-                DecisionStage::BlockStatsPersistence,
+                AwaitedStage::BlockStatsPersistence.into(),
                 "block_stats_persistence",
             ),
-            (DecisionStage::ValidatorSetRead, "validator_set_read"),
+            (AwaitedStage::ValidatorSetRead.into(), "validator_set_read"),
             (DecisionStage::Completion, "completion"),
         ];
 
@@ -445,6 +466,29 @@ enum DecisionStage {
     BlockStatsPersistence,
     ValidatorSetRead,
     Completion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AwaitedStage {
+    BlockDataRead,
+    PayloadValidation,
+    ForkchoiceUpdate,
+    Commit,
+    BlockStatsPersistence,
+    ValidatorSetRead,
+}
+
+impl From<AwaitedStage> for DecisionStage {
+    fn from(stage: AwaitedStage) -> Self {
+        match stage {
+            AwaitedStage::BlockDataRead => Self::BlockDataRead,
+            AwaitedStage::PayloadValidation => Self::PayloadValidation,
+            AwaitedStage::ForkchoiceUpdate => Self::ForkchoiceUpdate,
+            AwaitedStage::Commit => Self::Commit,
+            AwaitedStage::BlockStatsPersistence => Self::BlockStatsPersistence,
+            AwaitedStage::ValidatorSetRead => Self::ValidatorSetRead,
+        }
+    }
 }
 
 impl DecisionStage {
@@ -501,43 +545,48 @@ struct DecisionSummary {
 }
 
 impl DecisionTimings {
-    fn enter(&mut self, stage: DecisionStage) {
-        self.current_stage = stage;
+    fn enter_awaited(&mut self, stage: AwaitedStage) {
+        self.current_stage = stage.into();
+    }
+
+    fn enter_preparation(&mut self) {
+        self.current_stage = DecisionStage::Preparation;
+    }
+
+    fn enter_completion(&mut self) {
+        self.current_stage = DecisionStage::Completion;
     }
 
     fn observe(
         &mut self,
-        stage: DecisionStage,
+        stage: AwaitedStage,
         duration: Duration,
         metrics: &ConsensusMetrics,
     ) {
         match stage {
-            DecisionStage::BlockDataRead => {
+            AwaitedStage::BlockDataRead => {
                 self.block_data_read = Some(duration);
                 metrics.observe_block_data_read(duration);
             }
-            DecisionStage::PayloadValidation => {
+            AwaitedStage::PayloadValidation => {
                 self.payload_validation = Some(duration);
                 metrics.observe_payload_validation(duration);
             }
-            DecisionStage::ForkchoiceUpdate => {
+            AwaitedStage::ForkchoiceUpdate => {
                 self.forkchoice_update = Some(duration);
                 metrics.observe_forkchoice_update(duration);
             }
-            DecisionStage::Commit => {
+            AwaitedStage::Commit => {
                 self.commit = Some(duration);
                 metrics.observe_commit(duration);
             }
-            DecisionStage::BlockStatsPersistence => {
+            AwaitedStage::BlockStatsPersistence => {
                 self.block_stats_persistence = Some(duration);
                 metrics.observe_block_stats_persistence(duration);
             }
-            DecisionStage::ValidatorSetRead => {
+            AwaitedStage::ValidatorSetRead => {
                 self.validator_set_read = Some(duration);
                 metrics.observe_validator_set_read(duration);
-            }
-            DecisionStage::Preparation | DecisionStage::Completion => {
-                unreachable!("non-awaited decision stage cannot be observed")
             }
         }
     }
@@ -655,18 +704,18 @@ active stage before the call, retain its `Result` or `Option`, observe elapsed t
 Block-data read:
 
 ```rust
-timings.enter(DecisionStage::BlockDataRead);
+timings.enter_awaited(AwaitedStage::BlockDataRead);
 let started = Instant::now();
 let block_bytes = state.get_block_data(height, round, value_id).await;
-timings.observe(DecisionStage::BlockDataRead, started.elapsed(), metrics);
+timings.observe(AwaitedStage::BlockDataRead, started.elapsed(), metrics);
 let block_bytes = block_bytes.ok_or_eyre("app: certificate should have associated block data")?;
-timings.enter(DecisionStage::Preparation);
+timings.enter_preparation();
 ```
 
 Payload validation:
 
 ```rust
-timings.enter(DecisionStage::PayloadValidation);
+timings.enter_awaited(AwaitedStage::PayloadValidation);
 let started = Instant::now();
 let validity = validate_execution_payload(
     state.validated_cache_mut(),
@@ -677,40 +726,40 @@ let validity = validate_execution_payload(
     &emerald_config.retry_config,
 )
 .await;
-timings.observe(DecisionStage::PayloadValidation, started.elapsed(), metrics);
+timings.observe(AwaitedStage::PayloadValidation, started.elapsed(), metrics);
 let validity = validity?;
 ```
 
 Forkchoice update:
 
 ```rust
-timings.enter(DecisionStage::ForkchoiceUpdate);
+timings.enter_awaited(AwaitedStage::ForkchoiceUpdate);
 let started = Instant::now();
 let latest_valid_hash = engine
     .set_latest_forkchoice_state(block_hash, &emerald_config.retry_config)
     .await;
-timings.observe(DecisionStage::ForkchoiceUpdate, started.elapsed(), metrics);
+timings.observe(AwaitedStage::ForkchoiceUpdate, started.elapsed(), metrics);
 let latest_valid_hash = latest_valid_hash?;
 ```
 
 Commit:
 
 ```rust
-timings.enter(DecisionStage::Commit);
+timings.enter_awaited(AwaitedStage::Commit);
 let started = Instant::now();
 let commit_result = state.commit(certificate).await;
-timings.observe(DecisionStage::Commit, started.elapsed(), metrics);
+timings.observe(AwaitedStage::Commit, started.elapsed(), metrics);
 commit_result?;
 ```
 
 Block-statistics persistence:
 
 ```rust
-timings.enter(DecisionStage::BlockStatsPersistence);
+timings.enter_awaited(AwaitedStage::BlockStatsPersistence);
 let started = Instant::now();
 let stats_result = state.log_block_stats(height, tx_count, block_bytes.len(), block_time_secs).await;
 timings.observe(
-    DecisionStage::BlockStatsPersistence,
+    AwaitedStage::BlockStatsPersistence,
     started.elapsed(),
     metrics,
 );
@@ -720,24 +769,30 @@ stats_result?;
 Validator-set read and completion:
 
 ```rust
-timings.enter(DecisionStage::ValidatorSetRead);
+timings.enter_awaited(AwaitedStage::ValidatorSetRead);
 let started = Instant::now();
 let new_validator_set =
     read_validators_from_contract(engine.eth.url().as_ref(), &latest_valid_hash).await;
-timings.observe(DecisionStage::ValidatorSetRead, started.elapsed(), metrics);
+timings.observe(AwaitedStage::ValidatorSetRead, started.elapsed(), metrics);
 let new_validator_set = new_validator_set?;
-timings.enter(DecisionStage::Completion);
+timings.enter_completion();
 ```
 
 The invalid-validity return must remain after the validation observation, so its summary reports
 `failed_stage = "payload_validation"`. Do not alter the existing payload decode `unwrap`, parent-hash assertion,
 state mutations, `Next::Start` reply, or reply-send error log.
 
-- [ ] **Step 7: Add the stable field to the existing round-start event**
+- [ ] **Step 7: Record the timestamp gauge and add the stable field to the existing round-start event**
 
-Change only the existing `info!` call in `on_started_round`:
+Immediately before the existing `info!` call in `on_started_round`, record the event time, then add the stable event
+field without emitting a second log:
 
 ```rust
+state
+    .metrics
+    .consensus
+    .set_round_started_timestamp(SystemTime::now());
+
 info!(
     event = "consensus_round_started",
     %height,
@@ -789,13 +844,14 @@ git commit -m "feat(app): instrument decision processing"
 
 **Interfaces:**
 
-- Consumes: the seven full metric names and two structured event schemas from Tasks 1 and 2.
+- Consumes: the seven histogram names, round-start timestamp gauge, and two structured event schemas from Tasks 1
+  and 2.
 - Produces: portable Prometheus queries and a vendor-neutral round-entry skew calculation for operators.
 
 - [ ] **Step 1: Add the decision telemetry inventory under `## Monitoring`**
 
 After the existing `curl` example, add a `### Decision and round-entry telemetry` section. Reflow the touched file's
-existing overlong paragraphs without changing their meaning, then include a table with all seven full metric names and
+existing overlong paragraphs without changing their meaning, then include a table with all eight full metric names and
 these meanings:
 
 ```markdown
@@ -917,12 +973,11 @@ Run:
 
 ```bash
 cargo clippy -p emerald --tests --no-deps -- \
-  -D warnings -A clippy::items-after-test-module
-rustfmt +nightly --edition 2021 --check app/src/metrics.rs app/src/app.rs
+  -D warnings
+cargo +nightly fmt -p emerald -- --check
 ```
 
-Expected: both commands pass. The explicit `items-after-test-module` allowance is limited to Emerald's pre-existing
-test-module layout and must not hide another lint.
+Expected: both commands pass. Keep every test module after production items so no lint allowance is needed.
 
 - [ ] **Step 4: Run the repository-required full gates**
 

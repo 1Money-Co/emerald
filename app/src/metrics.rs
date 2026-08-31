@@ -1,6 +1,8 @@
 use core::ops::Deref;
+use core::sync::atomic::AtomicU64;
 use core::time::Duration;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use malachitebft_app_channel::app::metrics;
 use metrics::prometheus::metrics::counter::Counter;
@@ -318,7 +320,7 @@ impl Default for TxStatsMetrics {
 }
 
 fn decision_latency_buckets() -> impl Iterator<Item = f64> {
-    exponential_buckets(0.001, 2.0, 18)
+    exponential_buckets(0.0001, 2.0, 21)
 }
 
 #[derive(Clone, Debug)]
@@ -333,6 +335,7 @@ struct ConsensusMetricsInner {
     block_stats_persistence: Histogram,
     validator_set_read: Histogram,
     total: Histogram,
+    round_started_timestamp: Gauge<f64, AtomicU64>,
 }
 
 impl ConsensusMetrics {
@@ -345,6 +348,7 @@ impl ConsensusMetrics {
             block_stats_persistence: Histogram::new(decision_latency_buckets()),
             validator_set_read: Histogram::new(decision_latency_buckets()),
             total: Histogram::new(decision_latency_buckets()),
+            round_started_timestamp: Gauge::default(),
         }))
     }
 
@@ -390,6 +394,11 @@ impl ConsensusMetrics {
             "Total on_decided processing time (seconds)",
             self.0.total.clone(),
         );
+        registry.register(
+            "consensus_round_started_timestamp_seconds",
+            "Unix timestamp when the application started its latest consensus round",
+            self.0.round_started_timestamp.clone(),
+        );
     }
 
     pub fn observe_block_data_read(&self, duration: Duration) {
@@ -420,6 +429,14 @@ impl ConsensusMetrics {
 
     pub fn observe_total(&self, duration: Duration) {
         self.0.total.observe(duration.as_secs_f64());
+    }
+
+    pub fn set_round_started_timestamp(&self, timestamp: SystemTime) {
+        let seconds_since_epoch = timestamp
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        self.0.round_started_timestamp.set(seconds_since_epoch);
     }
 }
 
@@ -491,6 +508,7 @@ mod tests {
         consensus.observe_block_stats_persistence(sample);
         consensus.observe_validator_set_read(sample);
         consensus.observe_total(sample);
+        consensus.set_round_started_timestamp(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
 
         let mut output = String::new();
         encode(&mut output, &registry).unwrap();
@@ -502,8 +520,14 @@ mod tests {
             assert!(output.contains(&format!("{full_name}_sum 1.0")));
         }
 
-        assert!(output.contains("app_channel_on_decided_duration_seconds_bucket{le=\"0.001\"}"));
-        assert!(output.contains("app_channel_on_decided_duration_seconds_bucket{le=\"131.072\"}"));
+        assert!(output.contains("app_channel_on_decided_duration_seconds_bucket{le=\"0.0001\"}"));
+        assert!(output.contains("app_channel_on_decided_duration_seconds_bucket{le=\"104.8576\"}"));
+        assert!(
+            output.contains("# TYPE app_channel_consensus_round_started_timestamp_seconds gauge")
+        );
+        assert!(
+            output.contains("app_channel_consensus_round_started_timestamp_seconds 1700000000.0")
+        );
 
         for forbidden in [
             "height=",
