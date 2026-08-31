@@ -6,7 +6,7 @@ use malachitebft_app_channel::app::metrics;
 use metrics::prometheus::metrics::counter::Counter;
 use metrics::prometheus::metrics::gauge::Gauge;
 use metrics::prometheus::metrics::histogram::{exponential_buckets, Histogram};
-use metrics::SharedRegistry;
+use metrics::{Registry, SharedRegistry};
 
 #[derive(Clone, Debug)]
 pub struct DbMetrics(Arc<Inner>);
@@ -317,11 +317,122 @@ impl Default for TxStatsMetrics {
     }
 }
 
+fn decision_latency_buckets() -> impl Iterator<Item = f64> {
+    exponential_buckets(0.001, 2.0, 18)
+}
+
+#[derive(Clone, Debug)]
+pub struct ConsensusMetrics(Arc<ConsensusMetricsInner>);
+
+#[derive(Debug)]
+struct ConsensusMetricsInner {
+    block_data_read: Histogram,
+    payload_validation: Histogram,
+    forkchoice_update: Histogram,
+    commit: Histogram,
+    block_stats_persistence: Histogram,
+    validator_set_read: Histogram,
+    total: Histogram,
+}
+
+impl ConsensusMetrics {
+    pub fn new() -> Self {
+        Self(Arc::new(ConsensusMetricsInner {
+            block_data_read: Histogram::new(decision_latency_buckets()),
+            payload_validation: Histogram::new(decision_latency_buckets()),
+            forkchoice_update: Histogram::new(decision_latency_buckets()),
+            commit: Histogram::new(decision_latency_buckets()),
+            block_stats_persistence: Histogram::new(decision_latency_buckets()),
+            validator_set_read: Histogram::new(decision_latency_buckets()),
+            total: Histogram::new(decision_latency_buckets()),
+        }))
+    }
+
+    pub fn register(registry: &SharedRegistry) -> Self {
+        let metrics = Self::new();
+        registry.with_prefix("app_channel", |registry| metrics.register_into(registry));
+        metrics
+    }
+
+    fn register_into(&self, registry: &mut Registry) {
+        registry.register(
+            "on_decided_block_data_read_duration_seconds",
+            "Time spent reading decided block data (seconds)",
+            self.0.block_data_read.clone(),
+        );
+        registry.register(
+            "on_decided_payload_validation_duration_seconds",
+            "Time spent validating a decided payload (seconds)",
+            self.0.payload_validation.clone(),
+        );
+        registry.register(
+            "on_decided_forkchoice_update_duration_seconds",
+            "Time spent updating forkchoice for a decided payload (seconds)",
+            self.0.forkchoice_update.clone(),
+        );
+        registry.register(
+            "on_decided_commit_duration_seconds",
+            "Time spent committing a decided value (seconds)",
+            self.0.commit.clone(),
+        );
+        registry.register(
+            "on_decided_block_stats_persistence_duration_seconds",
+            "Time spent persisting decided block statistics (seconds)",
+            self.0.block_stats_persistence.clone(),
+        );
+        registry.register(
+            "on_decided_validator_set_read_duration_seconds",
+            "Time spent reading the next validator set (seconds)",
+            self.0.validator_set_read.clone(),
+        );
+        registry.register(
+            "on_decided_duration_seconds",
+            "Total on_decided processing time (seconds)",
+            self.0.total.clone(),
+        );
+    }
+
+    pub fn observe_block_data_read(&self, duration: Duration) {
+        self.0.block_data_read.observe(duration.as_secs_f64());
+    }
+
+    pub fn observe_payload_validation(&self, duration: Duration) {
+        self.0.payload_validation.observe(duration.as_secs_f64());
+    }
+
+    pub fn observe_forkchoice_update(&self, duration: Duration) {
+        self.0.forkchoice_update.observe(duration.as_secs_f64());
+    }
+
+    pub fn observe_commit(&self, duration: Duration) {
+        self.0.commit.observe(duration.as_secs_f64());
+    }
+
+    pub fn observe_block_stats_persistence(&self, duration: Duration) {
+        self.0.block_stats_persistence.observe(duration.as_secs_f64());
+    }
+
+    pub fn observe_validator_set_read(&self, duration: Duration) {
+        self.0.validator_set_read.observe(duration.as_secs_f64());
+    }
+
+    pub fn observe_total(&self, duration: Duration) {
+        self.0.total.observe(duration.as_secs_f64());
+    }
+}
+
+impl Default for ConsensusMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Unified metrics container for all application metrics
 #[derive(Clone, Debug)]
 pub struct Metrics {
     pub db: DbMetrics,
     pub tx_stats: TxStatsMetrics,
+    pub consensus: ConsensusMetrics,
 }
 
 impl Metrics {
@@ -329,6 +440,7 @@ impl Metrics {
         Self {
             db: DbMetrics::new(),
             tx_stats: TxStatsMetrics::new(),
+            consensus: ConsensusMetrics::new(),
         }
     }
 
@@ -336,6 +448,7 @@ impl Metrics {
         Self {
             db: DbMetrics::register(registry),
             tx_stats: TxStatsMetrics::register(registry),
+            consensus: ConsensusMetrics::register(registry),
         }
     }
 }
@@ -343,5 +456,66 @@ impl Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metrics::prometheus::encoding::text::encode;
+
+    const DECISION_METRIC_NAMES: [&str; 7] = [
+        "on_decided_block_data_read_duration_seconds",
+        "on_decided_payload_validation_duration_seconds",
+        "on_decided_forkchoice_update_duration_seconds",
+        "on_decided_commit_duration_seconds",
+        "on_decided_block_stats_persistence_duration_seconds",
+        "on_decided_validator_set_read_duration_seconds",
+        "on_decided_duration_seconds",
+    ];
+
+    #[test]
+    fn consensus_metrics_render_all_decision_histograms() {
+        let mut registry = metrics::Registry::default();
+        let consensus = ConsensusMetrics::new();
+        consensus.register_into(registry.sub_registry_with_prefix("app_channel"));
+
+        let sample = Duration::from_secs(1);
+        consensus.observe_block_data_read(sample);
+        consensus.observe_payload_validation(sample);
+        consensus.observe_forkchoice_update(sample);
+        consensus.observe_commit(sample);
+        consensus.observe_block_stats_persistence(sample);
+        consensus.observe_validator_set_read(sample);
+        consensus.observe_total(sample);
+
+        let mut output = String::new();
+        encode(&mut output, &registry).unwrap();
+
+        for name in DECISION_METRIC_NAMES {
+            let full_name = format!("app_channel_{name}");
+            assert!(output.contains(&format!("# TYPE {full_name} histogram")));
+            assert!(output.contains(&format!("{full_name}_count 1")));
+            assert!(output.contains(&format!("{full_name}_sum 1.0")));
+        }
+
+        assert!(output.contains(
+            "app_channel_on_decided_duration_seconds_bucket{le=\"0.001\"}"
+        ));
+        assert!(output.contains(
+            "app_channel_on_decided_duration_seconds_bucket{le=\"131.072\"}"
+        ));
+
+        for forbidden in [
+            "height=",
+            "round=",
+            "value_id=",
+            "block_hash=",
+            "proposer=",
+            "outcome=",
+            "failed_stage=",
+        ] {
+            assert!(!output.contains(forbidden));
+        }
     }
 }
