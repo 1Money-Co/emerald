@@ -154,9 +154,11 @@ Keep its existing height, round, proposer, role, and message. Do not emit a seco
 clocks, the round-entry skew for a `(height, round)` is the latest event timestamp minus the earliest event timestamp
 across validator monikers.
 
-At the same point, set `app_channel_consensus_round_started_timestamp_seconds` from `SystemTime`. Once all validator
-series refer to the same round, current fleet skew is directly queryable as `max(metric) - min(metric)`. Structured
-events remain the source for historical per-height and per-round correlation.
+At the same point, set `app_channel_consensus_round_started_timestamp_seconds` from `SystemTime`. Once structured
+events independently confirm that all validator series refer to the same round, current fleet skew is directly
+queryable as `max(metric) - min(metric)`. During transitions, the gauge can compare different rounds and report a
+misleadingly large skew. Structured events remain the reliable source for historical per-height and per-round
+correlation.
 
 ## Data Flow
 

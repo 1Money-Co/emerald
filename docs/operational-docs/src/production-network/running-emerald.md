@@ -175,16 +175,19 @@ Failed events include `failed_stage` instead of unreached duration fields. The b
 `preparation`, `block_data_read`, `payload_validation`, `forkchoice_update`, `commit`,
 `block_stats_persistence`, `validator_set_read`, and `completion`.
 
-With synchronized validator clocks, query the current round-entry skew directly from Prometheus after all validator
-series have advanced to the same `(height, round)`:
+With synchronized validator clocks, query the current round-entry skew directly from Prometheus only after
+independently confirming from `consensus_round_started` events that every validator series represents the same
+`(height, round)`:
 
 ```promql
 max(app_channel_consensus_round_started_timestamp_seconds)
 - min(app_channel_consensus_round_started_timestamp_seconds)
 ```
 
-The gauge has one bounded series per validator `moniker`. It intentionally does not label height or round, so use the
-existing `consensus_round_started` events for historical per-height and per-round correlation:
+The gauge has one bounded series per validator `moniker`. It intentionally does not label height or round. During a
+round transition, the query can compare timestamps from different rounds and report a misleadingly large skew. Do not
+use it until event data confirms alignment; use `consensus_round_started` events as the reliable source for historical
+per-height and per-round correlation:
 
 ```text
 round_entry_skew(height, round) =

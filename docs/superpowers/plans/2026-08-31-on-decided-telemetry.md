@@ -864,6 +864,7 @@ these meanings:
 | `app_channel_on_decided_block_stats_persistence_duration_seconds` | Persist cumulative block statistics. |
 | `app_channel_on_decided_validator_set_read_duration_seconds` | Read the next validator set at the decided hash. |
 | `app_channel_on_decided_duration_seconds` | Complete application handling of the `Decided` message. |
+| `app_channel_consensus_round_started_timestamp_seconds` | Unix timestamp of the latest application round start. |
 ```
 
 State explicitly that all values are seconds, histogram series carry only the existing `moniker` label, and height,
@@ -897,6 +898,15 @@ Explain that operators substitute any stage histogram for the total and change t
 - [ ] **Step 3: Document the structured events and skew calculation**
 
 List the `on_decided_timing` fields and bounded failure values exactly as specified. Then document:
+
+```promql
+max(app_channel_consensus_round_started_timestamp_seconds)
+- min(app_channel_consensus_round_started_timestamp_seconds)
+```
+
+State that this gauge query is valid only after `consensus_round_started` events independently confirm every validator
+represents the same `(height, round)`. During transitions it can compare different rounds and report a misleadingly
+large skew. Use the structured events as the reliable historical source:
 
 ```text
 round_entry_skew(height, round) =
