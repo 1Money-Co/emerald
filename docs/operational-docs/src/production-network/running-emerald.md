@@ -7,11 +7,13 @@
 ## Prerequisites
 
 - Emerald binaries installed (see [Installing Emerald](installation.md#installing-emerald))
-- Node configuration directory created (contains `config.toml`, `emerald.toml`, and `priv_validator_key.json`) 
-  - Recommended to setup a user `emerald` and use a home folder like `/home/emerald/.emerald` and in there a config folder for all files.
+- Node configuration directory created (contains `config.toml`, `emerald.toml`, and `priv_validator_key.json`)
+  - Recommended to set up a user `emerald` and use a home folder like `/home/emerald/.emerald`, with a config
+    folder inside it for all files.
 - Reth node must be running with Engine API enabled
 - JWT secret file (same as used by Reth)
-- `emerald.toml` file has to containt the path to the genesis file used by Reth that contains the chain configuration (`eth-genesis.json` in our example).
+- `emerald.toml` has to contain the path to the genesis file used by Reth that contains the chain configuration
+  (`eth-genesis.json` in our example).
 
 ## Configuration Files
 
@@ -29,7 +31,9 @@ See [malachitebft-config.toml](../config-examples/malachitebft-config.toml) for 
     -  persistent_peers must be filled out for p2p
 - **Metrics**: Prometheus metrics endpoint on port `30000`
 
-This file must be in config folder in home_dir, example `/home/emerald/.emerald/config/config.toml` where `--home` flag would be defined as `--home=/home/emerald/.emerald`
+This file must be in the config folder in `home_dir`, for example
+`/home/emerald/.emerald/config/config.toml`, where the `--home` flag would be defined as
+`--home=/home/emerald/.emerald`
 
 **2. `emerald.toml` (Execution Integration)**
 
@@ -79,8 +83,9 @@ persistent_peers = [
 
 Replace `<PEER_IP>` with the actual IP addresses of your validator peers.
 
-In the Malachite BFT config.toml you will need to fill in the 2 sections (consensus.p2p and mempool.p2p) `persistent_peers` array.
-It uses the format `/ip4/<IP_ADDRESS_TO_REMOTE_PEER>/tcp/<PORT_FOR_REMOTE_PEER>`. Make sure to fill in all peers in the testnet.
+In the Malachite BFT `config.toml`, fill in the `persistent_peers` array in the `consensus.p2p` and `mempool.p2p`
+sections. It uses the format `/ip4/<IP_ADDRESS_TO_REMOTE_PEER>/tcp/<PORT_FOR_REMOTE_PEER>`. Make sure to fill in all
+peers in the testnet.
 
 ## Start Emerald Node
 
@@ -98,20 +103,93 @@ The `--home` directory should contain:
 - `<home>/config/priv_validator_key.json` - Validator signing key
 - `<home>/config/genesis.json` - Malachite BFT genesis file
 
-An example Malachite BFT config file is provided: [malachitebft-config.toml](../config-examples/malachitebft-config.toml)
+An example Malachite BFT config file is provided:
+[malachitebft-config.toml](../config-examples/malachitebft-config.toml)
 
 The `--config` flag should contain the explicit file path to the Emerald config:
 - Example: `--config=/home/emerald/.emerald/config/emerald.toml`
 
 ## Monitoring
 
-Emerald exposes Prometheus metrics on port 30000 (configurable in `config.toml`):
+Emerald exposes Prometheus metrics on port `30000` (configurable in `config.toml`):
 
 ```bash
 curl http://<IP>:30000/metrics
 ```
 
+### Decision and round-entry telemetry
+
+The decision telemetry histograms below record wall-clock seconds. Their Prometheus series carry only the existing
+`moniker` label. Height, round, value ID, outcome, and failure stage stay in logs rather than metric labels to avoid
+high-cardinality time series.
+
+| Metric | Meaning |
+| --- | --- |
+| `app_channel_on_decided_block_data_read_duration_seconds` | Read decided payload bytes from redb. |
+| `app_channel_on_decided_payload_validation_duration_seconds` | Validate the payload, including a cache hit. |
+| `app_channel_on_decided_forkchoice_update_duration_seconds` | Update the execution head through Engine API. |
+| `app_channel_on_decided_commit_duration_seconds` | Commit the certificate and decided data to redb. |
+| `app_channel_on_decided_block_stats_persistence_duration_seconds` | Persist cumulative block statistics. |
+| `app_channel_on_decided_validator_set_read_duration_seconds` | Read the next validator set at the decided hash. |
+| `app_channel_on_decided_duration_seconds` | Complete application handling of the `Decided` message. |
+
+Use the same PromQL pattern for any stage histogram by swapping the metric name and changing the quantile to `0.50`,
+`0.95`, or `0.99`.
+
+Per-validator `p95` over a 24-hour window:
+
+```promql
+histogram_quantile(
+  0.95,
+  sum by (le, moniker) (
+    rate(app_channel_on_decided_duration_seconds_bucket[24h])
+  )
+)
+```
+
+Fleet-wide `p99` over a 24-hour window:
+
+```promql
+histogram_quantile(
+  0.99,
+  sum by (le) (
+    rate(app_channel_on_decided_duration_seconds_bucket[24h])
+  )
+)
+```
+
+The first query preserves the validator `moniker`. The second aggregates the entire validator fleet.
+
+The application also emits one `on_decided_timing` event per `on_decided` return. Every event includes `height`,
+`round`, `value_id`, `outcome`, and `total_duration_seconds`. Successful events also include every completed stage
+duration:
+
+- `block_data_read_duration_seconds`
+- `payload_validation_duration_seconds`
+- `forkchoice_update_duration_seconds`
+- `commit_duration_seconds`
+- `block_stats_persistence_duration_seconds`
+- `validator_set_read_duration_seconds`
+
+Failed events include `failed_stage` instead of unreached duration fields. The bounded `failed_stage` values are
+`preparation`, `block_data_read`, `payload_validation`, `forkchoice_update`, `commit`,
+`block_stats_persistence`, `validator_set_read`, and `completion`.
+
+Round-entry skew uses the existing `consensus_round_started` event and synchronized clocks:
+
+```text
+round_entry_skew(height, round) =
+    max(timestamp for consensus_round_started across monikers)
+  - min(timestamp for consensus_round_started across monikers)
+```
+
+Before comparing validators, finish the node-by-node telemetry rollout across the validator set, confirm all expected
+validator `moniker` values are present, and collect at least 24 hours of data. When recording results in
+interoperability issue `#315`, include the observation window and the live config snapshot used for the capture. This
+telemetry change is safe to deploy incrementally, but it does not close issue `#315` on its own.
+
 ## Systemd Service
 
-For production deployments, use systemd to manage the Emerald process. See [emerald.systemd.service.example](../config-examples/emerald.systemd.service.example) for a complete service configuration.
-
+For production deployments, use systemd to manage the Emerald process. See
+[emerald.systemd.service.example](../config-examples/emerald.systemd.service.example) for a complete service
+configuration.
