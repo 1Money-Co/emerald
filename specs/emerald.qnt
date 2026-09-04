@@ -184,15 +184,21 @@ module emerald {
 
   // ===== GetValue: Build and propose new value =====
   //
-  // Assumption: After starting a round, Malachite will call GetValue on the
-  // Emerald node that is the proposer for the consensus height and round. In
-  // response, Emerald will either propose a new value or return an already
-  // proposed value.
+  // Assumption: After starting a round, Malachite calls GetValue on the proposer
+  // only if it did not request RestreamProposal. The model permits one
+  // proposal-producing request per height and round.
+
+  pure def can_get_value(s: LocalState): bool = {
+    val proposer = proposer_for(s.consensus_height, s.consensus_round)
+    and {
+      s.phase == Working,
+      s.process_id == proposer,
+      get_local_proposal(s, s.consensus_height, s.consensus_round) == None,
+    }
+  }
 
   pure def listen_get_value(ctx: LocalContext): Set[()] = {
-    val s = ctx.state
-    val proposer = proposer_for(s.consensus_height, s.consensus_round)
-    if (s.phase == Working and s.process_id == proposer) Set(()) else Set()
+    if (can_get_value(ctx.state)) Set(()) else Set()
   }
 
   pure def handle_get_value(ctx: LocalContext, _params: ()): Transition = {
@@ -233,9 +239,11 @@ module emerald {
   // Assumption: This models only restreams with a non-Nil valid round; the
   // hidden-lock fallback is intentionally excluded. A locally stored proposal
   // stands in for retaining the valid value because votes, polkas, and locks are
-  // not modeled, and membership also assumes its block data remains available.
-  // Malachite requests either GetValue or RestreamProposal in a round. The model
-  // may enable both listeners, but each trace selects only one action.
+  // not modeled. Each model proposal is assumed to map to SUT proposal metadata
+  // and block data under the same (height, round, value_id) key. Malachite
+  // requests either GetValue or RestreamProposal in a round. The model may
+  // initially enable both, but taking either records a current-round proposal
+  // and disables both actions for that round.
 
   pure def listen_restream_proposal(ctx: LocalContext): Set[Proposal] = {
     val s = ctx.state

@@ -227,6 +227,7 @@ module emerald_tests {
       .then("node3".startedRound(1, 1))
       .expect(proposer_for(1, 1) == "node2")
       .then("node2".restreamProposal(proposal(1, 0, 0), proposal(1, 1, 0)))
+      .expect(not(can_get_value(s.system.get("node2"))))
       .then("node1".receivedProposal(proposal(1, 1, 0)))
       .then("node3".receivedProposal(proposal(1, 1, 0)))
       .then("node2".decided(proposal(1, 1, 0)))

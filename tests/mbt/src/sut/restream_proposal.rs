@@ -2,11 +2,9 @@
 
 use anyhow::{anyhow, ensure, Result};
 use emerald::app::process_consensus_message;
-use emerald::state::assemble_value_from_parts;
-use malachitebft_app_channel::app::types::core::Round as EmeraldRound;
+use malachitebft_app_channel::app::types::core::{Round as EmeraldRound, Validity};
 use malachitebft_app_channel::{AppMsg, NetworkMsg};
-use malachitebft_core_consensus::PeerId;
-use malachitebft_eth_types::Height as EmeraldHeight;
+use malachitebft_eth_types::{Height as EmeraldHeight, Value};
 
 use super::Sut;
 use crate::history::History;
@@ -97,16 +95,16 @@ impl Sut {
                 )
             })?;
         ensure!(
-            stored_proposal.round == round,
-            "Stored re-proposal has the wrong round"
-        );
-        ensure!(
             stored_proposal.valid_round == valid_round,
             "Stored re-proposal has the wrong valid round"
         );
         ensure!(
             stored_proposal.proposer == self.address,
             "Stored re-proposal has the wrong proposer"
+        );
+        ensure!(
+            stored_proposal.validity == Validity::Valid,
+            "Stored re-proposal is not valid"
         );
 
         let stream = capture
@@ -124,26 +122,17 @@ impl Sut {
             "ProposalInit has the wrong polka round"
         );
 
-        let peer_id = PeerId::from_multihash(Default::default())
-            .map_err(|err| anyhow!("Failed to create peer id: {err:?}"))?;
-        let mut restreamed_parts = None;
-        for part in stream.iter().cloned() {
-            if let Some(parts) = self
-                .components
-                .state
-                .reassemble_proposal(peer_id, part)
-                .await
-                .map_err(|err| anyhow!("Failed to reassemble RestreamProposal output: {err:?}"))?
-            {
-                restreamed_parts = Some(parts);
-            }
+        let mut restreamed_bytes = Vec::new();
+        for data in stream
+            .iter()
+            .filter_map(|message| message.content.as_data()?.as_data())
+        {
+            restreamed_bytes.extend_from_slice(&data.bytes);
         }
 
-        let restreamed_parts = restreamed_parts
-            .ok_or_else(|| anyhow!("RestreamProposal output could not be reassembled"))?;
-        let (restreamed_value, _) = assemble_value_from_parts(restreamed_parts);
+        let restreamed_value = Value::new(restreamed_bytes.into());
         ensure!(
-            restreamed_value.value.id() == value_id,
+            restreamed_value.id() == value_id,
             "Restreamed value does not match source value {value_id}"
         );
 
