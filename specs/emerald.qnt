@@ -45,11 +45,11 @@ module emerald {
   pure def proposer_for(height: Height, round: Round): Node =
     NODES[(height - 1 + round) % NODES.length()]
 
-  // Returns the next block payload.
+  // Returns the payload for the next newly built block.
   //
-  // For simplicity, we generate payloads as sequential numbers based on how
-  // many proposals there are, thus ensuring a unique payload per proposal
-  // recorded.
+  // For simplicity, newly built proposals use sequential numbers based on the
+  // number of proposal records. Restreamed proposals deliberately reuse an
+  // existing payload, so payloads are not unique across proposal records.
   pure def next_payload(ctx: LocalContext): Payload =
     ctx.extensions.all_proposals.size()
 
@@ -184,15 +184,21 @@ module emerald {
 
   // ===== GetValue: Build and propose new value =====
   //
-  // Assumption: After starting a round, Malachite will call GetValue on the
-  // Emerald node that is the proposer for the consensus height and round. In
-  // response, Emerald will either propose a new value or return an already
-  // proposed value.
+  // Assumption: After starting a round, Malachite calls GetValue on the proposer
+  // only if it did not request RestreamProposal. The model permits one
+  // proposal-producing request per height and round.
+
+  pure def can_get_value(s: LocalState): bool = {
+    val proposer = proposer_for(s.consensus_height, s.consensus_round)
+    and {
+      s.phase == Working,
+      s.process_id == proposer,
+      get_local_proposal(s, s.consensus_height, s.consensus_round) == None,
+    }
+  }
 
   pure def listen_get_value(ctx: LocalContext): Set[()] = {
-    val s = ctx.state
-    val proposer = proposer_for(s.consensus_height, s.consensus_round)
-    if (s.phase == Working and s.process_id == proposer) Set(()) else Set()
+    if (can_get_value(ctx.state)) Set(()) else Set()
   }
 
   pure def handle_get_value(ctx: LocalContext, _params: ()): Transition = {
@@ -225,6 +231,61 @@ module emerald {
           })
         ))
       )
+    }
+  }
+
+  // ===== RestreamProposal: Re-propose a valid value from an earlier round =====
+  //
+  // Assumption: This models only restreams with a non-Nil valid round; the
+  // hidden-lock fallback is intentionally excluded. A locally stored proposal
+  // stands in for retaining the valid value because votes, polkas, and locks are
+  // not modeled. Each model proposal is assumed to map to SUT proposal metadata
+  // and block data under the same (height, round, value_id) key. Malachite
+  // requests either GetValue or RestreamProposal in a round. The model may
+  // initially enable both, but taking either records a current-round proposal
+  // and disables both actions for that round.
+
+  pure def listen_restream_proposal(ctx: LocalContext): Set[Proposal] = {
+    val s = ctx.state
+    val proposer = proposer_for(s.consensus_height, s.consensus_round)
+
+    if (and {
+      s.phase == Working,
+      s.process_id == proposer,
+      s.consensus_round > 0,
+      get_local_proposal(s, s.consensus_height, s.consensus_round) == None,
+    })
+      s.proposals.filter(p => and {
+        p.height == s.consensus_height,
+        p.round < s.consensus_round,
+      })
+    else
+      Set()
+  }
+
+  pure def handle_restream_proposal(ctx: LocalContext, source_proposal: Proposal): Transition = {
+    val s = ctx.state
+    val proposal = {
+      ...source_proposal,
+      round: s.consensus_round,
+      proposer: s.process_id,
+    }
+
+    {
+      post_state: {
+        ...s,
+        proposals: s.proposals.setAdd(proposal),
+      },
+      effects: Set(
+        choreo::CustomEffect(RecordProposal(proposal)),
+        choreo::CustomEffect(RecordAction(
+          RestreamProposalAction({
+            node: s.process_id,
+            source_proposal: source_proposal,
+            proposal: proposal,
+          })
+        ))
+      ),
     }
   }
 
@@ -438,7 +499,6 @@ module emerald {
 
   // TODO: Implement missing Malachite inputs
   // + GetHistoryMinHeight
-  // + RestreamProposal
   //
   // TODO: Model additional behavior
   // + State pruning
@@ -574,6 +634,7 @@ module emerald {
 
       // Proposal building and broadcast
       choreo::cue(ctx, listen_get_value, handle_get_value),
+      choreo::cue(ctx, listen_restream_proposal, handle_restream_proposal),
       choreo::cue(ctx, listen_received_proposal, handle_received_proposal),
 
       // Consensus decision

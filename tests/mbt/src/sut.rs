@@ -4,6 +4,7 @@ mod get_decided;
 mod get_value;
 mod process_synced_value;
 mod receive_proposal;
+mod restream_proposal;
 mod started_round;
 
 use anyhow::{anyhow, Result};
