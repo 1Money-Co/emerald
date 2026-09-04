@@ -2,8 +2,10 @@
 
 use anyhow::{anyhow, ensure, Result};
 use emerald::app::process_consensus_message;
+use emerald::state::assemble_value_from_parts;
 use malachitebft_app_channel::app::types::core::Round as EmeraldRound;
 use malachitebft_app_channel::{AppMsg, NetworkMsg};
+use malachitebft_core_consensus::PeerId;
 use malachitebft_eth_types::Height as EmeraldHeight;
 
 use super::Sut;
@@ -82,6 +84,31 @@ impl Sut {
 
         process_result
             .map_err(|err| anyhow!("Failed to process RestreamProposal message: {err:?}"))?;
+
+        let stored_proposal = self
+            .components
+            .state
+            .store
+            .get_undecided_proposal(height, round, value_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "RestreamProposal did not store value {value_id} at height {height}, round {round}"
+                )
+            })?;
+        ensure!(
+            stored_proposal.round == round,
+            "Stored re-proposal has the wrong round"
+        );
+        ensure!(
+            stored_proposal.valid_round == valid_round,
+            "Stored re-proposal has the wrong valid round"
+        );
+        ensure!(
+            stored_proposal.proposer == self.address,
+            "Stored re-proposal has the wrong proposer"
+        );
+
         let stream = capture
             .await
             .map_err(|err| anyhow!("Failed to capture RestreamProposal stream: {err}"))??;
@@ -96,9 +123,28 @@ impl Sut {
             init.pol_round == valid_round,
             "ProposalInit has the wrong polka round"
         );
+
+        let peer_id = PeerId::from_multihash(Default::default())
+            .map_err(|err| anyhow!("Failed to create peer id: {err:?}"))?;
+        let mut restreamed_parts = None;
+        for part in stream.iter().cloned() {
+            if let Some(parts) = self
+                .components
+                .state
+                .reassemble_proposal(peer_id, part)
+                .await
+                .map_err(|err| anyhow!("Failed to reassemble RestreamProposal output: {err:?}"))?
+            {
+                restreamed_parts = Some(parts);
+            }
+        }
+
+        let restreamed_parts = restreamed_parts
+            .ok_or_else(|| anyhow!("RestreamProposal output could not be reassembled"))?;
+        let (restreamed_value, _) = assemble_value_from_parts(restreamed_parts);
         ensure!(
-            init.proposer == self.address,
-            "ProposalInit has the wrong proposer"
+            restreamed_value.value.id() == value_id,
+            "Restreamed value does not match source value {value_id}"
         );
 
         hist.record_proposal(proposal, value, stream);

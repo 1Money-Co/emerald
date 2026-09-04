@@ -45,11 +45,11 @@ module emerald {
   pure def proposer_for(height: Height, round: Round): Node =
     NODES[(height - 1 + round) % NODES.length()]
 
-  // Returns the next block payload.
+  // Returns the payload for the next newly built block.
   //
-  // For simplicity, we generate payloads as sequential numbers based on how
-  // many proposals there are, thus ensuring a unique payload per proposal
-  // recorded.
+  // For simplicity, newly built proposals use sequential numbers based on the
+  // number of proposal records. Restreamed proposals deliberately reuse an
+  // existing payload, so payloads are not unique across proposal records.
   pure def next_payload(ctx: LocalContext): Payload =
     ctx.extensions.all_proposals.size()
 
@@ -229,6 +229,13 @@ module emerald {
   }
 
   // ===== RestreamProposal: Re-propose a valid value from an earlier round =====
+  //
+  // Assumption: This models only restreams with a non-Nil valid round; the
+  // hidden-lock fallback is intentionally excluded. A locally stored proposal
+  // stands in for retaining the valid value because votes, polkas, and locks are
+  // not modeled, and membership also assumes its block data remains available.
+  // Malachite requests either GetValue or RestreamProposal in a round. The model
+  // may enable both listeners, but each trace selects only one action.
 
   pure def listen_restream_proposal(ctx: LocalContext): Set[Proposal] = {
     val s = ctx.state
@@ -484,7 +491,6 @@ module emerald {
 
   // TODO: Implement missing Malachite inputs
   // + GetHistoryMinHeight
-  // + RestreamProposal
   //
   // TODO: Model additional behavior
   // + State pruning
