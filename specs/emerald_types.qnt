@@ -85,6 +85,7 @@ module emerald_types {
     | ConsensusReadyAction({ node: Node })
     | StartedRoundAction({ node: Node, height: Height, round: Round, proposer: Node })
     | GetValueAction({ node: Node, height: Height, round: Round, proposal: Proposal })
+    | RestreamProposalAction({ node: Node, source_proposal: Proposal, proposal: Proposal })
     | ReceivedProposalAction({ node: Node, proposal: Proposal })
     | DecidedAction({ node: Node, proposal: Proposal })
     | ProcessSyncedValueAction({ node: Node, proposal: Proposal })

@@ -23,6 +23,17 @@ fn test_timeout_and_decide() -> impl Driver {
     EmeraldDriver::default()
 }
 
+/// Proposal restream recovery: validators retain the round-0 value, accept its
+/// round-1 re-proposal, decide, and the re-proposer advances to height 2.
+#[quint_test(
+    spec = "../../specs/emerald_tests.qnt",
+    test = "emeraldRestreamProposalAndDecideTest",
+    max_samples = 1
+)]
+fn test_restream_proposal_and_decide() -> impl Driver {
+    EmeraldDriver::default()
+}
+
 /// Round skipping: nodes 1 and 2 timeout and move ahead, deciding on round 1,
 /// node 3 skips to round 1 and decide.
 #[quint_test(

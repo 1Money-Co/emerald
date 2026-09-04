@@ -228,6 +228,52 @@ module emerald {
     }
   }
 
+  // ===== RestreamProposal: Re-propose a valid value from an earlier round =====
+
+  pure def listen_restream_proposal(ctx: LocalContext): Set[Proposal] = {
+    val s = ctx.state
+    val proposer = proposer_for(s.consensus_height, s.consensus_round)
+
+    if (and {
+      s.phase == Working,
+      s.process_id == proposer,
+      s.consensus_round > 0,
+      get_local_proposal(s, s.consensus_height, s.consensus_round) == None,
+    })
+      s.proposals.filter(p => and {
+        p.height == s.consensus_height,
+        p.round < s.consensus_round,
+      })
+    else
+      Set()
+  }
+
+  pure def handle_restream_proposal(ctx: LocalContext, source_proposal: Proposal): Transition = {
+    val s = ctx.state
+    val proposal = {
+      ...source_proposal,
+      round: s.consensus_round,
+      proposer: s.process_id,
+    }
+
+    {
+      post_state: {
+        ...s,
+        proposals: s.proposals.setAdd(proposal),
+      },
+      effects: Set(
+        choreo::CustomEffect(RecordProposal(proposal)),
+        choreo::CustomEffect(RecordAction(
+          RestreamProposalAction({
+            node: s.process_id,
+            source_proposal: source_proposal,
+            proposal: proposal,
+          })
+        ))
+      ),
+    }
+  }
+
   // ===== ReceivedProposal: Receive a proposal =====
   //
   // Assumption: Malachite will call ReceivedProposal on the Emerald node,
@@ -574,6 +620,7 @@ module emerald {
 
       // Proposal building and broadcast
       choreo::cue(ctx, listen_get_value, handle_get_value),
+      choreo::cue(ctx, listen_restream_proposal, handle_restream_proposal),
       choreo::cue(ctx, listen_received_proposal, handle_received_proposal),
 
       // Consensus decision

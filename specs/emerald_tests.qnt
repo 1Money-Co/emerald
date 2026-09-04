@@ -56,6 +56,12 @@ module emerald_tests {
       .perform(handle_get_value)
       .expect(proposal.in(s.system.get(node).proposals))
 
+  run restreamProposal(node: Node, sourceProposal: Proposal, proposal: Proposal): bool =
+    node
+      .with_cue(listen_restream_proposal, sourceProposal)
+      .perform(handle_restream_proposal)
+      .expect(proposal.in(s.system.get(node).proposals))
+
   run receivedProposal(node: Node, proposal: Proposal): bool =
     node
       .with_cue(listen_received_proposal, proposal)
@@ -204,6 +210,34 @@ module emerald_tests {
         and {
           st.last_decided_height == 1,
           st.last_decided_payload == Some(1)
+        }
+      ))
+
+  // Recovery path: validators accept a round-0 value, then decide its round-1 re-proposal.
+  run emeraldRestreamProposalAndDecideTest =
+    genesisStart
+      .then("node1".getValue(proposal(1, 0, 0)))
+      .then("node2".receivedProposal(proposal(1, 0, 0)))
+      .then("node3".receivedProposal(proposal(1, 0, 0)))
+      .then("node1".timeout(1, 0))
+      .then("node2".timeout(1, 0))
+      .then("node3".timeout(1, 0))
+      .then("node1".startedRound(1, 1))
+      .then("node2".startedRound(1, 1))
+      .then("node3".startedRound(1, 1))
+      .expect(proposer_for(1, 1) == "node2")
+      .then("node2".restreamProposal(proposal(1, 0, 0), proposal(1, 1, 0)))
+      .then("node1".receivedProposal(proposal(1, 1, 0)))
+      .then("node3".receivedProposal(proposal(1, 1, 0)))
+      .then("node2".decided(proposal(1, 1, 0)))
+      .then("node1".decided(proposal(1, 1, 0)))
+      .then("node3".decided(proposal(1, 1, 0)))
+      .then("node2".startedRound(2, 0))
+      .expect(NODES.toSet().forall(node =>
+        val st = s.system.get(node)
+        and {
+          st.last_decided_height == 1,
+          st.last_decided_payload == Some(0)
         }
       ))
 
