@@ -275,7 +275,9 @@ pub async fn on_get_value(
     // The POL round is always nil when we propose a newly built value.
     // See L15/L18 of the Tendermint algorithm.
     let pol_round = Round::Nil;
-    let stream_messages = state.stream_proposal(proposal.clone(), bytes, pol_round).await?;
+    let stream_messages = state
+        .stream_proposal(proposal.clone(), bytes, pol_round)
+        .await?;
 
     // Send it to consensus only after the attested stream is durable.
     if reply.send(proposal.clone()).is_err() {
@@ -936,10 +938,7 @@ pub async fn on_restream_proposal(
     {
         Some((proposal, bytes)) => {
             info!(value = %proposal.value.id(), "Re-using previously built value");
-            for stream_message in state
-                .stream_proposal(proposal, bytes, valid_round)
-                .await?
-            {
+            for stream_message in state.stream_proposal(proposal, bytes, valid_round).await? {
                 debug!(%height, %round, "Streaming proposal part: {stream_message:?}");
                 channels
                     .network

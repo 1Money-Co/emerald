@@ -14,9 +14,7 @@ use malachitebft_app_channel::app::types::sync::RawDecidedValue;
 use malachitebft_app_channel::app::types::ProposedValue;
 use malachitebft_eth_types::codec::proto as codec;
 use malachitebft_eth_types::codec::proto::ProtobufCodec;
-use malachitebft_eth_types::{
-    proto, EmeraldContext, Height, ProposalAttestation, Value, ValueId,
-};
+use malachitebft_eth_types::{proto, EmeraldContext, Height, ProposalAttestation, Value, ValueId};
 use malachitebft_proto::{Error as ProtoError, Protobuf};
 use prost::Message;
 use redb::ReadableTable;
@@ -255,7 +253,9 @@ impl Db {
         (proposal.height, proposal.round, proposal.value.id())
     }
 
-    fn validate_write(write: &UndecidedProposalWrite) -> Result<(Height, Round, ValueId), StoreError> {
+    fn validate_write(
+        write: &UndecidedProposalWrite,
+    ) -> Result<(Height, Round, ValueId), StoreError> {
         let key = Self::proposal_key(&write.proposal);
         if write.proposal.value.extensions != write.payload {
             return Err(StoreError::Integrity(format!(
@@ -366,11 +366,15 @@ impl Db {
     }
 
     fn decode_proposal(bytes: &[u8]) -> Result<ProposedValue<EmeraldContext>, StoreError> {
-        ProtobufCodec.decode(Bytes::copy_from_slice(bytes)).map_err(StoreError::Protobuf)
+        ProtobufCodec
+            .decode(Bytes::copy_from_slice(bytes))
+            .map_err(StoreError::Protobuf)
     }
 
     fn decode_attestation(bytes: &[u8]) -> Result<ProposalAttestation, StoreError> {
-        ProtobufCodec.decode(Bytes::copy_from_slice(bytes)).map_err(StoreError::Protobuf)
+        ProtobufCodec
+            .decode(Bytes::copy_from_slice(bytes))
+            .map_err(StoreError::Protobuf)
     }
 
     #[tracing::instrument(skip(self))]
@@ -410,9 +414,12 @@ impl Db {
 
         let record = match (payload, proposal, attestation) {
             (None, None, None) | (Some(_), None, None) => None,
-            (Some(payload), Some(proposal), attestation) => {
-                Some(Self::validate_stored_record(key, proposal, payload, attestation)?)
-            }
+            (Some(payload), Some(proposal), attestation) => Some(Self::validate_stored_record(
+                key,
+                proposal,
+                payload,
+                attestation,
+            )?),
             _ => {
                 return Err(StoreError::Integrity(format!(
                     "invalid undecided proposal record shape for {key:?}"
@@ -743,7 +750,8 @@ impl Db {
             let mut undecided_block_data = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
             undecided_block_data.retain(|k, _| k.0 >= block_data_retain_height)?;
 
-            let mut undecided_attestations = tx.open_table(UNDECIDED_PROPOSAL_ATTESTATIONS_TABLE)?;
+            let mut undecided_attestations =
+                tx.open_table(UNDECIDED_PROPOSAL_ATTESTATIONS_TABLE)?;
             undecided_attestations.retain(|k, _| k.0 >= block_data_retain_height)?;
 
             // Remove all pending proposal parts with height < retain_height
@@ -1356,7 +1364,10 @@ mod tests {
         }
     }
 
-    fn with_valid_round(mut write: UndecidedProposalWrite, valid_round: Round) -> UndecidedProposalWrite {
+    fn with_valid_round(
+        mut write: UndecidedProposalWrite,
+        valid_round: Round,
+    ) -> UndecidedProposalWrite {
         write.proposal.valid_round = valid_round;
         if let Some(attestation) = &mut write.attestation {
             attestation.init.pol_round = valid_round;
@@ -1364,7 +1375,10 @@ mod tests {
         write
     }
 
-    fn as_unattested(mut write: UndecidedProposalWrite, source: UndecidedWriteSource) -> UndecidedProposalWrite {
+    fn as_unattested(
+        mut write: UndecidedProposalWrite,
+        source: UndecidedWriteSource,
+    ) -> UndecidedProposalWrite {
         write.attestation = None;
         write.source = source;
         write
@@ -1393,11 +1407,15 @@ mod tests {
         let (db, _dir) = create_test_db("attestation_without_metadata");
         let write = make_attested_write(43);
         let key = Db::proposal_key(&write.proposal);
-        let attestation = ProtobufCodec.encode(write.attestation.as_ref().unwrap()).unwrap();
+        let attestation = ProtobufCodec
+            .encode(write.attestation.as_ref().unwrap())
+            .unwrap();
 
         let tx = db.db.begin_write().unwrap();
         {
-            let mut table = tx.open_table(UNDECIDED_PROPOSAL_ATTESTATIONS_TABLE).unwrap();
+            let mut table = tx
+                .open_table(UNDECIDED_PROPOSAL_ATTESTATIONS_TABLE)
+                .unwrap();
             table.insert(key, attestation.to_vec()).unwrap();
         }
         tx.commit().unwrap();
@@ -1484,7 +1502,10 @@ mod tests {
             db.write_undecided_proposal(write),
             Err(StoreError::Integrity(_))
         ));
-        assert!(db.get_undecided_record(key.0, key.1, key.2).unwrap().is_none());
+        assert!(db
+            .get_undecided_record(key.0, key.1, key.2)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1523,8 +1544,8 @@ mod tests {
                     Round::new(0),
                     Value::new(Bytes::from(vec![h as u8; 10])).id(),
                 )
-                    .unwrap()
-                    .is_some(),
+                .unwrap()
+                .is_some(),
                 "block data at height {h} should exist before pruning"
             );
         }
@@ -1623,8 +1644,8 @@ mod tests {
                 Round::new(0),
                 Value::new(Bytes::from(vec![3_u8; 10])).id(),
             )
-                .unwrap()
-                .is_some(),
+            .unwrap()
+            .is_some(),
             "undecided block data at height 3 should survive"
         );
         assert!(
@@ -1633,8 +1654,8 @@ mod tests {
                 Round::new(0),
                 Value::new(Bytes::from(vec![2_u8; 10])).id(),
             )
-                .unwrap()
-                .is_none(),
+            .unwrap()
+            .is_none(),
             "undecided block data at height 2 should be pruned"
         );
         assert!(
@@ -1643,8 +1664,8 @@ mod tests {
                 Round::new(0),
                 Value::new(Bytes::from(vec![1_u8; 10])).id(),
             )
-                .unwrap()
-                .is_none(),
+            .unwrap()
+            .is_none(),
             "undecided block data at height 1 should be pruned"
         );
 

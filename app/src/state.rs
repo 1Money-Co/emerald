@@ -20,8 +20,8 @@ use malachitebft_eth_engine::json_structures::ExecutionBlock;
 use malachitebft_eth_types::codec::proto::ProtobufCodec;
 use malachitebft_eth_types::secp256k1::K256Provider;
 use malachitebft_eth_types::{
-    Address, BlockTimestamp, EmeraldContext, Genesis, Height, ProposalData, ProposalFin,
-    ProposalAttestation, ProposalInit, ProposalPart, RetryConfig, ValidatorSet, Value, ValueId,
+    Address, BlockTimestamp, EmeraldContext, Genesis, Height, ProposalAttestation, ProposalData,
+    ProposalFin, ProposalInit, ProposalPart, RetryConfig, ValidatorSet, Value, ValueId,
 };
 use malachitebft_proto::Error as ProtoError;
 use rand::rngs::StdRng;
@@ -460,8 +460,14 @@ impl State {
         // duplicate is not safe to deliver to consensus as though it were canonical.
         info!(%value.height, %value.round, %value.proposer, "Storing validated proposal as undecided");
         let attestation = ProposalAttestation {
-            init: parts.init().cloned().expect("complete proposal has init part"),
-            fin: parts.fin().cloned().expect("complete proposal has fin part"),
+            init: parts
+                .init()
+                .cloned()
+                .expect("complete proposal has init part"),
+            fin: parts
+                .fin()
+                .cloned()
+                .expect("complete proposal has fin part"),
         };
         match self
             .store
@@ -546,13 +552,10 @@ impl State {
             .flatten()
     }
 
-    /// Stores an undecided proposal along with its block data.
+    /// Stores an unattested undecided proposal through the atomic aggregate boundary.
     ///
-    /// WARN: The order of the two storage operations is important.
-    /// Block data must be stored before the proposal metadata to prevent crashes from
-    /// leaving a proposal that references non-existent block data. If a crash occurs
-    /// between the operations, orphaned block data is safe, but a dangling proposal
-    /// reference would cause retrieval failures.
+    /// This is used while a local proposal is being built. `stream_proposal` upgrades the
+    /// matching record with its authenticated Init/Fin envelope before publication.
     pub async fn store_undecided_value(
         &self,
         value: &ProposedValue<EmeraldContext>,
@@ -760,7 +763,11 @@ impl State {
         address: Address,
         value_id: ValueId,
     ) -> eyre::Result<AttestedReplay> {
-        let Some(record) = self.store.get_undecided_record(height, round, value_id).await? else {
+        let Some(record) = self
+            .store
+            .get_undecided_record(height, round, value_id)
+            .await?
+        else {
             return Ok(AttestedReplay::Absent);
         };
         let Some(attestation) = record.attestation else {
@@ -781,7 +788,9 @@ impl State {
         let mut parts = Vec::with_capacity(record.payload.chunks(CHUNK_SIZE).len() + 2);
         parts.push(ProposalPart::Init(attestation.init));
         for chunk in record.payload.chunks(CHUNK_SIZE) {
-            parts.push(ProposalPart::Data(ProposalData::new(Bytes::copy_from_slice(chunk))));
+            parts.push(ProposalPart::Data(ProposalData::new(
+                Bytes::copy_from_slice(chunk),
+            )));
         }
         parts.push(ProposalPart::Fin(attestation.fin));
 
@@ -895,11 +904,9 @@ impl State {
             })
             .await?
         {
-            UndecidedWriteOutcome::Canonical(_) => Ok(self.make_stream_messages(
-                value.height,
-                value.round,
-                parts,
-            )),
+            UndecidedWriteOutcome::Canonical(_) => {
+                Ok(self.make_stream_messages(value.height, value.round, parts))
+            }
             UndecidedWriteOutcome::Conflict(conflict) => Err(eyre::eyre!(
                 "local proposal attestation conflict at height {}, round {}, field {:?}",
                 value.height,
@@ -1138,7 +1145,10 @@ jwt_token_path = "./assets/jwt.hex"
             },
             emerald_config,
         );
-        state.set_validator_set(Height::new(1426), ValidatorSet::new([Validator::new(public_key, 1)]));
+        state.set_validator_set(
+            Height::new(1426),
+            ValidatorSet::new([Validator::new(public_key, 1)]),
+        );
 
         (state, dir)
     }
@@ -1336,7 +1346,10 @@ jwt_token_path = "./assets/jwt.hex"
         let height = Height::new(1426);
         let round = Round::new(0);
         let payload = Bytes::from_static(b"local-attested-proposal");
-        let proposal = state.propose_value(height, round, payload.clone()).await.unwrap();
+        let proposal = state
+            .propose_value(height, round, payload.clone())
+            .await
+            .unwrap();
 
         let messages = state
             .stream_proposal(proposal.clone(), payload, Round::Nil)
@@ -1359,21 +1372,42 @@ jwt_token_path = "./assets/jwt.hex"
         let height = Height::new(1426);
         let round = Round::new(0);
         let payload = Bytes::from_static(b"authenticated-replay");
-        let proposal = state.propose_value(height, round, payload.clone()).await.unwrap();
+        let proposal = state
+            .propose_value(height, round, payload.clone())
+            .await
+            .unwrap();
         let streamed = state
             .stream_proposal(proposal.clone(), payload, Round::Nil)
             .await
             .unwrap();
 
         let AttestedReplay::Ready(parts) = state
-            .prepare_attested_replay(height, round, Round::Nil, state.address, proposal.value.id())
+            .prepare_attested_replay(
+                height,
+                round,
+                Round::Nil,
+                state.address,
+                proposal.value.id(),
+            )
             .await
             .unwrap()
         else {
             panic!("locally streamed proposal must be replayable");
         };
 
-        assert_eq!(parts.first().and_then(ProposalPart::as_init), streamed[0].content.as_data().and_then(ProposalPart::as_init));
-        assert_eq!(parts.last().and_then(ProposalPart::as_fin), streamed[streamed.len() - 2].content.as_data().and_then(ProposalPart::as_fin));
+        assert_eq!(
+            parts.first().and_then(ProposalPart::as_init),
+            streamed[0]
+                .content
+                .as_data()
+                .and_then(ProposalPart::as_init)
+        );
+        assert_eq!(
+            parts.last().and_then(ProposalPart::as_fin),
+            streamed[streamed.len() - 2]
+                .content
+                .as_data()
+                .and_then(ProposalPart::as_fin)
+        );
     }
 }
