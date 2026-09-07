@@ -2,7 +2,7 @@
 
 ## Status
 
-Pending re-approval. Revised through 2026-09-07 in response to design review.
+Approved on 2026-09-07. Revised through 2026-09-07 in response to design review.
 
 The first review raised two blocking findings, on effect-to-attestation coherence and on the hidden-lock
 verification contract, plus a narrowing of the authentication claims. The second raised two implementation-defining
