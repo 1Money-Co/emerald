@@ -20,7 +20,8 @@ use tracing::{debug, error, info, warn};
 use crate::bootstrap::{initialize_state_from_existing_block, initialize_state_from_genesis};
 use crate::metrics::ConsensusMetrics;
 use crate::payload::validate_execution_payload;
-use crate::state::{decode_value, State};
+use crate::state::{decode_value, AttestedReplay, State};
+use crate::store::{UndecidedProposalWrite, UndecidedWriteOutcome, UndecidedWriteSource};
 use crate::sync_handler::get_decided_value_for_sync;
 use crate::validators::read_validators_from_contract;
 
@@ -271,17 +272,19 @@ pub async fn on_get_value(
         }
     };
 
-    // Send it to consensus
+    // The POL round is always nil when we propose a newly built value.
+    // See L15/L18 of the Tendermint algorithm.
+    let pol_round = Round::Nil;
+    let stream_messages = state.stream_proposal(proposal.clone(), bytes, pol_round).await?;
+
+    // Send it to consensus only after the attested stream is durable.
     if reply.send(proposal.clone()).is_err() {
         error!("Failed to send GetValue reply");
     }
 
-    // The POL round is always nil when we propose a newly built value.
-    // See L15/L18 of the Tendermint algorithm.
-    let pol_round = Round::Nil;
     // Now what's left to do is to break down the value to propose into parts,
     // and send those parts over the network to our peers, for them to re-assemble the full value.
-    for stream_message in state.stream_proposal(proposal, bytes, pol_round) {
+    for stream_message in stream_messages {
         debug!(%height, %round, "Streaming proposal part: {stream_message:?}");
         channels
             .network
@@ -774,10 +777,27 @@ pub async fn on_process_synced_value(
         validity: Validity::Valid, // already validated by 2/3+ of the validator set
     };
 
-    // Store block data so on_decided() can retrieve it when the Decided message arrives.
-    state
-        .store_undecided_value(&proposed_value, block_bytes)
-        .await?;
+    // Store the synchronized value atomically. The sync source deliberately preserves a
+    // previously authenticated proposal's valid_round and attestation when both agree on value.
+    let proposed_value = match state
+        .store
+        .write_undecided_proposal(UndecidedProposalWrite {
+            proposal: proposed_value,
+            payload: block_bytes,
+            attestation: None,
+            source: UndecidedWriteSource::Sync,
+        })
+        .await?
+    {
+        UndecidedWriteOutcome::Canonical(value) => value,
+        UndecidedWriteOutcome::Conflict(conflict) => {
+            warn!(%height, %round, field = ?conflict.field, "Rejecting conflicting synced value");
+            if reply.send(None).is_err() {
+                error!(%height, %round, "Failed to send ProcessSyncedValue None reply");
+            }
+            return Ok(());
+        }
+    };
 
     // Send to consensus to see if it has been decided on
     if reply.send(Some(proposed_value)).is_err() {
@@ -859,14 +879,50 @@ pub async fn on_restream_proposal(
         height,
         round,
         valid_round,
-        address: _,
+        address,
         value_id,
     } = restream_proposal
     else {
         unreachable!("on_restream_proposal called with non-RestreamProposal message");
     };
 
-    //  Look for a proposal at valid_round or round(should be already stored)
+    match state
+        .prepare_attested_replay(height, round, valid_round, address, value_id)
+        .await?
+    {
+        AttestedReplay::Ready(parts) => {
+            info!(%height, %round, %value_id, "Replaying authenticated proposal");
+            for stream_message in state.make_stream_messages(height, round, parts) {
+                channels
+                    .network
+                    .send(NetworkMsg::PublishProposalPart(stream_message))
+                    .await?;
+            }
+            return Ok(());
+        }
+        AttestedReplay::IdentityMismatch { stored_init } => {
+            warn!(
+                %height,
+                %round,
+                %valid_round,
+                %address,
+                %value_id,
+                stored_round = %stored_init.round,
+                stored_valid_round = %stored_init.pol_round,
+                stored_proposer = %stored_init.proposer,
+                "Stored proposal attestation does not match restream effect"
+            );
+            return Ok(());
+        }
+        AttestedReplay::Absent if address != state.address => {
+            warn!(%height, %round, %address, %value_id, "No local authenticated proposal to restream");
+            return Ok(());
+        }
+        AttestedReplay::Absent => {}
+    }
+
+    // Only the local proposer may fall back to creating a fresh, authenticated re-proposal.
+    // Look for a proposal at valid_round or round (which should already be stored).
     let proposal_round = if valid_round == Round::Nil {
         round
     } else {
@@ -880,7 +936,10 @@ pub async fn on_restream_proposal(
     {
         Some((proposal, bytes)) => {
             info!(value = %proposal.value.id(), "Re-using previously built value");
-            for stream_message in state.stream_proposal(proposal, bytes, valid_round) {
+            for stream_message in state
+                .stream_proposal(proposal, bytes, valid_round)
+                .await?
+            {
                 debug!(%height, %round, "Streaming proposal part: {stream_message:?}");
                 channels
                     .network
