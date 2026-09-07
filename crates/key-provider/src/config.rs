@@ -4,10 +4,8 @@ pub enum KeyProviderConfig {
     #[default]
     File,
     #[cfg(feature = "aws-sm-kms")]
-    #[serde(rename = "aws_sm_kms")]
     AwsSmKms(AwsSmKmsConfig),
     #[cfg(feature = "gcp-sm-kms")]
-    #[serde(rename = "gcp_sm_kms")]
     GcpSmKms(GcpSmKmsConfig),
 }
 
