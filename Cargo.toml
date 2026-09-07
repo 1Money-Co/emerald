@@ -28,7 +28,7 @@ edition      = "2021"
 readme       = "README.md"
 repository   = "https://github.com/informalsystems/emerald"
 license      = "Apache-2.0"
-rust-version = "1.83"
+rust-version = "1.86"
 publish      = false
 
 [profile.dev]
@@ -91,6 +91,7 @@ blst               = "0.3.16"
 clap               = "4.5"
 color-eyre         = "0.6"
 config             = { version = "0.15", features = [ "toml" ], default-features = false }
+crc32c             = "0.6"
 derive-where       = "1.2.7"
 directories        = "5.0.1"
 hex                = { version = "0.4.3", features = [ "serde" ] }
@@ -118,6 +119,9 @@ test-log           = { version = "0.2", features = [ "trace" ] }
 aws-config               = { version = "1" }
 aws-sdk-kms              = { version = "1" }
 aws-sdk-secretsmanager   = { version = "1" }
+google-cloud-gax         = { version = "=1.9.1" }
+google-cloud-kms-v1      = { version = "=1.8.0" }
+google-cloud-secretmanager-v1 = { version = "=1.8.0" }
 zeroize                  = { version = "1", features = ["derive"] }
 
 [workspace.dependencies.malachitebft-app]

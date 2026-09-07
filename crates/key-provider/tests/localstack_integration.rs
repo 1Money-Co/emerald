@@ -1,3 +1,5 @@
+#![cfg(feature = "aws-sm-kms")]
+
 // Run with:
 //   AWS_DEFAULT_REGION=ap-east-1 \
 //   AWS_ENDPOINT_URL=http://localhost:4566 \
