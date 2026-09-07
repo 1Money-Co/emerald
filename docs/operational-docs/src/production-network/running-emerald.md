@@ -59,6 +59,10 @@ fee_recipient = "0x4242424242424242424242424242424242424242"
 
 This is where you define how Emerald connects to Reth. Make sure to fill in the Reth http and authrpc address.
 
+By default the validator key is read from `<home>/config/priv_validator_key.json`. To load it from
+AWS Secrets Manager + KMS or GCP Secret Manager + Cloud KMS instead, add a `[key_provider]` section
+— see [Validator Key Management](key-management.md).
+
 ## Configure Peer Connections
 
 For a multi-node network, configure persistent peers in `config.toml`:
@@ -100,7 +104,8 @@ emerald start \
 
 The `--home` directory should contain:
 - `<home>/config/config.toml` - Malachite BFT configuration
-- `<home>/config/priv_validator_key.json` - Validator signing key
+- `<home>/config/priv_validator_key.json` - Validator signing key (not needed when a cloud
+  [key provider](key-management.md) is configured)
 - `<home>/config/genesis.json` - Malachite BFT genesis file
 
 An example Malachite BFT config file is provided:

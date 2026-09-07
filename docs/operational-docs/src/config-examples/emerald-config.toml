@@ -14,8 +14,30 @@ prune_at_block_interval = 5
 # Size, in bytes, of the redb storage cache. Default: 512 MiB.
 redb_cache_size_bytes = 536870912
 
-[retry_config]
-initial_delay = "100ms"
-max_delay = "5s"
-max_elapsed_time = "30s"
-multiplier = 2.0
+# ---------------------------------------------------------------------------
+# Validator key source. Optional; defaults to the local file provider.
+# See production-network/key-management.md for IAM, payload format and
+# troubleshooting details.
+# ---------------------------------------------------------------------------
+
+# Default: read <home>/config/priv_validator_key.json from local disk.
+# [key_provider]
+# type = "file"
+
+# AWS Secrets Manager ciphertext, decrypted by AWS KMS.
+# [key_provider]
+# type       = "aws_sm_kms"
+# secret_id  = "emerald/validator-0/consensus-key"
+# region     = "us-east-1"
+# kms_key_id = "alias/emerald-validator-keys"
+# kms_region = "us-west-2"            # optional; defaults to `region`
+# [key_provider.kms_encryption_context] # optional; must match encrypt time exactly
+# validator = "0"
+
+# GCP Secret Manager ciphertext, decrypted by Cloud KMS. Authentication is ADC
+# only. Copy all three values verbatim from the key ceremony handoff.
+# [key_provider]
+# type           = "gcp_sm_kms"
+# secret_version = "projects/PROJECT/secrets/SECRET/versions/7"
+# kms_crypto_key = "projects/PROJECT/locations/LOCATION/keyRings/RING/cryptoKeys/KEY"
+# kms_aad        = "1money:mainnet:validator:1:general:v1"

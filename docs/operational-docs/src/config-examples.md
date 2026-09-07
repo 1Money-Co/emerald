@@ -8,6 +8,8 @@ This section contains example configuration files that you can use as templates 
   - Contains execution client connection settings
   - JWT authentication configuration
   - Node identification and networking settings
+  - Validator key source (`[key_provider]`) — see
+    [Validator Key Management](production-network/key-management.md)
 
 ## MalachiteBFT Configuration
 

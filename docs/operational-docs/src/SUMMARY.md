@@ -39,6 +39,7 @@
   - [Creating Network Genesis](production-network/genesis.md)
   - [Running Reth](production-network/running-reth.md)
   - [Running Emerald](production-network/running-emerald.md)
+  - [Validator Key Management](production-network/key-management.md)
 - [Configuration Examples](./config-examples.md)
 
 ---
