@@ -1410,4 +1410,36 @@ jwt_token_path = "./assets/jwt.hex"
                 .and_then(ProposalPart::as_fin)
         );
     }
+
+    #[tokio::test]
+    async fn attested_replay_rejects_an_effect_with_a_different_pol_round() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(0);
+        let payload = Bytes::from_static(b"attested-replay-identity");
+        let proposal = state
+            .propose_value(height, round, payload.clone())
+            .await
+            .unwrap();
+        state
+            .stream_proposal(proposal.clone(), payload, Round::Nil)
+            .await
+            .unwrap();
+
+        let AttestedReplay::IdentityMismatch { stored_init } = state
+            .prepare_attested_replay(
+                height,
+                round,
+                Round::new(1),
+                state.address,
+                proposal.value.id(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("a different POL round must not be replayed");
+        };
+
+        assert_eq!(stored_init.pol_round, Round::Nil);
+    }
 }
