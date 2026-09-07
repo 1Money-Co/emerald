@@ -1,0 +1,155 @@
+{
+  "description": "Conformance vectors for the decrypted GCP envelope payload. Emerald's parse_secret_material and l1client's om_keystore_material::parse_secret_payload read the same ceremony secrets, so every case marked contract=shared must behave identically in both. Cases marked contract=emerald are deliberate, documented divergences; l1client's own test should assert its side of those, not this expectation. Add a case here before changing either parser.",
+  "peer_implementation": "l1client crates/om-keystore-material/src/lib.rs::parse_secret_payload",
+  "default_key_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+  "cases": [
+    {
+      "name": "canonical lowercase hex",
+      "payload": "0101010101010101010101010101010101010101010101010101010101010101",
+      "expect": "accept",
+      "contract": "shared"
+    },
+    {
+      "name": "uppercase hex digits",
+      "payload": "0101010101010101010101010101010101010101010101010101010101010101",
+      "expect": "accept",
+      "contract": "shared"
+    },
+    {
+      "name": "0x prefix",
+      "payload": "0x0101010101010101010101010101010101010101010101010101010101010101",
+      "expect": "accept",
+      "contract": "shared"
+    },
+    {
+      "name": "0X prefix",
+      "payload": "0X0101010101010101010101010101010101010101010101010101010101010101",
+      "expect": "accept",
+      "contract": "shared"
+    },
+    {
+      "name": "digit-only hex is hex, not a JSON number",
+      "payload": "1111111111111111111111111111111111111111111111111111111111111111",
+      "key_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "expect": "accept",
+      "contract": "shared",
+      "note": "Valid JSON as a number; hex decoding must be attempted first."
+    },
+    {
+      "name": "json private_key alias",
+      "payload": "{\"private_key\":\"0101010101010101010101010101010101010101010101010101010101010101\"}",
+      "expect": "accept",
+      "contract": "shared"
+    },
+    {
+      "name": "json privateKey alias",
+      "payload": "{\"privateKey\":\"0x0101010101010101010101010101010101010101010101010101010101010101\"}",
+      "expect": "accept",
+      "contract": "shared"
+    },
+    {
+      "name": "json key alias",
+      "payload": "{\"key\":\"0101010101010101010101010101010101010101010101010101010101010101\"}",
+      "expect": "accept",
+      "contract": "shared"
+    },
+    {
+      "name": "json alias priority prefers private_key",
+      "payload": "{\"key\":\"0202020202020202020202020202020202020202020202020202020202020202\",\"privateKey\":\"0303030303030303030303030303030303030303030303030303030303030303\",\"private_key\":\"0101010101010101010101010101010101010101010101010101010101010101\"}",
+      "expect": "accept",
+      "contract": "shared",
+      "note": "Order is private_key, privateKey, key. A wrong order yields 0x02.. or 0x03.. and fails."
+    },
+    {
+      "name": "odd number of hex digits",
+      "payload": "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "expect": "reject",
+      "contract": "shared"
+    },
+    {
+      "name": "non-hexadecimal characters",
+      "payload": "fgfgfgfgfgfgfgfgfgfgfgfgfgfgfgfgfgfgfgfgfgfgfgfgfgfgfgfgfgfgfgfg",
+      "expect": "reject",
+      "contract": "shared"
+    },
+    {
+      "name": "plain text that is neither hex nor json",
+      "payload": "not-hex",
+      "expect": "reject",
+      "contract": "shared"
+    },
+    {
+      "name": "malformed json falls back to the hex error",
+      "payload": "{",
+      "expect": "reject",
+      "contract": "shared"
+    },
+    {
+      "name": "json without a known alias",
+      "payload": "{\"unexpected\":\"field\"}",
+      "expect": "reject",
+      "contract": "shared"
+    },
+    {
+      "name": "json alias holding a non-string",
+      "payload": "{\"private_key\":7}",
+      "expect": "reject",
+      "contract": "shared"
+    },
+    {
+      "name": "invalid utf-8",
+      "payload_hex": "ff",
+      "expect": "reject",
+      "contract": "shared"
+    },
+    {
+      "name": "whitespace inside the material",
+      "payload": "0 01010101010101010101010101010101010101010101010101010101010101",
+      "expect": "reject",
+      "contract": "shared",
+      "note": "Even length, so this fails on the character rather than on length."
+    },
+    {
+      "name": "trailing newline",
+      "payload": "0101010101010101010101010101010101010101010101010101010101010101\n",
+      "expect": "accept",
+      "contract": "emerald",
+      "note": "l1client rejects this; Emerald trims to match its own AWS provider."
+    },
+    {
+      "name": "leading space",
+      "payload": " 0101010101010101010101010101010101010101010101010101010101010101",
+      "expect": "accept",
+      "contract": "emerald",
+      "note": "l1client rejects this."
+    },
+    {
+      "name": "surrounding mixed whitespace with prefix",
+      "payload": "\t 0x0101010101010101010101010101010101010101010101010101010101010101 \r\n",
+      "expect": "accept",
+      "contract": "emerald",
+      "note": "l1client rejects this."
+    },
+    {
+      "name": "31 bytes",
+      "payload": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "expect": "reject",
+      "contract": "emerald",
+      "note": "l1client's parser returns the bytes and leaves length to its caller; Emerald requires exactly 32."
+    },
+    {
+      "name": "33 bytes",
+      "payload": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "expect": "reject",
+      "contract": "emerald",
+      "note": "l1client's parser returns the bytes and leaves length to its caller; Emerald requires exactly 32."
+    },
+    {
+      "name": "empty payload",
+      "payload": "",
+      "expect": "reject",
+      "contract": "emerald",
+      "note": "l1client decodes this to empty material and defers to algorithm validation."
+    }
+  ]
+}

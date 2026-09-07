@@ -1,4 +1,6 @@
 use core::error::Error as StdError;
+use core::future::Future;
+use core::time::Duration;
 use core::{mem, str};
 
 use async_trait::async_trait;
@@ -56,14 +58,48 @@ pub enum GcpSmKmsError {
     },
     #[error("Cloud KMS plaintext is not valid UTF-8: {0}")]
     InvalidUtf8(#[from] str::Utf8Error),
-    #[error("Cloud KMS plaintext is not valid hexadecimal key material: {0}")]
-    InvalidHex(#[from] hex::FromHexError),
+    #[error("Cloud KMS plaintext is not valid hexadecimal key material: {reason}")]
+    InvalidHex { reason: String },
     #[error(
         "Cloud KMS plaintext JSON does not contain a string private_key, privateKey, or key field"
     )]
     MissingKeyField,
     #[error("Cloud KMS plaintext must decode to exactly 32 bytes, got {actual}")]
     InvalidLength { actual: usize },
+    #[error("timed out after {timeout:?} loading the private key from GCP")]
+    Timeout { timeout: Duration },
+}
+
+/// Upper bound on the whole startup key load: Application Default Credentials
+/// discovery, the Secret Manager access and the Cloud KMS decrypt. The Google
+/// clients set neither a per-attempt timeout nor a retry policy by default, so
+/// without this a stalled metadata server or control-plane incident would hang
+/// node startup indefinitely instead of failing fast for the supervisor to retry.
+const KEY_LOAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn within_timeout<T>(
+    timeout: Duration,
+    future: impl Future<Output = Result<T, GcpSmKmsError>>,
+) -> Result<T, GcpSmKmsError> {
+    tokio::time::timeout(timeout, future)
+        .await
+        .unwrap_or_else(|_| Err(GcpSmKmsError::Timeout { timeout }))
+}
+
+/// `hex::FromHexError` renders the offending character, which here is decrypted
+/// private-key material, so it must never reach an error message or a log. Keep
+/// the position and a static reason and drop the character itself.
+impl From<hex::FromHexError> for GcpSmKmsError {
+    fn from(error: hex::FromHexError) -> Self {
+        let reason = match error {
+            hex::FromHexError::InvalidHexCharacter { index, .. } => {
+                format!("non-hexadecimal character at position {index}")
+            }
+            hex::FromHexError::OddLength => "odd number of digits".to_owned(),
+            hex::FromHexError::InvalidStringLength => "invalid string length".to_owned(),
+        };
+        Self::InvalidHex { reason }
+    }
 }
 
 pub struct GcpSmKmsKeyProvider {
@@ -85,24 +121,30 @@ impl KeyProvider for GcpSmKmsKeyProvider {
 
         info!(
             secret_version = %self.config.secret_version,
+            timeout = ?KEY_LOAD_TIMEOUT,
             "Loading private key from GCP Secret Manager and Cloud KMS",
         );
-        let secret_manager = SecretManagerService::builder()
-            .build()
-            .await
-            .map_err(|source| GcpSmKmsError::ClientInitialization {
-                service: "Secret Manager",
-                source: Box::new(source),
-            })?;
-        let kms = KeyManagementService::builder()
-            .build()
-            .await
-            .map_err(|source| GcpSmKmsError::ClientInitialization {
-                service: "Cloud KMS",
-                source: Box::new(source),
-            })?;
-
-        let key = load_private_key_with_clients(&self.config, &secret_manager, &kms).await?;
+        // The timeout wraps client construction too: Application Default
+        // Credentials discovery talks to the metadata server and can stall there.
+        let key = within_timeout(KEY_LOAD_TIMEOUT, async {
+            let secret_manager =
+                SecretManagerService::builder()
+                    .build()
+                    .await
+                    .map_err(|source| GcpSmKmsError::ClientInitialization {
+                        service: "Secret Manager",
+                        source: Box::new(source),
+                    })?;
+            let kms = KeyManagementService::builder()
+                .build()
+                .await
+                .map_err(|source| GcpSmKmsError::ClientInitialization {
+                    service: "Cloud KMS",
+                    source: Box::new(source),
+                })?;
+            load_private_key_with_clients(&self.config, &secret_manager, &kms).await
+        })
+        .await?;
         info!(
             secret_version = %self.config.secret_version,
             "Private key loaded successfully from GCP",
@@ -246,7 +288,15 @@ fn decode_hex_material(value: &str) -> Result<Zeroizing<Vec<u8>>, hex::FromHexEr
 }
 
 fn parse_secret_material(payload: &[u8]) -> Result<Zeroizing<[u8; 32]>, GcpSmKmsError> {
-    let payload = str::from_utf8(payload)?;
+    // The accepted and rejected payload forms are pinned by
+    // `gcp_sm_kms/fixtures/payload_conformance.json`, which also records where this
+    // parser deliberately differs from l1client's `parse_secret_payload` over the
+    // same ceremony secrets. Update that file alongside any change here.
+    //
+    // Surrounding whitespace is an artifact of how the secret was written (`echo`
+    // appends a newline), not of the key material, so drop it before decoding.
+    // This matches `AwsSmKmsKeyProvider`; l1client rejects such a payload.
+    let payload = str::from_utf8(payload)?.trim();
     let bare_hex_error = match decode_hex_material(payload) {
         Ok(material) => return exact_key(material),
         Err(error) => error,

@@ -17,7 +17,7 @@ use malachitebft_eth_types::secp256k1::{K256Provider, PrivateKey};
 use malachitebft_eth_types::Address;
 use serde::Deserialize;
 
-use super::{load_private_key_with_clients, parse_secret_material, GcpSmKmsError};
+use super::{load_private_key_with_clients, parse_secret_material, within_timeout, GcpSmKmsError};
 use crate::config::GcpSmKmsConfig;
 
 const SECRET_VERSION: &str = "projects/test-project/secrets/validator-general/versions/7";
@@ -156,73 +156,96 @@ fn matching_kms() -> KmsStub {
     })
 }
 
+#[derive(Deserialize)]
+struct PayloadVectors {
+    default_key_hex: String,
+    cases: Vec<PayloadCase>,
+}
+
+#[derive(Deserialize)]
+struct PayloadCase {
+    name: String,
+    #[serde(default)]
+    payload: Option<String>,
+    #[serde(default)]
+    payload_hex: Option<String>,
+    expect: String,
+    #[serde(default)]
+    key_hex: Option<String>,
+}
+
+/// Drives `fixtures/payload_conformance.json`, the shared description of what a
+/// decrypted envelope payload may contain. l1client's `parse_secret_payload` reads
+/// the same ceremony secrets, so the cases marked `contract: "shared"` in that file
+/// must hold on both sides; the `contract: "emerald"` cases record where this parser
+/// deliberately differs. Change the file, not just the code.
 #[test]
-fn parses_bare_hex_with_optional_prefix() {
-    for payload in [
-        KEY_HEX.to_string(),
-        KEY_HEX.to_uppercase(),
-        format!("0x{KEY_HEX}"),
-        format!("0X{KEY_HEX}"),
-    ] {
-        assert_eq!(
-            parse_secret_material(payload.as_bytes())
-                .unwrap()
-                .as_slice(),
-            [1; 32]
-        );
+fn payload_conformance_vectors() {
+    let vectors: PayloadVectors =
+        serde_json::from_str(include_str!("fixtures/payload_conformance.json")).unwrap();
+
+    for case in &vectors.cases {
+        let name = &case.name;
+        let payload = match (&case.payload, &case.payload_hex) {
+            (Some(text), None) => text.as_bytes().to_vec(),
+            (None, Some(hex_bytes)) => hex::decode(hex_bytes).unwrap(),
+            _ => panic!("case {name:?} needs exactly one of payload/payload_hex"),
+        };
+        let parsed = parse_secret_material(&payload);
+
+        match case.expect.as_str() {
+            "accept" => {
+                let expected = case.key_hex.as_ref().unwrap_or(&vectors.default_key_hex);
+                let expected = hex::decode(expected).unwrap();
+                let parsed = parsed
+                    .unwrap_or_else(|error| panic!("case {name:?} should parse, got {error}"));
+                assert_eq!(parsed.as_slice(), expected.as_slice(), "case {name:?}");
+            }
+            "reject" => {
+                assert!(parsed.is_err(), "case {name:?} should be rejected");
+            }
+            other => panic!("case {name:?} has unknown expect {other:?}"),
+        }
     }
 }
 
 #[test]
-fn parses_json_aliases_in_legacy_priority_order() {
-    for field in ["private_key", "privateKey", "key"] {
-        let payload = serde_json::json!({ field: format!("0x{KEY_HEX}") }).to_string();
-        assert_eq!(
-            parse_secret_material(payload.as_bytes())
-                .unwrap()
-                .as_slice(),
-            [1; 32]
-        );
-    }
-
-    let payload = serde_json::json!({
-        "key": "02".repeat(32),
-        "privateKey": "03".repeat(32),
-        "private_key": KEY_HEX,
-    })
-    .to_string();
-    assert_eq!(
-        parse_secret_material(payload.as_bytes())
-            .unwrap()
-            .as_slice(),
-        [1; 32]
-    );
-}
-
-#[test]
-fn rejects_noncanonical_or_wrong_length_plaintext() {
-    let payloads = [
-        format!(" {KEY_HEX}"),
-        format!("{KEY_HEX}\n"),
-        "f".repeat(63),
-        "fg".repeat(32),
-        "ff".repeat(31),
-        "ff".repeat(33),
-        "not-hex".to_string(),
-        "{".to_string(),
-        r#"{"unexpected":"field"}"#.to_string(),
-        r#"{"private_key":7}"#.to_string(),
-    ];
-    for payload in payloads {
-        assert!(
-            parse_secret_material(payload.as_bytes()).is_err(),
-            "accepted invalid plaintext: {payload:?}"
-        );
-    }
+fn rejects_invalid_utf8_plaintext() {
     assert!(matches!(
         parse_secret_material(&[0xff]),
         Err(GcpSmKmsError::InvalidUtf8(_))
     ));
+}
+
+#[test]
+fn hex_errors_report_position_without_echoing_key_material() {
+    // An even-length payload so hex reports the offending character rather than
+    // an odd length. 'Z' stands in for a byte of decrypted key material.
+    let payload = format!("{}ZZ", "01".repeat(31));
+    let message = parse_secret_material(payload.as_bytes())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("position 62"),
+        "lost the position: {message}"
+    );
+    assert!(!message.contains('Z'), "leaked key material: {message}");
+
+    let payload =
+        serde_json::json!({ "private_key": format!("{}ZZ", "01".repeat(31)) }).to_string();
+    let message = parse_secret_material(payload.as_bytes())
+        .unwrap_err()
+        .to_string();
+    assert!(!message.contains('Z'), "leaked key material: {message}");
+
+    // Odd-length and wrong-length payloads carry no payload bytes either.
+    let message = parse_secret_material("f".repeat(63).as_bytes())
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        message,
+        "Cloud KMS plaintext is not valid hexadecimal key material: odd number of digits"
+    );
 }
 
 #[tokio::test]
@@ -327,6 +350,25 @@ async fn loader_preserves_service_failures_and_does_not_fallback() {
         _ => None,
     };
     assert_eq!(status, Some(Code::FailedPrecondition));
+}
+
+#[tokio::test]
+async fn load_fails_fast_instead_of_hanging() {
+    // Stands in for a stalled metadata server or an unresponsive GCP endpoint:
+    // without the bound the node would wait here forever at startup.
+    let result = within_timeout(
+        std::time::Duration::from_millis(10),
+        std::future::pending::<Result<(), GcpSmKmsError>>(),
+    )
+    .await;
+    assert!(matches!(result, Err(GcpSmKmsError::Timeout { .. })));
+
+    // A future that completes in time is untouched.
+    let ok = within_timeout(std::time::Duration::from_secs(30), async {
+        Ok::<_, GcpSmKmsError>(7)
+    })
+    .await;
+    assert_eq!(ok.unwrap(), 7);
 }
 
 #[tokio::test]

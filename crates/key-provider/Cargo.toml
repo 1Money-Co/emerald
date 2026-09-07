@@ -29,6 +29,7 @@ bytes                         = { workspace = true, optional = true }
 crc32c                        = { workspace = true, optional = true }
 google-cloud-kms-v1           = { workspace = true, optional = true }
 google-cloud-secretmanager-v1 = { workspace = true, optional = true }
+tokio                         = { workspace = true, features = [ "time" ], optional = true }
 
 [features]
 default    = ["aws-sm-kms", "gcp-sm-kms"]
@@ -38,6 +39,7 @@ gcp-sm-kms = [
   "dep:crc32c",
   "dep:google-cloud-kms-v1",
   "dep:google-cloud-secretmanager-v1",
+  "dep:tokio",
 ]
 
 [dev-dependencies]
