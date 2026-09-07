@@ -432,9 +432,44 @@ impl CanMakePrivateKeyFile for App {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, OnceLock};
+
+    use malachitebft_app_channel::app::node::Node;
     use malachitebft_eth_types::secp256k1::PrivateKey;
 
-    use super::{key_provider_kind, public_key_hex};
+    use super::{key_provider_kind, public_key_hex, App};
+
+    #[test]
+    fn resolved_private_key_takes_precedence_over_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let private_key_file = dir.path().join("priv_validator_key.json");
+        let disk_key = PrivateKey::from_slice(&[2_u8; 32]).unwrap();
+        std::fs::write(&private_key_file, serde_json::to_vec(&disk_key).unwrap()).unwrap();
+        let app = App {
+            config: Default::default(),
+            home_dir: dir.path().to_path_buf(),
+            genesis_file: Default::default(),
+            emerald_config_file: Default::default(),
+            private_key_file,
+            start_height: None,
+            resolved_private_key: Arc::new(OnceLock::new()),
+        };
+        let loaded = app.load_private_key_file().unwrap();
+        assert_eq!(loaded.public_key(), disk_key.public_key());
+
+        let cached_key = PrivateKey::from_slice(&[1_u8; 32]).unwrap();
+        app.resolved_private_key.set(cached_key.clone()).unwrap();
+        let loaded = app.load_private_key(app.load_private_key_file().unwrap());
+        assert_eq!(loaded.public_key(), cached_key.public_key());
+        assert_eq!(
+            app.get_keypair(loaded).public().to_peer_id().to_string(),
+            "16Uiu2HAmEWQnHq2jLKJypwVnVoQeFCULuyop6atvq2eWjYSUjzNi"
+        );
+
+        std::fs::remove_file(&app.private_key_file).unwrap();
+        let loaded = app.load_private_key_file().unwrap();
+        assert_eq!(loaded.public_key(), cached_key.public_key());
+    }
 
     #[test]
     fn key_provider_kind_names_file_provider() {

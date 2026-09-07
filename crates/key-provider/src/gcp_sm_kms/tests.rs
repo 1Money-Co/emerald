@@ -157,14 +157,24 @@ fn matching_kms() -> KmsStub {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PayloadVectors {
+    #[serde(rename = "description")]
+    _description: String,
+    #[serde(rename = "peer_implementation")]
+    _peer_implementation: String,
     default_key_hex: String,
     cases: Vec<PayloadCase>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PayloadCase {
     name: String,
+    #[serde(rename = "contract")]
+    _contract: String,
+    #[serde(default, rename = "note")]
+    _note: Option<String>,
     #[serde(default)]
     payload: Option<String>,
     #[serde(default)]
@@ -172,6 +182,20 @@ struct PayloadCase {
     expect: String,
     #[serde(default)]
     key_hex: Option<String>,
+}
+
+#[test]
+fn payload_vector_schema_rejects_unknown_fields() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/payload_conformance.json")).unwrap();
+
+    let mut unknown_root_field = fixture.clone();
+    unknown_root_field["default_key_hexx"] = serde_json::json!(KEY_HEX);
+    assert!(serde_json::from_value::<PayloadVectors>(unknown_root_field).is_err());
+
+    let mut unknown_case_field = fixture;
+    unknown_case_field["cases"][0]["key_hexx"] = serde_json::json!(KEY_HEX);
+    assert!(serde_json::from_value::<PayloadVectors>(unknown_case_field).is_err());
 }
 
 /// Drives `fixtures/payload_conformance.json`, the shared description of what a

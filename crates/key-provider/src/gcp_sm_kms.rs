@@ -102,6 +102,13 @@ impl From<hex::FromHexError> for GcpSmKmsError {
     }
 }
 
+/// Loads an envelope-encrypted validator key from GCP at startup.
+///
+/// # Runtime requirements
+///
+/// Loading requires a Tokio runtime with I/O and time enabled, such as one built
+/// with `tokio::runtime::Builder::enable_all()`. Without the time driver, the
+/// startup timeout panics instead of returning a `KeyProviderError`.
 pub struct GcpSmKmsKeyProvider {
     config: GcpSmKmsConfig,
 }

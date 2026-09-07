@@ -11,7 +11,8 @@
     },
     {
       "name": "uppercase hex digits",
-      "payload": "0101010101010101010101010101010101010101010101010101010101010101",
+      "payload": "ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB",
+      "key_hex": "abababababababababababababababababababababababababababababababab",
       "expect": "accept",
       "contract": "shared"
     },
@@ -51,6 +52,18 @@
       "name": "json key alias",
       "payload": "{\"key\":\"0101010101010101010101010101010101010101010101010101010101010101\"}",
       "expect": "accept",
+      "contract": "shared"
+    },
+    {
+      "name": "json key field with leading space",
+      "payload": "{\"private_key\":\" 0101010101010101010101010101010101010101010101010101010101010101\"}",
+      "expect": "reject",
+      "contract": "shared"
+    },
+    {
+      "name": "json key field with trailing newline",
+      "payload": "{\"private_key\":\"0101010101010101010101010101010101010101010101010101010101010101\\n\"}",
+      "expect": "reject",
       "contract": "shared"
     },
     {
