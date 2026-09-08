@@ -33,7 +33,7 @@ from hidden-lock effect through late decision.
 - Preserve raw block-data reads for execution and commit handling, but never use them alone to restore proposal
   metadata.
 - Add no production dependency. Add `malachitebft-core-consensus` and `malachitebft-metrics` only as `emerald`
-  dev-dependencies for deterministic state-machine tests, and enable Tokio's `test-util` feature only for tests.
+  dev-dependencies for deterministic state-machine tests.
 - The optional Quint restream action is excluded because Emerald PR #19 is not present on this base. If that PR
   lands, cover it in a separately reviewed follow-up; the deterministic composite test in Task 5 remains mandatory.
 - Keep Markdown at 120 columns and do not format `Cargo.lock`.
@@ -690,20 +690,22 @@ terminator and calls `stream_id(height, round)`, eliminating the consensus-round
 
 Call `state.stream_proposal(..., Round::Nil).await?` before `reply.send(proposal.clone())`. Malachite reaches
 `GetValue` only when it has no valid value and its `propose()` transition uses a nil POL round. Make
-`get_previously_built_value` return the one local proposal and its stored `valid_round`; return an integrity error for
-multiple candidates or a candidate from a non-local proposer.
+`get_previously_built_value` classify the stored candidates as `Absent`, `Reusable`, or `UnsafeCandidates`. Exactly
+one local proposal is reusable and retains its stored `valid_round`; multiple candidates or any candidate from a
+non-local proposer are unsafe. Storage and coherence failures remain errors.
 
 On restart, Malachite queues proposals returned by `StartedRound` before issuing the asynchronous `GetValue`. When
-storage contains a defined-POL proposal, do not publish or rewrite storage. Keep the handler pending past the request
-timeout so the queued or WAL-restored proposal remains the sole envelope used for recovery. Then reply with the
-existing value: this keeps Malachite's connector alive, while consensus has already left the propose step and cannot
-turn the late acknowledgement into a competing nil-POL proposal. For a new value or a stored nil-POL value, prepare
-the stream, then send the consensus reply and publish the messages.
+storage contains a defined-POL proposal, do not publish or rewrite storage. Return immediately without sending the
+reply, so the queued or WAL-restored proposal remains the sole envelope used for recovery. The pinned Malachite
+connector absorbs the closed response channel and forwards no value to consensus. Handle `UnsafeCandidates` the
+same way after warning: do not build, reply, or publish. For a new value or a stored nil-POL value, prepare the stream,
+then send the consensus reply and publish the messages.
 
 Add `restart_defined_pol_is_restored_without_nil_rewrite` to exercise both production handlers and the reply-channel
-contract. Add `late_get_value_reply_preserves_the_restored_defined_pol_proposal` with the pinned consensus harness to
-process the restored proposal, proposal timeout, and late local value in order. Assert no proposal publication and
-that the keeper still contains the defined-POL envelope.
+contract. Assert the handler returns promptly, the response channel closes, the stored proposal is unchanged, and no
+proposal is published. Add `get_value_suppresses_multiple_stored_candidates_without_stopping_the_app` and
+`get_value_suppresses_a_non_local_stored_candidate_without_stopping_the_app`; assert both handlers return successfully
+without a reply or publication.
 
 - [ ] **Step 7: Apply the sync merge outcome**
 

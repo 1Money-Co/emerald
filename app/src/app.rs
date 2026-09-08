@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 use crate::bootstrap::{initialize_state_from_existing_block, initialize_state_from_genesis};
 use crate::metrics::ConsensusMetrics;
 use crate::payload::validate_execution_payload;
-use crate::state::{decode_value, AttestedReplay, State};
+use crate::state::{decode_value, AttestedReplay, PreviouslyBuiltValue, State};
 use crate::store::{UndecidedProposalWrite, UndecidedWriteOutcome, UndecidedWriteSource};
 use crate::sync_handler::get_decided_value_for_sync;
 use crate::validators::read_validators_from_contract;
@@ -190,8 +190,8 @@ pub async fn on_started_round(
 ///
 /// Requests the application to build a value for consensus to propose.
 ///
-/// The application replies with the requested value within the timeout unless a restored
-/// defined-POL proposal is already queued in consensus, in which case this request expires.
+/// The application replies with the requested value within the timeout unless stored candidates
+/// cannot safely become a new local envelope, in which case it declines the request.
 pub async fn on_get_value(
     get_value: AppMsg<EmeraldContext>,
     state: &mut State,
@@ -209,31 +209,36 @@ pub async fn on_get_value(
         unreachable!("on_get_value called with non-GetValue message");
     };
 
-    // New values are built immediately. The timeout is used below only to defer a competing
-    // request while consensus recovers an existing defined-POL proposal.
+    // The timeout is used below only while the execution client is syncing.
 
     info!(%height, %round, "🟢🟢 Consensus is requesting a value to propose");
 
     // Here it is important that, if we have previously built a value for this height and round,
     // we send back the very same value.
     let (proposal, bytes) = match state.get_previously_built_value(height, round).await? {
-        Some((proposal, valid_round)) if valid_round.is_defined() => {
+        PreviouslyBuiltValue::UnsafeCandidates {
+            candidate_count,
+            has_non_local_proposer,
+        } => {
+            warn!(
+                %height,
+                %round,
+                candidate_count,
+                has_non_local_proposer,
+                "Stored proposals are unsafe to reuse; suppressing GetValue"
+            );
+            return Ok(());
+        }
+        PreviouslyBuiltValue::Reusable { valid_round, .. } if valid_round.is_defined() => {
             warn!(
                 %height,
                 %round,
                 %valid_round,
-                "Stored proposal requires a POL; deferring GetValue to recovery"
+                "Stored proposal requires a POL; suppressing GetValue during recovery"
             );
-            tokio::time::sleep(timeout * 2).await;
-            // The proposal timeout has moved consensus out of the propose step, so this late
-            // acknowledgement cannot create a nil-POL proposal. It keeps the host connector's
-            // request channel healthy while the restored proposal drives recovery.
-            if reply.send(proposal).is_err() {
-                error!("Failed to send deferred GetValue reply");
-            }
             return Ok(());
         }
-        Some((proposal, _)) => {
+        PreviouslyBuiltValue::Reusable { proposal, .. } => {
             info!(value = %proposal.value.id(), "Re-using previously built value");
             // Fetch the block data for the previously built value
             let bytes = state
@@ -243,7 +248,7 @@ pub async fn on_get_value(
                 .ok_or_else(|| eyre!("Block data not found for previously built value"))?;
             (proposal, bytes)
         }
-        None => {
+        PreviouslyBuiltValue::Absent => {
             // Check if the execution client is syncing and behind the consensus height
             let (is_syncing, highest_chain_height) = engine.is_syncing().await?;
             if is_syncing && highest_chain_height >= height.as_u64() {

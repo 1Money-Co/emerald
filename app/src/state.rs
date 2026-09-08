@@ -53,6 +53,22 @@ pub enum AttestedReplay {
     IdentityMismatch { stored_init: ProposalInit },
 }
 
+/// The safe result of looking up a value for a `GetValue` request.
+pub enum PreviouslyBuiltValue {
+    /// No proposal is stored for the requested height and round.
+    Absent,
+    /// Exactly one locally authored proposal can be reused.
+    Reusable {
+        proposal: LocallyProposedValue<EmeraldContext>,
+        valid_round: Round,
+    },
+    /// Stored candidates cannot safely be converted into a local proposal.
+    UnsafeCandidates {
+        candidate_count: usize,
+        has_non_local_proposer: bool,
+    },
+}
+
 /// Size of randomly generated blocks in bytes
 #[allow(dead_code)]
 const BLOCK_SIZE: usize = 10 * 1024 * 1024; // 10 MiB
@@ -680,37 +696,39 @@ impl State {
 
     /// Retrieves a previously built proposal value for the given height and round.
     /// Called by the consensus engine to re-use a previously built value.
-    /// There should be at most one proposal for a given height and round when the proposer is not byzantine.
-    /// We assume this implementation is not byzantine and we are the proposer for the given height and round.
-    /// Therefore there must be a single proposal for the rounds where we are the proposer, with the proposer address
-    /// matching our own.
+    /// Exactly one locally authored proposal can be reused. Ambiguous or non-local candidates
+    /// are reported separately so callers can suppress proposal construction without treating
+    /// peer-reachable stored state as a fatal application error.
     pub async fn get_previously_built_value(
         &self,
         height: Height,
         round: Round,
-    ) -> eyre::Result<Option<(LocallyProposedValue<EmeraldContext>, Round)>> {
+    ) -> eyre::Result<PreviouslyBuiltValue> {
         let proposals: Vec<ProposedValue<EmeraldContext>> =
             self.store.get_undecided_proposals(height, round).await?;
 
-        let Some(proposal) = proposals.first() else {
-            return Ok(None);
-        };
-        if proposals.len() > 1 {
-            return Err(eyre::eyre!(
-                "multiple proposals stored at height {height}, round {round}"
-            ));
+        if proposals.is_empty() {
+            return Ok(PreviouslyBuiltValue::Absent);
         }
-        if proposal.proposer != self.address {
-            return Err(eyre::eyre!(
-                "proposal stored for non-local proposer {} at height {height}, round {round}",
-                proposal.proposer
-            ));
+        let has_non_local_proposer = proposals
+            .iter()
+            .any(|proposal| proposal.proposer != self.address);
+        if proposals.len() != 1 || has_non_local_proposer {
+            return Ok(PreviouslyBuiltValue::UnsafeCandidates {
+                candidate_count: proposals.len(),
+                has_non_local_proposer,
+            });
         }
+        let proposal = &proposals[0];
 
-        Ok(Some((
-            LocallyProposedValue::new(proposal.height, proposal.round, proposal.value.clone()),
-            proposal.valid_round,
-        )))
+        Ok(PreviouslyBuiltValue::Reusable {
+            proposal: LocallyProposedValue::new(
+                proposal.height,
+                proposal.round,
+                proposal.value.clone(),
+            ),
+            valid_round: proposal.valid_round,
+        })
     }
 
     /// Prepares a stored proposal for restreaming and records the re-proposal at the current round.
@@ -1489,7 +1507,7 @@ jwt_token_path = "./assets/jwt.hex"
     }
 
     #[tokio::test]
-    async fn previously_built_value_rejects_a_non_local_proposer() {
+    async fn previously_built_value_marks_a_non_local_proposer_as_unsafe() {
         let (state, _dir) = make_test_state().await;
         let height = Height::new(1426);
         let round = Round::new(0);
@@ -1513,15 +1531,20 @@ jwt_token_path = "./assets/jwt.hex"
             .await
             .unwrap();
 
-        let error = state
-            .get_previously_built_value(height, round)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("non-local proposer"));
+        assert!(matches!(
+            state
+                .get_previously_built_value(height, round)
+                .await
+                .unwrap(),
+            PreviouslyBuiltValue::UnsafeCandidates {
+                candidate_count: 1,
+                has_non_local_proposer: true,
+            }
+        ));
     }
 
     #[tokio::test]
-    async fn previously_built_value_rejects_multiple_candidates() {
+    async fn previously_built_value_marks_multiple_candidates_as_unsafe() {
         let (state, _dir) = make_test_state().await;
         let height = Height::new(1426);
         let round = Round::new(0);
@@ -1550,11 +1573,16 @@ jwt_token_path = "./assets/jwt.hex"
                 .unwrap();
         }
 
-        let error = state
-            .get_previously_built_value(height, round)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("multiple proposals"));
+        assert!(matches!(
+            state
+                .get_previously_built_value(height, round)
+                .await
+                .unwrap(),
+            PreviouslyBuiltValue::UnsafeCandidates {
+                candidate_count: 2,
+                has_non_local_proposer: false,
+            }
+        ));
     }
 
     #[tokio::test]
