@@ -190,8 +190,8 @@ pub async fn on_started_round(
 ///
 /// Requests the application to build a value for consensus to propose.
 ///
-/// The application MUST reply to this message with the requested value
-/// within the specified timeout duration.
+/// The application replies with the requested value within the timeout unless a restored
+/// defined-POL proposal is already queued in consensus, in which case this request expires.
 pub async fn on_get_value(
     get_value: AppMsg<EmeraldContext>,
     state: &mut State,
@@ -209,16 +209,31 @@ pub async fn on_get_value(
         unreachable!("on_get_value called with non-GetValue message");
     };
 
-    // NOTE: We can ignore the timeout as we are building the value right away.
-    // If we were let's say reaping as many txes from a mempool and executing them,
-    // then we would need to respect the timeout and stop at a certain point.
+    // New values are built immediately. The timeout is used below only to defer a competing
+    // request while consensus recovers an existing defined-POL proposal.
 
     info!(%height, %round, "🟢🟢 Consensus is requesting a value to propose");
 
     // Here it is important that, if we have previously built a value for this height and round,
     // we send back the very same value.
     let (proposal, bytes) = match state.get_previously_built_value(height, round).await? {
-        Some(proposal) => {
+        Some((proposal, valid_round)) if valid_round.is_defined() => {
+            warn!(
+                %height,
+                %round,
+                %valid_round,
+                "Stored proposal requires a POL; deferring GetValue to recovery"
+            );
+            tokio::time::sleep(timeout * 2).await;
+            // The proposal timeout has moved consensus out of the propose step, so this late
+            // acknowledgement cannot create a nil-POL proposal. It keeps the host connector's
+            // request channel healthy while the restored proposal drives recovery.
+            if reply.send(proposal).is_err() {
+                error!("Failed to send deferred GetValue reply");
+            }
+            return Ok(());
+        }
+        Some((proposal, _)) => {
             info!(value = %proposal.value.id(), "Re-using previously built value");
             // Fetch the block data for the previously built value
             let bytes = state
@@ -273,7 +288,8 @@ pub async fn on_get_value(
     };
 
     // Malachite requests GetValue only when it has no valid value, so its proposal always uses a
-    // nil POL round. A recovered local row is reconciled to this envelope by stream_proposal.
+    // nil POL round. A stored defined-POL proposal is handled by recovery instead of being
+    // rewritten into a different envelope for this round.
     let stream_messages = state
         .stream_proposal(proposal.clone(), bytes, Round::Nil)
         .await?;

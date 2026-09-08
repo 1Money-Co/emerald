@@ -58,3 +58,4 @@ tikv-jemallocator = "0.6"
 malachitebft-core-consensus = { workspace = true }
 malachitebft-metrics = { workspace = true }
 tempfile = "3"
+tokio = { workspace = true, features = [ "test-util" ] }

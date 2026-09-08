@@ -6,12 +6,13 @@ use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPa
 use malachitebft_app_channel::app::streaming::StreamContent;
 use malachitebft_app_channel::app::types::codec::Codec;
 use malachitebft_app_channel::app::types::core::{
-    Context, NilOrVal, Round, SignedMessage, Timeout, Validity, ValueOrigin, ValuePayload, VoteType,
+    Context, NilOrVal, Proposal as _, Round, SignedMessage, Timeout, Validity, ValueOrigin,
+    ValuePayload, VoteType,
 };
 use malachitebft_app_channel::app::types::{LocallyProposedValue, PeerId, ProposedValue};
 use malachitebft_app_channel::{AppMsg, Channels, NetworkMsg};
 use malachitebft_core_consensus::{
-    process, ConsensusMsg, Effect, Input, Params, Resumable, Resume, SignedConsensusMsg,
+    process, ConsensusMsg, Effect, Input, Params, Resumable, Resume, Role, SignedConsensusMsg,
     State as ConsensusState, ThresholdParams,
 };
 use malachitebft_eth_cli::config::EmeraldConfig;
@@ -29,7 +30,7 @@ use ssz::Encode;
 use tokio::sync::mpsc;
 use url::Url;
 
-use crate::app::{on_get_value, on_received_proposal_part, on_restream_proposal};
+use crate::app::{on_get_value, on_received_proposal_part, on_restream_proposal, on_started_round};
 use crate::metrics::{DbMetrics, Metrics as AppMetrics};
 use crate::state::{State, StateMetrics};
 use crate::store::Store;
@@ -53,6 +54,7 @@ enum ObservedEffect {
         round: Round,
         value_id: ValueId,
     },
+    SignProposal,
     Decide {
         height: Height,
         round: Round,
@@ -109,6 +111,7 @@ impl ConsensusHarness {
                 resume.resume_with(())
             }
             Effect::SignProposal(proposal, resume) => {
+                self.observed.push(ObservedEffect::SignProposal);
                 let signature = self.provider.sign(&proposal.to_sign_bytes());
                 resume.resume_with(SignedMessage::new(proposal, signature))
             }
@@ -848,70 +851,183 @@ async fn hidden_lock_forwarding_decides_only_the_receiving_node() {
         .any(|effect| matches!(effect, ObservedEffect::Decide { .. })));
 }
 
-#[tokio::test]
-async fn get_value_recovery_republishes_with_nil_pol_round() {
+#[tokio::test(start_paused = true)]
+async fn restart_defined_pol_is_restored_without_nil_rewrite() {
     let key = PrivateKey::from_slice(&[11; 32]).unwrap();
     let validator_set = ValidatorSet::new([Validator::new(key.public_key(), 1)]);
     let height = Height::new(1);
     let round = Round::new(10);
-    let stale_valid_round = Round::new(7);
+    let stored_valid_round = Round::new(7);
     let (mut state, dir) = make_app_state(key, height, validator_set).await;
     let execution_payload = fixture_execution_payload();
     let payload = bytes::Bytes::from(execution_payload.as_ssz_bytes());
     let value = Value::new(payload.clone());
     let value_id = value.id();
     state
-        .store_undecided_value(
-            &ProposedValue {
-                height,
-                round,
-                valid_round: stale_valid_round,
-                proposer: state.address,
-                value,
-                validity: Validity::Valid,
-            },
+        .stream_proposal(
+            LocallyProposedValue::new(height, round, value),
             payload,
+            stored_valid_round,
         )
         .await
         .unwrap();
 
     let engine = make_test_engine(dir.path());
     let config = state.emerald_config.clone();
+    let (reply_value, restored_values) = tokio::sync::oneshot::channel();
+    on_started_round(
+        AppMsg::StartedRound {
+            height,
+            round,
+            proposer: state.address,
+            role: Role::Proposer,
+            reply_value,
+        },
+        &mut state,
+        &engine,
+        &config,
+    )
+    .await
+    .unwrap();
+    let restored_values = restored_values.await.unwrap();
+    assert_eq!(restored_values.len(), 1);
+    assert_eq!(restored_values[0].valid_round, stored_valid_round);
+    let stored_before = state
+        .store
+        .get_undecided_record(height, round, value_id)
+        .await
+        .unwrap()
+        .unwrap();
+
     let (channels, mut network_rx) = make_network_channels();
-    let (reply, response) = tokio::sync::oneshot::channel();
-    on_get_value(
+    let (reply, mut response) = tokio::sync::oneshot::channel();
+    let request_timeout = Duration::from_millis(10);
+    let get_value = on_get_value(
         AppMsg::GetValue {
             height,
             round,
-            timeout: Duration::from_millis(1),
+            timeout: request_timeout,
             reply,
         },
         &mut state,
         &channels,
         &engine,
         &config,
-    )
-    .await
-    .unwrap();
-    assert_eq!(response.await.unwrap().value.id(), value_id);
-    drop(channels);
+    );
+    let connector_receive = async {
+        tokio::time::sleep(request_timeout + Duration::from_millis(1)).await;
+        assert!(matches!(
+            response.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        response.await.unwrap()
+    };
+    let (result, deferred_proposal) = tokio::join!(get_value, connector_receive);
+    result.unwrap();
+    assert_eq!(deferred_proposal.value.id(), value_id);
+    assert!(matches!(
+        network_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
 
-    let NetworkMsg::PublishProposalPart(first_message) = network_rx.recv().await.unwrap();
-    let init = first_message
-        .content
-        .as_data()
-        .and_then(ProposalPart::as_init)
-        .unwrap();
-    assert_eq!(init.pol_round, Round::Nil);
-
-    let stored = state
+    let stored_after = state
         .store
         .get_undecided_record(height, round, value_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(stored.proposal.valid_round, Round::Nil);
-    assert_eq!(stored.attestation.unwrap().init.pol_round, Round::Nil);
+    assert_eq!(stored_after, stored_before);
+}
+
+#[test]
+fn late_get_value_reply_preserves_the_restored_defined_pol_proposal() {
+    let key = PrivateKey::from_slice(&[11; 32]).unwrap();
+    let address = Address::from_public_key(&key.public_key());
+    let validator_set = ValidatorSet::new([Validator::new(key.public_key(), 1)]);
+    let height = Height::new(1);
+    let current_round = Round::new(10);
+    let valid_round = Round::new(7);
+    let value = Value::new(bytes::Bytes::from_static(b"defined-pol-restart"));
+    let mut state = ConsensusState::new(
+        EmeraldContext::new(),
+        Params {
+            initial_height: height,
+            initial_validator_set: validator_set.clone(),
+            address,
+            threshold_params: ThresholdParams::default(),
+            value_payload: ValuePayload::PartsOnly,
+            enabled: true,
+        },
+        128,
+    );
+    let metrics = Metrics::default();
+    let mut harness = ConsensusHarness {
+        provider: K256Provider::new(key),
+        observed: Vec::new(),
+    };
+
+    run_consensus_input(
+        &mut state,
+        Input::StartHeight(height, validator_set, false),
+        &mut harness,
+        &metrics,
+    )
+    .unwrap();
+    advance_to_round(&mut state, current_round, &mut harness, &metrics);
+
+    for (round, pol_round) in [(valid_round, Round::Nil), (current_round, valid_round)] {
+        run_consensus_input(
+            &mut state,
+            Input::ProposedValue(
+                ProposedValue {
+                    height,
+                    round,
+                    valid_round: pol_round,
+                    proposer: address,
+                    value: value.clone(),
+                    validity: Validity::Valid,
+                },
+                ValueOrigin::Consensus,
+            ),
+            &mut harness,
+            &metrics,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        state
+            .full_proposal_at_round_and_proposer(&height, current_round, &address)
+            .unwrap()
+            .proposal
+            .pol_round(),
+        valid_round
+    );
+
+    run_consensus_input(
+        &mut state,
+        Input::TimeoutElapsed(Timeout::propose(current_round)),
+        &mut harness,
+        &metrics,
+    )
+    .unwrap();
+    harness.observed.clear();
+    run_consensus_input(
+        &mut state,
+        Input::Propose(LocallyProposedValue::new(height, current_round, value)),
+        &mut harness,
+        &metrics,
+    )
+    .unwrap();
+
+    assert!(!harness.observed.contains(&ObservedEffect::SignProposal));
+    assert_eq!(
+        state
+            .full_proposal_at_round_and_proposer(&height, current_round, &address)
+            .unwrap()
+            .proposal
+            .pol_round(),
+        valid_round
+    );
 }
 
 #[tokio::test]

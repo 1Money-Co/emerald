@@ -144,8 +144,8 @@ Every write of an undecided proposal goes through one function with two input sh
   for parts the node has just built itself.
 - An **unattested write** carries payload and metadata with no envelope, because none is available at that moment.
   Three paths produce one: `propose_value`, the build branch in `prepare_restream_proposal`, and
-  `on_process_synced_value`. The source distinguishes local construction, received streams, and sync. Sync does not
-  know the proposal's `pol_round` and synthesizes `Round::Nil`; only local construction may replace its own envelope.
+  `on_process_synced_value`. Proposal construction and received streams share the proposal source. Sync has its own
+  source because it does not know the proposal's `pol_round` and synthesizes `Round::Nil`.
 
 Before inspecting stored state, every input must be internally coherent:
 
@@ -198,11 +198,19 @@ The function returns the canonical stored `ProposedValue` on insert, no-op, back
 Conflict and IntegrityError outcomes otherwise. Ordinary writes receive the same value they supplied. The sync merge
 may instead return the pre-existing value whose `valid_round` is more precise than sync's synthetic nil.
 
-There is one source-restricted recovery transition. Malachite emits `GetValue` only when it has no valid value and
-constructs every reply as a nil-POL proposal. If a restart finds a coherent local row for the same key with a defined
-`valid_round`, the node builds a fresh nil-POL attestation and atomically replaces only that locally authored metadata
-and attestation. Received streams cannot select this transition, and proposer, value, payload, or integrity
-disagreements still fail without mutation.
+There is no proposal-source exception to these transition rules. In particular, a defined `valid_round` is never
+rewritten to nil. Malachite emits `GetValue` only when it has no valid value and constructs every reply as a nil-POL
+proposal. During restart, however, it queues proposals returned by `StartedRound` before issuing that asynchronous
+request. If the one stored local proposal for the round has a defined `valid_round`, Emerald leaves its metadata and
+attestation unchanged, withholds the `GetValue` reply until after the proposal timeout, and lets the queued or
+WAL-restored proposal drive recovery. It then acknowledges the request with the existing value so the host connector
+does not treat a dropped reply channel as fatal. Since consensus has left the propose step, the late acknowledgement
+cannot create or broadcast a nil-POL proposal. This preserves one proposer-signed envelope instead of creating a
+second envelope for the same height and round.
+
+`get_previously_built_value` treats the stored candidate set as an integrity boundary. No proposal means normal
+construction may proceed. Exactly one proposal is reusable only when its proposer is the local validator. Multiple
+rows or a row for another proposer return an error rather than selecting an arbitrary candidate.
 
 Reconciling an orphaned payload means: if the stored bytes are byte-equal to the incoming payload, keep them; if
 they disagree, replace them with the incoming payload in the same transaction. Replacement rather than refusal is
@@ -274,7 +282,7 @@ All four write paths use the same function and therefore share these rules:
 
 - Received proposals, from `process_complete_proposal_parts`: one attested write. Every conflict returns no value.
 - Local proposals, from `propose_value` then `stream_proposal`: an unattested write followed by an attested one that
-  backfills the envelope from the parts just built. A recovered nil-POL proposal may replace the local envelope only.
+  backfills the envelope from the parts just built.
 - Locally rebuilt re-proposals, from the build branch in `prepare_restream_proposal` then `stream_proposal`: the same
   two-phase shape.
 - Synced values, from `on_process_synced_value`: one unattested sync write. It either inserts a new nil-valid-round
@@ -287,6 +295,7 @@ Caller behavior is explicit so that a storage outcome cannot leave consensus and
 | ------ | ------- | -------- | -------------------------- |
 | Received stream | Reply `Some(canonical)` | Warn and reply `None` | Return error; no reply |
 | New local proposal | Prepare attested stream, then reply and publish | Return error; no reply or publish | Same |
+| Restart GetValue with defined POL | Recover, then acknowledge after timeout; no write or publish | n/a | Same |
 | Local re-proposal | Prepare attested stream, then publish | Return error; do not publish | Same |
 | Sync | Reply `Some(canonical value)` | Warn and reply `None` | Return error; no reply |
 | Foreign replay | Publish after all checks | Warn; publish nothing | Log and publish nothing |
@@ -295,9 +304,10 @@ Caller behavior is explicit so that a storage outcome cannot leave consensus and
 signs the parts, performs the attested write, and returns the messages only after persistence succeeds. `on_get_value`
 performs this preparation before sending its `LocallyProposedValue` reply to consensus; it then publishes the already
 prepared messages. This closes the existing window in which consensus could retain a local proposal whose attestation
-failed to persist. `on_get_value` always streams a nil POL round, matching Malachite's `propose()` transition; the
-source-restricted replacement above reconciles a stale local envelope first. Re-proposal preparation follows the same
-persist-before-publish order.
+failed to persist. `on_get_value` streams a nil POL round only for a new or previously stored nil-POL proposal. A
+stored defined-POL proposal is left for recovery and suppresses the competing reply until after the proposal timeout.
+That delayed connector acknowledgement does not stream or mutate the proposal. Re-proposal preparation follows the
+same persist-before-publish order.
 
 Signing at proposal-construction time, so that the local paths could insert all three records at once, is a viable
 alternative that would remove the two-phase window. It is not adopted here because it restructures `propose_value`
@@ -539,9 +549,8 @@ Storage transition tests, covering each cell of the state machine:
     nothing.
 13. Backfill: coherent payload and metadata exist with no attestation, as after an upgrade, a local two-phase write,
     or a synced value, and a matching attested write backfills only the attestation.
-14. Backfill conflict: a received attested write whose `init.pol_round` disagrees with the stored `valid_round` leaves
-    the record unchanged and returns no proposal. A locally authored attested write may replace a defined POL with a
-    freshly signed nil-POL envelope, but the reverse direction remains a conflict.
+14. Backfill conflict: any attested write whose `init.pol_round` disagrees with the stored `valid_round` leaves the
+    record unchanged and returns no proposal. This holds in both directions and for local and received streams.
 15. Payload disagreement on an attested proposal: a write whose payload bytes differ from the stored payload for the
     same key is refused, covering two payloads that share a `value_id`.
 16. Orphan with equal bytes: a payload written without metadata is completed by the next write of either shape.
@@ -563,6 +572,13 @@ Storage transition tests, covering each cell of the state machine:
     and process a matching sync certificate. Assert sync returns the stored proposal and consensus can decide.
 25. Caller outcomes: inject a conflict and a storage error into each write path. Assert the reply and publication
     behavior in the caller table, including that a local attestation failure occurs before the GetValue reply.
+26. Restart ordering: persist a local attested proposal with a defined POL, call `StartedRound`, then call `GetValue`
+    in Malachite's observed order. Assert the stored proposal is restored unchanged, the delayed reply succeeds so
+    the connector's receiver does not fail, and `GetValue` causes no write or publication. In the pinned consensus
+    harness, process the proposal timeout and delayed local value, then assert no proposal is published and the
+    keeper retains the defined-POL proposal.
+27. Stored candidate integrity: assert `get_previously_built_value` rejects both multiple candidates for one round
+    and a single candidate authored by a non-local proposer.
 
 ### Model-based coverage
 

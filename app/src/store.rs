@@ -86,8 +86,7 @@ pub enum StoreError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UndecidedWriteSource {
-    LocalProposal,
-    ReceivedProposal,
+    Proposal,
     Sync,
 }
 
@@ -564,27 +563,7 @@ impl Db {
             (Some(payload), Some(proposal), attestation) => {
                 let stored = Self::validate_stored_record(key, proposal, payload, attestation)?;
                 if let Err(conflict) = Self::compare_write(&stored, &write) {
-                    let may_reconcile_local_valid_round = conflict.field
-                        == UndecidedConflictField::ValidRound
-                        && write.source == UndecidedWriteSource::LocalProposal
-                        && write.proposal.valid_round == Round::Nil;
-                    if let (true, Some(attestation_bytes)) =
-                        (may_reconcile_local_valid_round, attestation_bytes.as_ref())
-                    {
-                        {
-                            let mut table = tx.open_table(UNDECIDED_PROPOSALS_TABLE)?;
-                            table.insert(key, proposal_bytes.to_vec())?;
-                            write_bytes += proposal_bytes.len() as u64;
-                        }
-                        {
-                            let mut table = tx.open_table(UNDECIDED_PROPOSAL_ATTESTATIONS_TABLE)?;
-                            table.insert(key, attestation_bytes.to_vec())?;
-                            write_bytes += attestation_bytes.len() as u64;
-                        }
-                        UndecidedWriteOutcome::Canonical(write.proposal)
-                    } else {
-                        UndecidedWriteOutcome::Conflict(conflict)
-                    }
+                    UndecidedWriteOutcome::Conflict(conflict)
                 } else {
                     if stored.attestation.is_none() {
                         if let Some(attestation_bytes) = &attestation_bytes {
@@ -1342,7 +1321,7 @@ mod tests {
                 ProposalFin::new(key.sign(b"store-attestation")),
             )),
             proposal,
-            source: UndecidedWriteSource::ReceivedProposal,
+            source: UndecidedWriteSource::Proposal,
         }
     }
 
@@ -1417,7 +1396,7 @@ mod tests {
         assert_eq!(
             db.write_undecided_proposal(as_unattested(
                 attested.clone(),
-                UndecidedWriteSource::ReceivedProposal,
+                UndecidedWriteSource::Proposal,
             ))
             .unwrap(),
             UndecidedWriteOutcome::Canonical(proposal.clone())
@@ -1452,19 +1431,22 @@ mod tests {
     }
 
     #[test]
-    fn undecided_local_attested_write_replaces_stored_valid_round() {
-        let (db, _dir) = create_test_db("local_replaces_valid_round");
+    fn undecided_proposal_nil_valid_round_does_not_replace_defined() {
+        let (db, _dir) = create_test_db("proposal_nil_does_not_replace_defined");
         let stored_write = with_valid_round(make_attested_write(48), Round::new(3));
+        let expected_proposal = stored_write.proposal.clone();
+        let expected_attestation = stored_write.attestation.clone();
         db.write_undecided_proposal(stored_write).unwrap();
 
         let mut recovered_write = with_valid_round(make_attested_write(48), Round::Nil);
-        recovered_write.source = UndecidedWriteSource::LocalProposal;
-        let expected_proposal = recovered_write.proposal.clone();
-        let expected_attestation = recovered_write.attestation.clone();
-        assert_eq!(
-            db.write_undecided_proposal(recovered_write).unwrap(),
-            UndecidedWriteOutcome::Canonical(expected_proposal.clone())
-        );
+        recovered_write.source = UndecidedWriteSource::Proposal;
+        assert!(matches!(
+            db.write_undecided_proposal(recovered_write),
+            Ok(UndecidedWriteOutcome::Conflict(UndecidedConflict {
+                field: UndecidedConflictField::ValidRound,
+                ..
+            }))
+        ));
 
         let stored = db
             .get_undecided_record(
@@ -1479,8 +1461,39 @@ mod tests {
     }
 
     #[test]
-    fn undecided_received_attested_write_rejects_stored_valid_round() {
-        let (db, _dir) = create_test_db("received_rejects_valid_round");
+    fn undecided_unattested_nil_does_not_replace_attested_defined() {
+        let (db, _dir) = create_test_db("unattested_nil_does_not_replace_defined");
+        let stored_write = with_valid_round(make_attested_write(51), Round::new(3));
+        let expected = stored_write.clone();
+        db.write_undecided_proposal(stored_write).unwrap();
+
+        let local_write = as_unattested(
+            with_valid_round(make_attested_write(51), Round::Nil),
+            UndecidedWriteSource::Proposal,
+        );
+        assert!(matches!(
+            db.write_undecided_proposal(local_write),
+            Ok(UndecidedWriteOutcome::Conflict(UndecidedConflict {
+                field: UndecidedConflictField::ValidRound,
+                ..
+            }))
+        ));
+
+        let stored = db
+            .get_undecided_record(
+                expected.proposal.height,
+                expected.proposal.round,
+                expected.proposal.value.id(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.proposal, expected.proposal);
+        assert_eq!(stored.attestation, expected.attestation);
+    }
+
+    #[test]
+    fn undecided_attested_write_rejects_stored_valid_round() {
+        let (db, _dir) = create_test_db("attested_rejects_valid_round");
         let stored_write = with_valid_round(make_attested_write(49), Round::new(3));
         let expected = stored_write.proposal.clone();
         db.write_undecided_proposal(stored_write).unwrap();
@@ -1503,14 +1516,14 @@ mod tests {
     }
 
     #[test]
-    fn undecided_local_defined_valid_round_does_not_replace_nil() {
-        let (db, _dir) = create_test_db("local_defined_does_not_replace_nil");
+    fn undecided_defined_valid_round_does_not_replace_nil() {
+        let (db, _dir) = create_test_db("defined_does_not_replace_nil");
         let stored_write = with_valid_round(make_attested_write(50), Round::Nil);
         let expected = stored_write.proposal.clone();
         db.write_undecided_proposal(stored_write).unwrap();
 
         let mut local_write = with_valid_round(make_attested_write(50), Round::new(3));
-        local_write.source = UndecidedWriteSource::LocalProposal;
+        local_write.source = UndecidedWriteSource::Proposal;
         assert!(matches!(
             db.write_undecided_proposal(local_write),
             Ok(UndecidedWriteOutcome::Conflict(UndecidedConflict {

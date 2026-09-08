@@ -33,7 +33,7 @@ from hidden-lock effect through late decision.
 - Preserve raw block-data reads for execution and commit handling, but never use them alone to restore proposal
   metadata.
 - Add no production dependency. Add `malachitebft-core-consensus` and `malachitebft-metrics` only as `emerald`
-  dev-dependencies for deterministic state-machine tests.
+  dev-dependencies for deterministic state-machine tests, and enable Tokio's `test-util` feature only for tests.
 - The optional Quint restream action is excluded because Emerald PR #19 is not present on this base. If that PR
   lands, cover it in a separately reviewed follow-up; the deterministic composite test in Task 5 remains mandatory.
 - Keep Markdown at 120 columns and do not format `Cargo.lock`.
@@ -225,8 +225,7 @@ git commit -m "feat: add proposal attestation codec"
 ```rust
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UndecidedWriteSource {
-    LocalProposal,
-    ReceivedProposal,
+    Proposal,
     Sync,
 }
 
@@ -351,14 +350,14 @@ transaction; do not add a production escape hatch.
 | `undecided_write_surfaces_storage_key_mismatch` | Metadata ID differs from key | Integrity; no value |
 | `undecided_sync_preserves_stored_valid_round` | Defined-POL row, then sync nil | Stored proposal unchanged |
 | `undecided_proposal_after_sync_conflicts` | Sync nil, then defined POL | Conflict; no backfill |
-| Local nil-POL recovery | Local defined POL, then local nil | Replace metadata and attestation |
-| Received POL conflict | Received defined POL, then received nil | Conflict; bytes unchanged |
-| Local reverse-POL conflict | Local nil POL, then local defined POL | Conflict; bytes unchanged |
+| Proposal POL conflict | Defined POL, then nil | Conflict; record unchanged |
+| Unattested POL conflict | Attested defined POL, then unattested nil | Conflict; attestation unchanged |
+| Reverse POL conflict | Nil POL, then defined | Conflict; record unchanged |
 | `undecided_reads_reject_split_records` | Corrupt key, payload, and init seeds | Both read APIs return integrity |
 
-Name those three source-and-direction tests `undecided_local_attested_write_replaces_stored_valid_round`,
-`undecided_received_attested_write_rejects_stored_valid_round`, and
-`undecided_local_defined_valid_round_does_not_replace_nil`, respectively.
+Name those three direction tests `undecided_proposal_nil_valid_round_does_not_replace_defined`,
+`undecided_unattested_nil_does_not_replace_attested_defined`, and
+`undecided_defined_valid_round_does_not_replace_nil`, respectively.
 
 For the collision-only seeds, construct the redb key explicitly with a chosen `ValueId`; do not claim the test has
 found a natural `DefaultHasher` collision. The invariant under test is byte comparison despite an equal key.
@@ -627,7 +626,7 @@ let write = UndecidedProposalWrite {
     proposal: value,
     payload: data,
     attestation: Some(attestation),
-    source: UndecidedWriteSource::ReceivedProposal,
+    source: UndecidedWriteSource::Proposal,
 };
 ```
 
@@ -639,7 +638,7 @@ reconsidering `pol_round`, so forwarding a `ValidRound` conflict to consensus wo
 - [ ] **Step 5: Convert local construction and streaming to the two-phase aggregate write**
 
 Make `propose_value` and the build branch of `prepare_restream_proposal` call `store_unattested_proposal` with
-`UndecidedWriteSource::LocalProposal`. Accept only `Canonical`; turn `Conflict` into an `eyre` error carrying the key
+`UndecidedWriteSource::Proposal`. Accept only `Canonical`; turn `Conflict` into an `eyre` error carrying the key
 and field.
 
 Change `stream_id` and `stream_proposal` as follows:
@@ -669,7 +668,7 @@ pub async fn stream_proposal(
         proposal,
         payload: data,
         attestation: Some(ProposalAttestation::new(init, fin)),
-        source: UndecidedWriteSource::LocalProposal,
+        source: UndecidedWriteSource::Proposal,
     }).await? {
         UndecidedWriteOutcome::Canonical(_) => {
             Ok(self.make_stream_messages(value.height, value.round, parts))
@@ -690,9 +689,21 @@ terminator and calls `stream_id(height, round)`, eliminating the consensus-round
 - [ ] **Step 6: Prepare before replying in `on_get_value`**
 
 Call `state.stream_proposal(..., Round::Nil).await?` before `reply.send(proposal.clone())`. Malachite reaches
-`GetValue` only when it has no valid value and its `propose()` transition always uses a nil POL round. When a recovered
-local row has a defined `valid_round`, atomically replace its metadata and attestation with the freshly signed nil-POL
-envelope. Only local attested writes may use this replacement. Then send the consensus reply and publish the messages.
+`GetValue` only when it has no valid value and its `propose()` transition uses a nil POL round. Make
+`get_previously_built_value` return the one local proposal and its stored `valid_round`; return an integrity error for
+multiple candidates or a candidate from a non-local proposer.
+
+On restart, Malachite queues proposals returned by `StartedRound` before issuing the asynchronous `GetValue`. When
+storage contains a defined-POL proposal, do not publish or rewrite storage. Keep the handler pending past the request
+timeout so the queued or WAL-restored proposal remains the sole envelope used for recovery. Then reply with the
+existing value: this keeps Malachite's connector alive, while consensus has already left the propose step and cannot
+turn the late acknowledgement into a competing nil-POL proposal. For a new value or a stored nil-POL value, prepare
+the stream, then send the consensus reply and publish the messages.
+
+Add `restart_defined_pol_is_restored_without_nil_rewrite` to exercise both production handlers and the reply-channel
+contract. Add `late_get_value_reply_preserves_the_restored_defined_pol_proposal` with the pinned consensus harness to
+process the restored proposal, proposal timeout, and late local value in order. Assert no proposal publication and
+that the keeper still contains the defined-POL envelope.
 
 - [ ] **Step 7: Apply the sync merge outcome**
 

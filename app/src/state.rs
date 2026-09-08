@@ -53,15 +53,6 @@ pub enum AttestedReplay {
     IdentityMismatch { stored_init: ProposalInit },
 }
 
-fn resolve_verified_proposal_write(
-    outcome: UndecidedWriteOutcome,
-) -> Option<ProposedValue<EmeraldContext>> {
-    match outcome {
-        UndecidedWriteOutcome::Canonical(value) => Some(value),
-        UndecidedWriteOutcome::Conflict(_) => None,
-    }
-}
-
 /// Size of randomly generated blocks in bytes
 #[allow(dead_code)]
 const BLOCK_SIZE: usize = 10 * 1024 * 1024; // 10 MiB
@@ -484,7 +475,7 @@ impl State {
                 proposal: value.clone(),
                 payload: data,
                 attestation: Some(attestation),
-                source: UndecidedWriteSource::ReceivedProposal,
+                source: UndecidedWriteSource::Proposal,
             })
             .await?;
         if let UndecidedWriteOutcome::Conflict(conflict) = &outcome {
@@ -496,7 +487,10 @@ impl State {
             );
         }
 
-        Ok(resolve_verified_proposal_write(outcome))
+        Ok(match outcome {
+            UndecidedWriteOutcome::Canonical(value) => Some(value),
+            UndecidedWriteOutcome::Conflict(_) => None,
+        })
     }
 
     /// Reassembles proposal parts from streamed messages.
@@ -574,7 +568,7 @@ impl State {
                 proposal: value.clone(),
                 payload: data,
                 attestation: None,
-                source: UndecidedWriteSource::LocalProposal,
+                source: UndecidedWriteSource::Proposal,
             })
             .await?
         {
@@ -688,26 +682,35 @@ impl State {
     /// Called by the consensus engine to re-use a previously built value.
     /// There should be at most one proposal for a given height and round when the proposer is not byzantine.
     /// We assume this implementation is not byzantine and we are the proposer for the given height and round.
-    /// Therefore there must be a single proposal for the rounds where we are the proposer, with the proposer address matching our own.
+    /// Therefore there must be a single proposal for the rounds where we are the proposer, with the proposer address
+    /// matching our own.
     pub async fn get_previously_built_value(
         &self,
         height: Height,
         round: Round,
-    ) -> eyre::Result<Option<LocallyProposedValue<EmeraldContext>>> {
+    ) -> eyre::Result<Option<(LocallyProposedValue<EmeraldContext>, Round)>> {
         let proposals: Vec<ProposedValue<EmeraldContext>> =
             self.store.get_undecided_proposals(height, round).await?;
 
-        assert!(
-            proposals.len() <= 1,
-            "There should be at most one proposal for a given height and round"
-        );
+        let Some(proposal) = proposals.first() else {
+            return Ok(None);
+        };
+        if proposals.len() > 1 {
+            return Err(eyre::eyre!(
+                "multiple proposals stored at height {height}, round {round}"
+            ));
+        }
+        if proposal.proposer != self.address {
+            return Err(eyre::eyre!(
+                "proposal stored for non-local proposer {} at height {height}, round {round}",
+                proposal.proposer
+            ));
+        }
 
-        proposals
-            .first()
-            .map(|p| LocallyProposedValue::new(p.height, p.round, p.value.clone()))
-            .map(Some)
-            .map(Ok)
-            .unwrap_or(Ok(None))
+        Ok(Some((
+            LocallyProposedValue::new(proposal.height, proposal.round, proposal.value.clone()),
+            proposal.valid_round,
+        )))
     }
 
     /// Prepares a stored proposal for restreaming and records the re-proposal at the current round.
@@ -906,7 +909,7 @@ impl State {
                 proposal,
                 payload: data,
                 attestation: Some(ProposalAttestation::new(init, fin)),
-                source: UndecidedWriteSource::LocalProposal,
+                source: UndecidedWriteSource::Proposal,
             })
             .await?
         {
@@ -1107,7 +1110,6 @@ mod tests {
     use super::*;
     use crate::app::on_restream_proposal;
     use crate::metrics::{DbMetrics, Metrics};
-    use crate::store::{UndecidedConflict, UndecidedConflictField};
 
     async fn make_test_state() -> (State, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -1289,7 +1291,7 @@ jwt_token_path = "./assets/jwt.hex"
                 proposal: proposal.clone(),
                 payload: payload.clone(),
                 attestation: Some(ProposalAttestation::new(init.clone(), fin.clone())),
-                source: UndecidedWriteSource::ReceivedProposal,
+                source: UndecidedWriteSource::Proposal,
             })
             .await
             .unwrap();
@@ -1484,6 +1486,75 @@ jwt_token_path = "./assets/jwt.hex"
             .unwrap()
             .expect("streamed proposal must be stored");
         assert!(stored.attestation.is_some());
+    }
+
+    #[tokio::test]
+    async fn previously_built_value_rejects_a_non_local_proposer() {
+        let (state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(0);
+        let payload = Bytes::from_static(b"foreign-proposal");
+        let foreign = ProposedValue {
+            height,
+            round,
+            valid_round: Round::Nil,
+            proposer: Address::new([9; 20]),
+            value: Value::new(payload.clone()),
+            validity: Validity::Valid,
+        };
+        state
+            .store
+            .write_undecided_proposal(UndecidedProposalWrite {
+                proposal: foreign,
+                payload,
+                attestation: None,
+                source: UndecidedWriteSource::Proposal,
+            })
+            .await
+            .unwrap();
+
+        let error = state
+            .get_previously_built_value(height, round)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("non-local proposer"));
+    }
+
+    #[tokio::test]
+    async fn previously_built_value_rejects_multiple_candidates() {
+        let (state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(0);
+
+        for payload in [
+            Bytes::from_static(b"first-local-proposal"),
+            Bytes::from_static(b"second-local-proposal"),
+        ] {
+            let proposal = ProposedValue {
+                height,
+                round,
+                valid_round: Round::Nil,
+                proposer: state.address,
+                value: Value::new(payload.clone()),
+                validity: Validity::Valid,
+            };
+            state
+                .store
+                .write_undecided_proposal(UndecidedProposalWrite {
+                    proposal,
+                    payload,
+                    attestation: None,
+                    source: UndecidedWriteSource::Proposal,
+                })
+                .await
+                .unwrap();
+        }
+
+        let error = state
+            .get_previously_built_value(height, round)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("multiple proposals"));
     }
 
     #[tokio::test]
@@ -1797,49 +1868,5 @@ jwt_token_path = "./assets/jwt.hex"
 
         assert!(result.is_ok());
         assert!(collector.await.unwrap().is_empty());
-    }
-
-    #[test]
-    fn valid_round_conflict_rejects_the_freshly_verified_proposal() {
-        let payload = Bytes::from_static(b"same-authenticated-payload");
-        let stored = ProposedValue {
-            height: Height::new(42),
-            round: Round::new(10),
-            valid_round: Round::Nil,
-            proposer: Address::new([3; 20]),
-            value: Value::new(payload),
-            validity: Validity::Valid,
-        };
-
-        let resolved =
-            resolve_verified_proposal_write(UndecidedWriteOutcome::Conflict(UndecidedConflict {
-                field: UndecidedConflictField::ValidRound,
-                stored,
-            }));
-
-        assert!(resolved.is_none());
-    }
-
-    #[test]
-    fn non_valid_round_conflict_rejects_the_freshly_verified_proposal() {
-        let incoming = ProposedValue {
-            height: Height::new(42),
-            round: Round::new(10),
-            valid_round: Round::Nil,
-            proposer: Address::new([3; 20]),
-            value: Value::new(Bytes::from_static(b"incoming")),
-            validity: Validity::Valid,
-        };
-
-        let resolved =
-            resolve_verified_proposal_write(UndecidedWriteOutcome::Conflict(UndecidedConflict {
-                field: UndecidedConflictField::Value,
-                stored: ProposedValue {
-                    value: Value::new(Bytes::from_static(b"stored")),
-                    ..incoming
-                },
-            }));
-
-        assert!(resolved.is_none());
     }
 }
