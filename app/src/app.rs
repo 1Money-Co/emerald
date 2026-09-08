@@ -217,9 +217,8 @@ pub async fn on_get_value(
 
     // Here it is important that, if we have previously built a value for this height and round,
     // we send back the very same value.
-    let (proposal, bytes, pol_round) = match state.get_previously_built_value(height, round).await?
-    {
-        Some((proposal, valid_round)) => {
+    let (proposal, bytes) = match state.get_previously_built_value(height, round).await? {
+        Some(proposal) => {
             info!(value = %proposal.value.id(), "Re-using previously built value");
             // Fetch the block data for the previously built value
             let bytes = state
@@ -227,7 +226,7 @@ pub async fn on_get_value(
                 .get_block_data(height, round, proposal.value.id())
                 .await?
                 .ok_or_else(|| eyre!("Block data not found for previously built value"))?;
-            (proposal, bytes, valid_round)
+            (proposal, bytes)
         }
         None => {
             // Check if the execution client is syncing and behind the consensus height
@@ -268,13 +267,15 @@ pub async fn on_get_value(
                 let proposal: LocallyProposedValue<EmeraldContext> =
                     state.propose_value(height, round, bytes.clone()).await?;
 
-                (proposal, bytes, Round::Nil)
+                (proposal, bytes)
             }
         }
     };
 
+    // Malachite requests GetValue only when it has no valid value, so its proposal always uses a
+    // nil POL round. A recovered local row is reconciled to this envelope by stream_proposal.
     let stream_messages = state
-        .stream_proposal(proposal.clone(), bytes, pol_round)
+        .stream_proposal(proposal.clone(), bytes, Round::Nil)
         .await?;
 
     // Send it to consensus only after the attested stream is durable.

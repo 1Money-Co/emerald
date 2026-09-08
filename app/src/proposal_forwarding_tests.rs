@@ -1,3 +1,4 @@
+use core::time::Duration;
 use std::path::Path;
 
 use alloy_genesis::Genesis as EvmGenesis;
@@ -28,7 +29,7 @@ use ssz::Encode;
 use tokio::sync::mpsc;
 use url::Url;
 
-use crate::app::{on_received_proposal_part, on_restream_proposal};
+use crate::app::{on_get_value, on_received_proposal_part, on_restream_proposal};
 use crate::metrics::{DbMetrics, Metrics as AppMetrics};
 use crate::state::{State, StateMetrics};
 use crate::store::Store;
@@ -336,6 +337,16 @@ async fn receive_stream(
     engine: &Engine,
     messages: Vec<malachitebft_app_channel::app::streaming::StreamMessage<ProposalPart>>,
 ) -> ProposedValue<EmeraldContext> {
+    receive_stream_result(state, engine, messages)
+        .await
+        .expect("stream must produce one complete proposal")
+}
+
+async fn receive_stream_result(
+    state: &mut State,
+    engine: &Engine,
+    messages: Vec<malachitebft_app_channel::app::streaming::StreamMessage<ProposalPart>>,
+) -> Option<ProposedValue<EmeraldContext>> {
     let peer_id = PeerId::from_multihash(Default::default()).unwrap();
     let mut completed = None;
     for part in messages {
@@ -356,7 +367,7 @@ async fn receive_stream(
             completed = Some(proposal);
         }
     }
-    completed.expect("stream must produce one complete proposal")
+    completed
 }
 
 #[test]
@@ -835,4 +846,124 @@ async fn hidden_lock_forwarding_decides_only_the_receiving_node() {
         .observed
         .iter()
         .any(|effect| matches!(effect, ObservedEffect::Decide { .. })));
+}
+
+#[tokio::test]
+async fn get_value_recovery_republishes_with_nil_pol_round() {
+    let key = PrivateKey::from_slice(&[11; 32]).unwrap();
+    let validator_set = ValidatorSet::new([Validator::new(key.public_key(), 1)]);
+    let height = Height::new(1);
+    let round = Round::new(10);
+    let stale_valid_round = Round::new(7);
+    let (mut state, dir) = make_app_state(key, height, validator_set).await;
+    let execution_payload = fixture_execution_payload();
+    let payload = bytes::Bytes::from(execution_payload.as_ssz_bytes());
+    let value = Value::new(payload.clone());
+    let value_id = value.id();
+    state
+        .store_undecided_value(
+            &ProposedValue {
+                height,
+                round,
+                valid_round: stale_valid_round,
+                proposer: state.address,
+                value,
+                validity: Validity::Valid,
+            },
+            payload,
+        )
+        .await
+        .unwrap();
+
+    let engine = make_test_engine(dir.path());
+    let config = state.emerald_config.clone();
+    let (channels, mut network_rx) = make_network_channels();
+    let (reply, response) = tokio::sync::oneshot::channel();
+    on_get_value(
+        AppMsg::GetValue {
+            height,
+            round,
+            timeout: Duration::from_millis(1),
+            reply,
+        },
+        &mut state,
+        &channels,
+        &engine,
+        &config,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.await.unwrap().value.id(), value_id);
+    drop(channels);
+
+    let NetworkMsg::PublishProposalPart(first_message) = network_rx.recv().await.unwrap();
+    let init = first_message
+        .content
+        .as_data()
+        .and_then(ProposalPart::as_init)
+        .unwrap();
+    assert_eq!(init.pol_round, Round::Nil);
+
+    let stored = state
+        .store
+        .get_undecided_record(height, round, value_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.proposal.valid_round, Round::Nil);
+    assert_eq!(stored.attestation.unwrap().init.pol_round, Round::Nil);
+}
+
+#[tokio::test]
+async fn received_valid_round_conflict_is_not_delivered_to_consensus() {
+    let key = PrivateKey::from_slice(&[12; 32]).unwrap();
+    let validator_set = ValidatorSet::new([Validator::new(key.public_key(), 1)]);
+    let height = Height::new(1);
+    let round = Round::new(10);
+    let (mut proposer, _proposer_dir) =
+        make_app_state(key.clone(), height, validator_set.clone()).await;
+    proposer.consensus_round = round;
+    let execution_payload = fixture_execution_payload();
+    let block_hash = execution_payload.payload_inner.payload_inner.block_hash;
+    let payload = bytes::Bytes::from(execution_payload.as_ssz_bytes());
+    let value = Value::new(payload.clone());
+    let value_id = value.id();
+    let canonical_stream = proposer
+        .stream_proposal(
+            LocallyProposedValue::new(height, round, value),
+            payload,
+            Round::Nil,
+        )
+        .await
+        .unwrap();
+    let mut conflicting_stream = canonical_stream.clone();
+    conflicting_stream
+        .iter_mut()
+        .find_map(|message| match &mut message.content {
+            StreamContent::Data(ProposalPart::Init(init)) => Some(init),
+            _ => None,
+        })
+        .unwrap()
+        .pol_round = Round::new(7);
+
+    let (mut receiver, receiver_dir) = make_app_state(key, height, validator_set).await;
+    receiver.consensus_round = round;
+    receiver
+        .validated_cache_mut()
+        .insert(block_hash, Validity::Valid);
+    let receiver_engine = make_test_engine(receiver_dir.path());
+
+    let accepted = receive_stream_result(&mut receiver, &receiver_engine, canonical_stream).await;
+    assert!(accepted.is_some());
+    let rejected = receive_stream_result(&mut receiver, &receiver_engine, conflicting_stream).await;
+    assert!(rejected.is_none());
+
+    let stored = receiver
+        .store
+        .get_undecided_record(height, round, value_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.proposal.valid_round, Round::Nil);
+    assert_eq!(stored.attestation.unwrap().init.pol_round, Round::Nil);
 }
