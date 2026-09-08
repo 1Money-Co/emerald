@@ -623,8 +623,10 @@ let write = UndecidedProposalWrite {
 ```
 
 Map `Canonical(value)` to `Some(value)`. Log `Conflict` at warning with height, round, value ID, stored and incoming
-proposers/POL rounds, and `conflict.field`, then return `Ok(None)`. Propagate `StoreError`, which makes
-`on_received_proposal_part` return before sending its reply.
+proposers/POL rounds, and `conflict.field`. For a `ValidRound`-only conflict, return the freshly verified incoming
+value without mutating storage; return `Ok(None)` for every other conflict. Propagate `StoreError`, which makes
+`on_received_proposal_part` return before sending its reply. This exception prevents an unsigned `pol_round`
+mutation from suppressing the later genuine stream while retaining first-writer storage bounds.
 
 - [ ] **Step 5: Convert local construction and streaming to the two-phase aggregate write**
 

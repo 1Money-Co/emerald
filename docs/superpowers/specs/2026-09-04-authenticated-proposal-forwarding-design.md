@@ -232,9 +232,9 @@ a later sync certificate can still recover it because `on_process_synced_value` 
 instead of failing on its defined `valid_round`.
 
 The reverse ordering remains intentionally asymmetric. If sync created nil-valid-round metadata first, a later
-attested stream with a defined `pol_round` conflicts rather than rewriting metadata already returned to consensus.
-The verified commit certificate already supplies the recovery path in that ordering, so declining to attach a
-different envelope does not block decision.
+attested stream with a defined `pol_round` does not rewrite metadata already returned to consensus. The aggregate
+remains unchanged, but the freshly signature- and payload-verified proposal is still returned to Malachite so a
+malleated first arrival cannot suppress the genuine proposal.
 
 #### Read contract
 
@@ -254,10 +254,12 @@ undecided proposal exists and is never used by itself to restore proposal metada
 
 ### Conflict Handling
 
-A completed stream that reaches a conflict outcome is dropped before replying to consensus. A correct proposer emits
-exactly one proposal per round, so a second stream that disagrees on `pol_round` or on payload bytes for the same key
-is either an equivocation or a mutated replay, and neither should reach consensus. This keeps Emerald's store and
-Malachite's retained proposal in agreement, since Malachite also keeps the first value it sees for the key.
+A completed stream that conflicts on proposer, value, payload, or attestation is dropped before replying to
+consensus. A `ValidRound`-only conflict is different because `pol_round` is not covered by the current proposal-part
+signature. After the incoming stream independently passes proposer selection, signature verification, and execution
+payload validation, Emerald returns that fresh proposal to Malachite without changing the first stored aggregate.
+Malachite retains distinct proposals and records equivocation, so suppressing the later verified proposal would add a
+per-round liveness denial without protecting consensus state.
 
 The first-writer rule is retained rather than replaced by multi-envelope storage. Keeping every distinct envelope
 would let an attacker mint unbounded rows per key by varying `pol_round`, which trades a coherence bug for a storage
@@ -265,8 +267,8 @@ exhaustion vector.
 
 All four write paths use the same function and therefore share these rules:
 
-- Received proposals, from `process_complete_proposal_parts`: one attested write. A conflict drops the stream and
-  returns no `ProposedValue`, so consensus never sees it.
+- Received proposals, from `process_complete_proposal_parts`: one attested write. A `ValidRound`-only conflict returns
+  the freshly verified `ProposedValue` without mutating storage; every other conflict returns no value.
 - Local proposals, from `propose_value` then `stream_proposal`: an unattested write followed by an attested one that
   backfills the envelope from the parts just built.
 - Locally rebuilt re-proposals, from the build branch in `prepare_restream_proposal` then `stream_proposal`: the same
@@ -279,11 +281,11 @@ Caller behavior is explicit so that a storage outcome cannot leave consensus and
 
 | Caller | Success | Conflict | Integrity or storage error |
 | ------ | ------- | -------- | -------------------------- |
-| Received stream | Reply `Some(canonical value)` | Warn and reply `None` | Return error; no reply |
+| Received stream | Reply `Some(canonical)` | Valid round: `Some(incoming)`; else `None` | Return error; no reply |
 | New local proposal | Prepare attested stream, then reply and publish | Return error; no reply or publish | Same |
 | Local re-proposal | Prepare attested stream, then publish | Return error; do not publish | Same |
 | Sync | Reply `Some(canonical value)` | Warn and reply `None` | Return error; no reply |
-| Foreign replay | Publish after all checks | Warn; publish nothing | Return error; publish nothing |
+| Foreign replay | Publish after all checks | Warn; publish nothing | Log and publish nothing |
 
 `stream_proposal` therefore becomes a fallible preparation step rather than an infallible iterator. It builds and
 signs the parts, performs the attested write, and returns the messages only after persistence succeeds. `on_get_value`
@@ -325,8 +327,8 @@ Dropping on mismatch is the safe failure. The node declines to forward rather th
 describes a different proposal than the one consensus locked, and it never lends its own delivery to a mutated
 envelope. The cost is a lost forwarding opportunity in exactly the case where a `pol_round`-mutated stream won the
 race into storage, which is a liveness consequence of the malleability tracked in [issue #322][issue-322], not of
-this design. The conflict rule in the coherence invariant makes that case rare by refusing the second stream
-outright.
+this design. The conflict rule preserves the bounded first-writer record while still returning a later independently
+verified stream to Malachite; only replay from the stored envelope remains unavailable for the conflicting identity.
 
 The replay branch loads the metadata, attestation, and payload from `(height, round, value_id)` and checks the same
 key, embedded-value, separate-payload, and envelope coherence invariant before publishing. It then emits
@@ -353,7 +355,8 @@ height and round as arguments instead, which also removes a nil-round unwrap.
 Validation is unchanged. A forwarded stream carries the original `init`, so `ProposalInit.proposer` is the proposer
 selected for `ProposalInit.round`, and `ProposalFin.signature` verifies against that validator's public key.
 `validate_proposal_parts` accepts it under its existing rules. The only receive-path change is the conflict rule in
-the coherence invariant, which drops a second stream that contradicts an already attested one.
+the coherence invariant: proposer, value, payload, and attestation conflicts are dropped, while a `ValidRound`-only
+conflict leaves storage unchanged and returns the freshly verified incoming proposal to Malachite.
 
 ### Scope of the Guarantee
 
@@ -375,8 +378,7 @@ Once #322 binds `pol_round` and `proposer` into the digest, the envelope becomes
 identity match degenerates into a consistency assertion.
 
 The forward arrives as a distinct `(peer_id, stream_id)` stream in `PartStreamsMap`, assembles to the same value, and
-is absorbed as a duplicate by the insert-if-absent write in `insert_undecided_proposal` and by
-`state.value_exists` in Malachite's `on_proposed_value`.
+is absorbed as a duplicate by the aggregate writer and by Malachite's proposal keeper.
 
 ### Data Flow
 
@@ -415,10 +417,9 @@ the stored and incoming identities and which field disagreed. On the current rel
 proposer equivocation or a `pol_round` mutation in flight, so the log line is the field signal that
 [issue #322][issue-322] is being exercised in anger. Once #322 lands, a conflict can only mean equivocation.
 
-An attestation present without its payload is a data-integrity failure, since the payload is always written before
-the metadata and attestation that describe it. It returns a contextual error through the consensus-message
-processing path rather than being treated as a normal missing proposal, matching the existing treatment of missing
-block data.
+An attestation present without its payload is a data-integrity failure. Proposal receive and sync callers propagate
+that error before replying. Restream handling logs verification, integrity, and storage failures and publishes
+nothing, because failure of a liveness backstop must not terminate the long-running application task.
 
 The same integrity-error path handles metadata whose embedded value disagrees with either its storage key or its
 separate block-data payload. Neither backfill nor replay proceeds until all persisted copies agree.
@@ -516,8 +517,8 @@ the acceptance test for issue #317; the narrower tests below localize failures w
    effect's valid round. Assert the drop branch is taken and nothing is published, rather than the stored envelope
    being replayed under a different identity than the one consensus requested.
 6. Conflict rule: a second complete stream for an already attested `(height, round, value_id)` with a different
-   `init.pol_round` is dropped before reaching consensus, and neither the stored metadata nor the stored attestation
-   changes.
+   `init.pol_round` leaves the stored metadata and attestation unchanged but returns the freshly verified incoming
+   proposal to Malachite.
 7. Drop branch: no attestation and a foreign proposer address. Assert nothing is published.
 8. Regression: a round-0 proposal and a proposer-driven re-proposal with a defined `valid_round` produce the parts
    the current release produces, including nil `pol_round` handling.
@@ -533,8 +534,8 @@ Storage transition tests, covering each cell of the state machine:
     nothing.
 13. Backfill: coherent payload and metadata exist with no attestation, as after an upgrade, a local two-phase write,
     or a synced value, and a matching attested write backfills only the attestation.
-14. Backfill conflict: an attested write whose `init.pol_round` disagrees with the stored `valid_round` is refused;
-    no record changes and consensus receives no `ProposedValue`.
+14. Backfill conflict: an attested write whose `init.pol_round` disagrees with the stored `valid_round` leaves the
+    record unchanged but returns the freshly verified incoming proposal to Malachite.
 15. Payload disagreement on an attested proposal: a write whose payload bytes differ from the stored payload for the
     same key is refused, covering two payloads that share a `value_id`.
 16. Orphan with equal bytes: a payload written without metadata is completed by the next write of either shape.
@@ -587,8 +588,8 @@ nodes, and the backstop strengthens incrementally as validators upgrade.
 
 The new redb table is created on first open, and no migration pass is run over existing data. Undecided proposals
 carried across the upgrade have no attestation, so they cannot be forwarded until one is backfilled by a matching
-stream for the same key. Their behavior is otherwise unchanged, which makes the worst case for a node restarting
-mid-height the current behavior rather than a regression.
+stream for the same key. Some legacy locally rebuilt rows can disagree with a subsequently received proposer and
+remain unforwardable for that height; operators need no migration, and the condition disappears as consensus advances.
 
 The first access to a legacy record also validates the payload embedded in `ProposedValue` against the separate
 block-data record. A mismatch is surfaced as an integrity error rather than guessed or migrated; creating one

@@ -217,8 +217,9 @@ pub async fn on_get_value(
 
     // Here it is important that, if we have previously built a value for this height and round,
     // we send back the very same value.
-    let (proposal, bytes) = match state.get_previously_built_value(height, round).await? {
-        Some(proposal) => {
+    let (proposal, bytes, pol_round) = match state.get_previously_built_value(height, round).await?
+    {
+        Some((proposal, valid_round)) => {
             info!(value = %proposal.value.id(), "Re-using previously built value");
             // Fetch the block data for the previously built value
             let bytes = state
@@ -226,7 +227,7 @@ pub async fn on_get_value(
                 .get_block_data(height, round, proposal.value.id())
                 .await?
                 .ok_or_else(|| eyre!("Block data not found for previously built value"))?;
-            (proposal, bytes)
+            (proposal, bytes, valid_round)
         }
         None => {
             // Check if the execution client is syncing and behind the consensus height
@@ -267,14 +268,11 @@ pub async fn on_get_value(
                 let proposal: LocallyProposedValue<EmeraldContext> =
                     state.propose_value(height, round, bytes.clone()).await?;
 
-                (proposal, bytes)
+                (proposal, bytes, Round::Nil)
             }
         }
     };
 
-    // The POL round is always nil when we propose a newly built value.
-    // See L15/L18 of the Tendermint algorithm.
-    let pol_round = Round::Nil;
     let stream_messages = state
         .stream_proposal(proposal.clone(), bytes, pol_round)
         .await?;
@@ -888,12 +886,20 @@ pub async fn on_restream_proposal(
         unreachable!("on_restream_proposal called with non-RestreamProposal message");
     };
 
-    match state
+    let attested_replay = match state
         .prepare_attested_replay(height, round, valid_round, address, value_id)
-        .await?
+        .await
     {
+        Ok(replay) => replay,
+        Err(error) => {
+            error!(%height, %round, %valid_round, %address, %value_id, %error, "Failed to prepare authenticated proposal replay");
+            return Ok(());
+        }
+    };
+
+    match attested_replay {
         AttestedReplay::Ready(parts) => {
-            info!(%height, %round, %value_id, "Replaying authenticated proposal");
+            info!(%height, %round, %address, %value_id, "Replaying authenticated proposal");
             for stream_message in state.make_stream_messages(height, round, parts) {
                 channels
                     .network
@@ -932,13 +938,28 @@ pub async fn on_restream_proposal(
     };
     info!(%height, %proposal_round, "Restreaming existing proposal...");
 
-    match state
+    let local_reproposal = match state
         .prepare_restream_proposal(height, proposal_round, round, value_id)
-        .await?
+        .await
     {
+        Ok(proposal) => proposal,
+        Err(error) => {
+            error!(%height, %round, %proposal_round, %value_id, %error, "Failed to prepare local proposal restream");
+            return Ok(());
+        }
+    };
+
+    match local_reproposal {
         Some((proposal, bytes)) => {
             info!(value = %proposal.value.id(), "Re-using previously built value");
-            for stream_message in state.stream_proposal(proposal, bytes, valid_round).await? {
+            let stream_messages = match state.stream_proposal(proposal, bytes, valid_round).await {
+                Ok(messages) => messages,
+                Err(error) => {
+                    error!(%height, %round, %proposal_round, %value_id, %error, "Failed to authenticate local proposal restream");
+                    return Ok(());
+                }
+            };
+            for stream_message in stream_messages {
                 debug!(%height, %round, "Streaming proposal part: {stream_message:?}");
                 channels
                     .network

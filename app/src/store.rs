@@ -540,7 +540,7 @@ impl Db {
                     table.insert(key, attestation_bytes.to_vec())?;
                     write_bytes += attestation_bytes.len() as u64;
                 }
-                UndecidedWriteOutcome::Canonical(write.proposal.clone())
+                UndecidedWriteOutcome::Canonical(write.proposal)
             }
             (Some(orphan), None, None) => {
                 if orphan != write.payload {
@@ -558,7 +558,7 @@ impl Db {
                     table.insert(key, attestation_bytes.to_vec())?;
                     write_bytes += attestation_bytes.len() as u64;
                 }
-                UndecidedWriteOutcome::Canonical(write.proposal.clone())
+                UndecidedWriteOutcome::Canonical(write.proposal)
             }
             (Some(payload), Some(proposal), attestation) => {
                 let stored = Self::validate_stored_record(key, proposal, payload, attestation)?;
@@ -588,6 +588,7 @@ impl Db {
         Ok(outcome)
     }
 
+    #[cfg(test)]
     fn insert_undecided_proposal(
         &self,
         proposal: ProposedValue<EmeraldContext>,
@@ -953,33 +954,6 @@ impl Db {
         Ok(None)
     }
 
-    fn insert_undecided_block_data(
-        &self,
-        height: Height,
-        round: Round,
-        value_id: ValueId,
-        data: Bytes,
-    ) -> Result<(), StoreError> {
-        let start = Instant::now();
-        let write_bytes = data.len() as u64;
-
-        let tx = self.db.begin_write()?;
-        {
-            let mut table = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
-            let key = (height, round, value_id);
-            // Only insert if no value exists at this key
-            if table.get(&key)?.is_none() {
-                table.insert(key, data.to_vec())?;
-            }
-        }
-        tx.commit()?;
-
-        self.metrics.observe_write_time(start.elapsed());
-        self.metrics.add_write_bytes(write_bytes);
-
-        Ok(())
-    }
-
     fn insert_decided_block_data(&self, height: Height, data: Bytes) -> Result<(), StoreError> {
         let start = Instant::now();
         let write_bytes = data.len() as u64;
@@ -1117,7 +1091,8 @@ impl Store {
 
     /// Stores an undecided proposal.
     /// Called by the application when receiving new proposals from peers.
-    pub async fn store_undecided_proposal(
+    #[cfg(test)]
+    pub(crate) async fn store_undecided_proposal(
         &self,
         value: ProposedValue<EmeraldContext>,
     ) -> Result<(), StoreError> {
@@ -1231,20 +1206,6 @@ impl Store {
     ) -> Result<Option<Bytes>, StoreError> {
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || db.get_block_data(height, round, value_id)).await?
-    }
-
-    pub async fn store_undecided_block_data(
-        &self,
-        height: Height,
-        round: Round,
-        value_id: ValueId,
-        data: Bytes,
-    ) -> Result<(), StoreError> {
-        let db = Arc::clone(&self.db);
-        tokio::task::spawn_blocking(move || {
-            db.insert_undecided_block_data(height, round, value_id, data)
-        })
-        .await?
     }
 
     pub async fn store_decided_block_data(

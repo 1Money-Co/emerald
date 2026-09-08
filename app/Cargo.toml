@@ -55,4 +55,6 @@ humantime-serde = { workspace = true }
 tikv-jemallocator = "0.6"
 
 [dev-dependencies]
+malachitebft-core-consensus = { workspace = true }
+malachitebft-metrics = { workspace = true }
 tempfile = "3"
