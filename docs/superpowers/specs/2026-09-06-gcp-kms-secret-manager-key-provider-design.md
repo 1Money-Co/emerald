@@ -237,8 +237,8 @@ Authentication uses ADC only. This naturally supports:
 
 The validator runtime identity needs only:
 
-- permission to access the configured Secret Manager version, normally through
-  `roles/secretmanager.secretAccessor`; and
+- `roles/secretmanager.secretAccessor` on the configured secret, whose versions
+  inherit its IAM policy; and
 - permission to decrypt with the configured CryptoKey, normally through
   `roles/cloudkms.cryptoKeyDecrypter`.
 
@@ -327,9 +327,12 @@ dependency set:
 - the compatible GAX/Auth versions selected and locked by Cargo; and
 - an explicit CRC32C dependency used directly by production code.
 
-The service crates require Rust 1.86. Emerald currently declares Rust 1.83 while its
-Docker build already uses Rust 1.90 and CI uses the current stable toolchain. Update
-the workspace `rust-version` to 1.86 so package metadata states the real minimum.
+The service crates themselves require Rust 1.86, but the locked GCP transitive
+dependencies require Rust 1.88 and the existing default AWS graph requires Rust
+1.91.1. The supported workspace MSRV and Docker toolchain are therefore Rust
+1.91.1. CI checks the locked workspace and key-provider feature combinations on
+that exact version. Keep the dependency versions rather than downgrading the
+AWS and GCP graphs to preserve the original, unbuildable Rust 1.86 declaration.
 
 Before merging, verify the final lockfile rather than assuming l1client's complete
 dependency graph can be copied. Emerald already contains AWS SDK, rustls 0.21/0.23,

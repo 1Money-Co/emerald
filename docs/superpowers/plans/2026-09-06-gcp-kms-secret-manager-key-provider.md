@@ -19,7 +19,7 @@
 - GCP is startup-only; recurring signing remains local.
 - Preserve File and AWS behavior and public API.
 - Default builds include `aws-sm-kms` and `gcp-sm-kms`; file-only builds remain possible.
-- Use Google Secret Manager/KMS `=1.8.0` as the starting SDK generation and declare Rust 1.86 as the real MSRV.
+- Use Google Secret Manager/KMS `=1.8.0` as the starting SDK generation and Rust 1.91.1 as the supported MSRV, matching the locked default AWS graph.
 - Do not change config generators, ceremony scripts, consensus, storage, Reth or Solidity.
 - Do not commit until the user explicitly requests a commit.
 
@@ -57,7 +57,7 @@ Run: `cargo test -p malachitebft-eth-cli emerald_config_parses_gcp_sm_kms_key_pr
 
 - [x] **Step 3: Add the feature, dependencies, config struct and enum variant**
 
-Add `gcp-sm-kms`, make both cloud backends default, and add the approved three-field struct. Update workspace MSRV to 1.86 and add exact Google service dependencies plus `crc32c`/`bytes` where directly used.
+Add `gcp-sm-kms`, make both cloud backends default, and add the approved three-field struct. Update workspace MSRV and the Docker toolchain to 1.91.1 and add exact Google service dependencies plus `crc32c`/`bytes` where directly used.
 
 - [x] **Step 4: Run the focused TOML test and confirm it passes**
 

@@ -300,10 +300,8 @@ fn parse_secret_material(payload: &[u8]) -> Result<Zeroizing<[u8; 32]>, GcpSmKms
     // parser deliberately differs from l1client's `parse_secret_payload` over the
     // same ceremony secrets. Update that file alongside any change here.
     //
-    // Surrounding whitespace is an artifact of how the secret was written (`echo`
-    // appends a newline), not of the key material, so drop it before decoding.
-    // This matches `AwsSmKmsKeyProvider`; l1client rejects such a payload.
-    let payload = str::from_utf8(payload)?.trim();
+    // Preserve the shared l1client envelope contract: do not trim key material.
+    let payload = str::from_utf8(payload)?;
     let bare_hex_error = match decode_hex_material(payload) {
         Ok(material) => return exact_key(material),
         Err(error) => error,

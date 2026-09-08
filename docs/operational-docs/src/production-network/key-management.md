@@ -101,11 +101,15 @@ exported into the node's environment. There is no way to point at a service-acco
 
 The runtime identity needs exactly two permissions:
 
-- `roles/secretmanager.secretAccessor` on the configured secret version
+- `roles/secretmanager.secretAccessor` on the configured secret
 - `roles/cloudkms.cryptoKeyDecrypter` on the configured CryptoKey
 
 Secret creation, secret update and KMS *encrypt* permissions are not required and should not be
 granted.
+
+Secret versions inherit the secret's IAM policy. The numeric `secret_version` selects what Emerald
+reads; it does not restrict the identity's IAM permissions to that version. See
+[Google's access guidance](https://docs.cloud.google.com/secret-manager/docs/access-secret-version).
 
 ### What the secret must contain
 
@@ -115,14 +119,13 @@ not plaintext key material.
 
 The canonical decrypted plaintext is lowercase hex for the 32 key bytes, with no `0x` prefix. For
 compatibility with the 1Money L1 loader, a `0x`/`0X` prefix, uppercase hex digits, and a JSON object
-with a string `private_key`, `privateKey` or `key` field are also accepted. Whitespace around the
-payload is trimmed, so a secret written with `echo` rather than `printf` still loads.
+with a string `private_key`, `privateKey` or `key` field are also accepted. Bare hex must not contain
+leading or trailing whitespace. Whitespace inside a JSON key string is also rejected; ordinary
+JSON formatting whitespace is accepted, matching the 1Money L1 loader.
 
 > [!NOTE]
-> The 1Money L1 loader is stricter here: it does **not** trim, so a payload with a trailing newline
-> loads in Emerald but fails on the L1 node reading the same secret. If both run against one
-> ceremony key, write it without a trailing newline —
-> `printf '%s' "$hex" | gcloud kms encrypt ...` — so it is accepted by both.
+> Write ceremony key material without a trailing newline:
+> `printf '%s' "$hex" | gcloud kms encrypt ...`. Neither GCP loader trims bare hex.
 
 Emerald verifies the CRC32C checksums both services return, and sends request checksums for the
 ciphertext and the AAD. A checksum mismatch aborts startup before the material is used.
