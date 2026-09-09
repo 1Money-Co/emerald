@@ -195,9 +195,9 @@ Run focused migration, deduplication, restream, decision, and pruning tests firs
 The change is local persistent-storage behavior. It changes no consensus or network encoding, so mixed-version nodes
 remain wire-compatible and can be upgraded one at a time while preserving the validator availability threshold.
 
-Before upgrading each node, operators must stop it cleanly, back up `store.redb`, and verify temporary free space for
-approximately one deduplicated payload set plus redb overhead. Migration copies unique rows before deleting the legacy
-table, so that headroom is required even when the old table contains many duplicates.
+Before upgrading each node, operators must stop it cleanly, back up `<home>/store.db`, and verify temporary free space
+for approximately one deduplicated payload set plus redb overhead. Migration copies unique rows before deleting the
+legacy table, so that headroom is required even when the old table contains many duplicates.
 
 Deleting the legacy table frees its redb pages for reuse but may not immediately shrink the database file on the
 filesystem. Startup will not invoke redb's potentially slow full compaction. If returning file space to the filesystem

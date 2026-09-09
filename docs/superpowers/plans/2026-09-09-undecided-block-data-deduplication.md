@@ -1078,12 +1078,19 @@ The first startup with the round-independent payload schema migrates the local r
 Before upgrading each node:
 
 1. Stop Emerald cleanly.
-2. Back up `store.redb`.
+2. Back up `<home>/store.db`.
 3. Reserve temporary free space for approximately one deduplicated undecided payload set plus redb overhead.
 4. Start the new binary and wait for the `undecided_block_data_migration` event before upgrading another validator.
 
+Migration copies every unique payload into the v2 table before deleting the legacy table in the same transaction.
+That temporary copy requires headroom even when many legacy rows are duplicates; deduplication reduces the copied set,
+but it does not let redb reclaim the legacy pages until the transaction commits.
+
 If legacy rows use the same `(height, value_id)` with different bytes, startup fails without changing the legacy
-table. Investigate or restore the backup; the node must not choose either payload automatically.
+table. The error and structured log identify both available rounds and payload lengths without logging payload bytes.
+Emerald has no safe automated repair for this corrupted state: preserve the database and logs for diagnosis, or
+restore the backup and continue with the previous binary. Do not delete either row without determining the
+authoritative payload.
 
 The migration is one-way. To run an older Emerald binary, restore the database backup taken before the upgrade.
 Deleting the legacy table frees redb pages for reuse but might not reduce the file size immediately. Startup does not

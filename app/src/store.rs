@@ -1,6 +1,7 @@
 #![allow(clippy::result_large_err)]
 
 use core::mem::size_of;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -83,6 +84,23 @@ pub enum StoreError {
 
     #[error("Conflicting undecided block data at height {height}, value {value_id}")]
     ConflictingUndecidedBlockData { height: Height, value_id: ValueId },
+
+    #[error("Conflicting decided block data at height {height}")]
+    ConflictingDecidedBlockData { height: Height },
+
+    #[error(
+        "Conflicting legacy undecided block data at height {height}, value {value_id}: \
+         existing round {existing_round}, incoming round {incoming_round}, \
+         existing length {existing_len}, incoming length {incoming_len}"
+    )]
+    ConflictingLegacyUndecidedBlockData {
+        height: Height,
+        value_id: ValueId,
+        existing_round: String,
+        incoming_round: Round,
+        existing_len: usize,
+        incoming_len: usize,
+    },
 }
 
 const CERTIFICATES_TABLE: redb::TableDefinition<'_, HeightKey, Vec<u8>> =
@@ -297,14 +315,21 @@ impl Db {
         let value = ProtobufCodec.encode(&proposal)?;
 
         let tx = self.db.begin_write()?;
-        {
+        let inserted = {
             let mut table = tx.open_table(UNDECIDED_PROPOSALS_TABLE)?;
             // Keep the first accepted proposal authoritative for this key. Restream preparation may later try to
             // persist locally reconstructed metadata for the same value; overwriting the original proposer would
             // violate the proposer identity expected by consensus.
             if table.get(&key)?.is_none() {
                 table.insert(key, value.to_vec())?;
+                true
+            } else {
+                false
             }
+        };
+
+        if !inserted {
+            return Ok(());
         }
         tx.commit()?;
 
@@ -591,32 +616,51 @@ impl Db {
         tx: &redb::WriteTransaction,
     ) -> Result<UndecidedBlockDataMigrationStats, StoreError> {
         let mut stats = UndecidedBlockDataMigrationStats::default();
+        let mut migrated_rounds: BTreeMap<(Height, ValueId), Round> = BTreeMap::new();
         {
             let legacy = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
             let mut target = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
             for entry in legacy.iter()? {
                 let (legacy_key, legacy_value) = entry?;
-                let (height, _round, value_id) = legacy_key.value();
+                let (height, round, value_id) = legacy_key.value();
                 let payload = legacy_value.value().to_vec();
                 let key = (height, value_id);
                 let existing = target.get(&key)?.map(|value| value.value().to_vec());
 
                 stats.legacy_rows += 1;
                 match existing {
-                    Some(existing) if existing == payload => stats.duplicate_payloads += 1,
-                    Some(_) => {
+                    Some(existing) if existing == payload => {
+                        stats.duplicate_payloads += 1;
+                        migrated_rounds.entry(key).or_insert(round);
+                    }
+                    Some(existing) => {
+                        let existing_round = migrated_rounds.get(&key).copied();
                         tracing::error!(
                             event = "undecided_block_data_migration_conflict",
                             %height,
                             value = %value_id,
+                            existing_round = ?existing_round,
+                            incoming_round = %round,
+                            existing_len = existing.len(),
+                            incoming_len = payload.len(),
                             "Conflicting legacy undecided block data"
                         );
-                        return Err(StoreError::ConflictingUndecidedBlockData { height, value_id });
+                        return Err(StoreError::ConflictingLegacyUndecidedBlockData {
+                            height,
+                            value_id,
+                            existing_round: existing_round
+                                .map(|round| round.to_string())
+                                .unwrap_or_else(|| "unknown (pre-existing v2 row)".to_owned()),
+                            incoming_round: round,
+                            existing_len: existing.len(),
+                            incoming_len: payload.len(),
+                        });
                     }
                     None => {
                         stats.inserted_payloads += 1;
                         stats.inserted_bytes += payload.len() as u64;
                         target.insert(key, payload)?;
+                        migrated_rounds.insert(key, round);
                     }
                 }
             }
@@ -759,21 +803,27 @@ impl Db {
 
     fn insert_decided_block_data(&self, height: Height, data: Bytes) -> Result<(), StoreError> {
         let start = Instant::now();
-        let write_bytes = data.len() as u64;
-
         let tx = self.db.begin_write()?;
-        {
+        let inserted = {
             let mut table = tx.open_table(DECIDED_BLOCK_DATA_TABLE)?;
-            // Only insert if no value exists at this key
-            if table.get(&height)?.is_none() {
-                table.insert(height, data.to_vec())?;
+            let existing = table.get(&height)?.map(|value| value.value().to_vec());
+            match existing {
+                Some(existing) if existing.as_slice() == data.as_ref() => false,
+                Some(_) => return Err(StoreError::ConflictingDecidedBlockData { height }),
+                None => {
+                    table.insert(height, data.to_vec())?;
+                    true
+                }
             }
+        };
+
+        if !inserted {
+            return Ok(());
         }
+
         tx.commit()?;
-
         self.metrics.observe_write_time(start.elapsed());
-        self.metrics.add_write_bytes(write_bytes);
-
+        self.metrics.add_write_bytes(data.len() as u64);
         Ok(())
     }
 
@@ -1205,11 +1255,17 @@ mod tests {
         );
 
         let error = db.initialize_schema().unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("existing round 0"), "{message}");
+        assert!(message.contains("incoming round 1"), "{message}");
+        assert!(message.contains("existing length 5"), "{message}");
+        assert!(message.contains("incoming length 9"), "{message}");
         assert!(matches!(
             error,
-            StoreError::ConflictingUndecidedBlockData {
+            StoreError::ConflictingLegacyUndecidedBlockData {
                 height: error_height,
                 value_id: error_value_id,
+                ..
             } if error_height == height && error_value_id == value_id
         ));
         assert!(has_table(&db, "undecided_block_data"));
@@ -1305,6 +1361,60 @@ mod tests {
         ));
         assert_eq!(
             db.get_undecided_block_data(height, value_id).unwrap(),
+            Some(original.clone())
+        );
+        assert_eq!(metrics.write_count(), 1);
+        assert_eq!(metrics.write_bytes(), original.len() as u64);
+    }
+
+    #[test]
+    fn undecided_proposal_duplicate_does_not_increment_write_metrics() {
+        let (db, _dir, metrics) = create_test_db_with_metrics("duplicate_proposal_metrics");
+        let proposal = make_proposed_value(7);
+
+        db.insert_undecided_proposal(proposal.clone()).unwrap();
+        let writes = metrics.write_count();
+        let bytes = metrics.write_bytes();
+        db.insert_undecided_proposal(proposal).unwrap();
+
+        assert_eq!(metrics.write_count(), writes);
+        assert_eq!(metrics.write_bytes(), bytes);
+    }
+
+    #[test]
+    fn decided_block_data_duplicate_does_not_increment_write_metrics() {
+        let (db, _dir, metrics) = create_test_db_with_metrics("duplicate_decided_metrics");
+        let height = Height::new(7);
+        let payload = Bytes::from_static(b"decided-payload");
+
+        db.insert_decided_block_data(height, payload.clone())
+            .unwrap();
+        let writes = metrics.write_count();
+        let bytes = metrics.write_bytes();
+        db.insert_decided_block_data(height, payload).unwrap();
+
+        assert_eq!(metrics.write_count(), writes);
+        assert_eq!(metrics.write_bytes(), bytes);
+    }
+
+    #[test]
+    fn decided_block_data_rejects_conflicting_bytes_without_overwrite() {
+        let (db, _dir, metrics) = create_test_db_with_metrics("conflicting_decided_payload");
+        let height = Height::new(7);
+        let original = Bytes::from_static(b"original");
+
+        db.insert_decided_block_data(height, original.clone())
+            .unwrap();
+        let error = db
+            .insert_decided_block_data(height, Bytes::from_static(b"conflict"))
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("Conflicting decided block data"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            db.get_decided_block_data(height).unwrap(),
             Some(original.clone())
         );
         assert_eq!(metrics.write_count(), 1);

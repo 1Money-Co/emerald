@@ -12,7 +12,7 @@ use malachitebft_app_channel::{AppMsg, Channels, NetworkMsg};
 use malachitebft_eth_cli::config::EmeraldConfig;
 use malachitebft_eth_engine::engine::Engine;
 use malachitebft_eth_engine::json_structures::ExecutionBlock;
-use malachitebft_eth_types::EmeraldContext;
+use malachitebft_eth_types::{EmeraldContext, Value};
 use ssz::{Decode, Encode};
 use tokio::time::Instant as TokioInstant;
 use tracing::{debug, error, info, warn};
@@ -596,7 +596,8 @@ async fn on_decided_inner(
     debug!("🎁 block size: {:?}, height: {}", block_bytes.len(), height);
 
     // Decode bytes into execution payload (a block) and get relevant fields
-    let execution_payload = ExecutionPayloadV3::from_ssz_bytes(&block_bytes).unwrap();
+    let execution_payload = ExecutionPayloadV3::from_ssz_bytes(&block_bytes)
+        .map_err(|error| eyre!("Failed to decode decided execution payload: {error:?}"))?;
     let block_hash = execution_payload.payload_inner.payload_inner.block_hash;
     let block_timestamp = execution_payload.timestamp();
     let block_number = execution_payload.payload_inner.payload_inner.block_number;
@@ -765,6 +766,29 @@ pub async fn on_process_synced_value(
 
     let block_bytes = value.extensions.clone();
 
+    if let Err(error) = ExecutionPayloadV3::from_ssz_bytes(&block_bytes) {
+        warn!(%height, %round, error = ?error, "Rejecting synced value with malformed execution payload");
+        if reply.send(None).is_err() {
+            error!(%height, %round, "Failed to send ProcessSyncedValue None reply");
+        }
+        return Ok(());
+    }
+
+    let derived_value_id = Value::new(block_bytes.clone()).id();
+    if derived_value_id != value.id() {
+        warn!(
+            %height,
+            %round,
+            certified_value = %value.id(),
+            derived_value = %derived_value_id,
+            "Rejecting synced value whose ID does not match its execution payload"
+        );
+        if reply.send(None).is_err() {
+            error!(%height, %round, "Failed to send ProcessSyncedValue None reply");
+        }
+        return Ok(());
+    }
+
     let proposed_value: ProposedValue<EmeraldContext> = ProposedValue {
         height,
         round,
@@ -775,9 +799,15 @@ pub async fn on_process_synced_value(
     };
 
     // Store block data so on_decided() can retrieve it when the Decided message arrives.
-    state
-        .store_undecided_value(&proposed_value, block_bytes)
-        .await?;
+    if !state
+        .store_peer_undecided_value(&proposed_value, block_bytes)
+        .await?
+    {
+        if reply.send(None).is_err() {
+            error!(%height, %round, "Failed to send ProcessSyncedValue None reply");
+        }
+        return Ok(());
+    }
 
     // Send to consensus to see if it has been decided on
     if reply.send(Some(proposed_value)).is_err() {
