@@ -783,6 +783,9 @@ pub async fn on_process_synced_value(
         return Ok(());
     }
 
+    // Defense in depth: `Value::from_proto` already binds the ID to `extensions`. Keep this check at
+    // the application boundary because a mismatch entering Malachite can poison its first-write-wins
+    // proposal keeper and later panic when the certified payload is decided.
     let derived_value_id = Value::new(block_bytes.clone()).id();
     if derived_value_id != proposed_value.value.id() {
         warn!(
