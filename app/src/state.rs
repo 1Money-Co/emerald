@@ -269,8 +269,11 @@ impl State {
         let certificate = decided_value.certificate;
 
         let raw_block_data = self
-            .get_block_data(certificate.height, certificate.round, certificate.value_id)
+            .store
+            .get_decided_block_data(certificate.height)
             .await
+            .ok()
+            .flatten()
             .expect("state: certificate should have associated block data");
         debug!(
             "🎁 block size: {:?}, height: {}",
@@ -499,15 +502,14 @@ impl State {
         Ok(Some(parts))
     }
 
-    /// Retrieves a decided block data at the given height
-    pub async fn get_block_data(
+    /// Retrieves undecided block data at the given height and value ID.
+    pub async fn get_undecided_block_data(
         &self,
         height: Height,
-        round: Round,
         value_id: ValueId,
     ) -> Option<Bytes> {
         self.store
-            .get_block_data(height, round, value_id)
+            .get_undecided_block_data(height, value_id)
             .await
             .ok()
             .flatten()
@@ -526,7 +528,7 @@ impl State {
         data: Bytes,
     ) -> eyre::Result<()> {
         self.store
-            .store_undecided_block_data(value.height, value.round, value.value.id(), data)
+            .store_undecided_block_data(value.height, value.value.id(), data)
             .await?;
         self.store.store_undecided_proposal(value.clone()).await?;
         Ok(())
@@ -566,7 +568,7 @@ impl State {
         // Get block data for decided value
         let block_data = self
             .store
-            .get_block_data(certificate.height, certificate.round, certificate.value_id)
+            .get_undecided_block_data(certificate.height, certificate.value_id)
             .await?;
 
         // Log first 32 bytes of block data with JNT prefix
@@ -672,7 +674,7 @@ impl State {
 
         let bytes = self
             .store
-            .get_block_data(height, proposal_round, value_id)
+            .get_undecided_block_data(height, value_id)
             .await?
             .ok_or_else(|| {
                 eyre::eyre!(
@@ -941,13 +943,14 @@ pub fn decode_value(bytes: Bytes) -> Result<Value, ProtoError> {
 
 #[cfg(test)]
 mod tests {
+    use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2};
     use malachitebft_app_channel::{AppMsg, Channels, NetworkMsg};
     use malachitebft_eth_types::secp256k1::PrivateKey;
     use malachitebft_eth_types::Validator;
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::app::on_restream_proposal;
+    use crate::app::{on_process_synced_value, on_restream_proposal};
     use crate::metrics::{DbMetrics, Metrics};
 
     async fn make_test_state() -> (State, tempfile::TempDir) {
@@ -995,6 +998,33 @@ jwt_token_path = "./assets/jwt.hex"
         );
 
         (state, dir)
+    }
+
+    fn make_execution_payload_bytes() -> Bytes {
+        let payload = ExecutionPayloadV3 {
+            payload_inner: ExecutionPayloadV2 {
+                payload_inner: ExecutionPayloadV1 {
+                    parent_hash: Default::default(),
+                    fee_recipient: Default::default(),
+                    state_root: Default::default(),
+                    receipts_root: Default::default(),
+                    logs_bloom: Default::default(),
+                    prev_randao: Default::default(),
+                    block_number: 1,
+                    gas_limit: 30_000_000,
+                    gas_used: 0,
+                    timestamp: 1,
+                    extra_data: Default::default(),
+                    base_fee_per_gas: Default::default(),
+                    block_hash: Default::default(),
+                    transactions: Vec::new(),
+                },
+                withdrawals: Vec::new(),
+            },
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+        };
+        Bytes::from(payload.as_ssz_bytes())
     }
 
     fn make_test_channels() -> (
@@ -1084,11 +1114,29 @@ jwt_token_path = "./assets/jwt.hex"
 
         let current_round_bytes = state
             .store
-            .get_block_data(height, current_round, value.id())
+            .get_undecided_block_data(height, value.id())
             .await
             .unwrap()
             .expect("restreamed block data must be stored at the current round");
         assert_eq!(current_round_bytes, bytes);
+
+        let round_two = Round::new(2);
+        let (round_two_value, round_two_bytes) = state
+            .prepare_restream_proposal(height, proposal_round, round_two, value.id())
+            .await
+            .unwrap()
+            .expect("round-two restream must reuse the stored value");
+        assert_eq!(round_two_value.round, round_two);
+        assert_eq!(round_two_bytes, bytes);
+        for round in [proposal_round, current_round, round_two] {
+            assert!(state
+                .store
+                .get_undecided_proposal(height, round, value.id())
+                .await
+                .unwrap()
+                .is_some());
+        }
+        assert_eq!(state.store.undecided_block_data_len().await.unwrap(), 1);
 
         drop(channels);
         let init = proposal_init.await.unwrap();
@@ -1097,6 +1145,82 @@ jwt_token_path = "./assets/jwt.hex"
         assert_eq!(init.round, current_round);
         assert_eq!(init.pol_round, proposal_round);
         assert_eq!(init.proposer, state.address);
+    }
+
+    #[tokio::test]
+    async fn shared_undecided_block_data_commits_from_later_round() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let source_round = Round::new(0);
+        let decided_round = Round::new(2);
+        let bytes = make_execution_payload_bytes();
+        let value = Value::new(bytes.clone());
+        let proposal = ProposedValue {
+            height,
+            round: source_round,
+            valid_round: Round::Nil,
+            proposer: state.address,
+            value: value.clone(),
+            validity: Validity::Valid,
+        };
+        state
+            .store_undecided_value(&proposal, bytes.clone())
+            .await
+            .unwrap();
+        state
+            .prepare_restream_proposal(height, source_round, decided_round, value.id())
+            .await
+            .unwrap()
+            .unwrap();
+
+        state
+            .commit(CommitCertificate {
+                height,
+                round: decided_round,
+                value_id: value.id(),
+                commit_signatures: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state.store.get_decided_block_data(height).await.unwrap(),
+            Some(bytes)
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_undecided_block_data_stores_synced_value() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(3);
+        let bytes = make_execution_payload_bytes();
+        let value = Value::new(bytes.clone());
+        let value_bytes = ProtobufCodec.encode(&value).unwrap();
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+
+        on_process_synced_value(
+            AppMsg::ProcessSyncedValue {
+                height,
+                round,
+                proposer: state.address,
+                value_bytes,
+                reply,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(receiver.await.unwrap().unwrap().value, value);
+        assert_eq!(
+            state
+                .store
+                .get_undecided_block_data(height, value.id())
+                .await
+                .unwrap(),
+            Some(bytes)
+        );
     }
 
     #[tokio::test]

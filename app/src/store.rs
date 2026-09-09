@@ -97,6 +97,7 @@ const UNDECIDED_PROPOSALS_TABLE: redb::TableDefinition<'_, UndecidedValueKey, Ve
 const DECIDED_BLOCK_DATA_TABLE: redb::TableDefinition<'_, HeightKey, Vec<u8>> =
     redb::TableDefinition::new("decided_block_data");
 
+#[allow(dead_code)]
 const LEGACY_UNDECIDED_BLOCK_DATA_TABLE: redb::TableDefinition<'_, UndecidedValueKey, Vec<u8>> =
     redb::TableDefinition::new("undecided_block_data");
 
@@ -449,7 +450,7 @@ impl Db {
             undecided.retain(|k, _| k.0 >= block_data_retain_height)?;
 
             // Remove all undecided block data with height < retain_height
-            let mut undecided_block_data = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
+            let mut undecided_block_data = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
             undecided_block_data.retain(|k, _| k.0 >= block_data_retain_height)?;
 
             // Remove all pending proposal parts with height < retain_height
@@ -612,72 +613,20 @@ impl Db {
             .and_then(|(t, c)| elapsed_seconds.map(|e| (t, c, e))))
     }
 
-    fn get_block_data(
-        &self,
-        height: Height,
-        round: Round,
-        value_id: ValueId,
-    ) -> Result<Option<Bytes>, StoreError> {
+    fn get_decided_block_data(&self, height: Height) -> Result<Option<Bytes>, StoreError> {
         let start = Instant::now();
-
         let tx = self.db.begin_read()?;
-
-        // Try undecided block data first
-        let undecided_table = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
-        if let Some(data) = undecided_table.get(&(height, round, value_id))? {
-            let bytes = data.value();
-            let read_bytes = bytes.len() as u64;
-            self.metrics.observe_read_time(start.elapsed());
-            self.metrics.add_read_bytes(read_bytes);
-            self.metrics.add_key_read_bytes(
-                (size_of::<Height>() + size_of::<Round>() + size_of::<ValueId>()) as u64,
-            );
-            return Ok(Some(Bytes::copy_from_slice(&bytes)));
-        }
-
-        // Then try decided block data
-        let decided_table = tx.open_table(DECIDED_BLOCK_DATA_TABLE)?;
-        if let Some(data) = decided_table.get(&height)? {
-            let bytes = data.value();
-            let read_bytes = bytes.len() as u64;
-            self.metrics.observe_read_time(start.elapsed());
-            self.metrics.add_read_bytes(read_bytes);
-            self.metrics.add_key_read_bytes(size_of::<Height>() as u64);
-            return Ok(Some(Bytes::copy_from_slice(&bytes)));
-        }
-
+        let table = tx.open_table(DECIDED_BLOCK_DATA_TABLE)?;
+        let value = table
+            .get(&height)?
+            .map(|data| Bytes::copy_from_slice(&data.value()));
         self.metrics.observe_read_time(start.elapsed());
-        Ok(None)
+        self.metrics
+            .add_read_bytes(value.as_ref().map_or(0, |bytes| bytes.len() as u64));
+        self.metrics.add_key_read_bytes(size_of::<Height>() as u64);
+        Ok(value)
     }
 
-    fn insert_legacy_undecided_block_data(
-        &self,
-        height: Height,
-        round: Round,
-        value_id: ValueId,
-        data: Bytes,
-    ) -> Result<(), StoreError> {
-        let start = Instant::now();
-        let write_bytes = data.len() as u64;
-
-        let tx = self.db.begin_write()?;
-        {
-            let mut table = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
-            let key = (height, round, value_id);
-            // Only insert if no value exists at this key
-            if table.get(&key)?.is_none() {
-                table.insert(key, data.to_vec())?;
-            }
-        }
-        tx.commit()?;
-
-        self.metrics.observe_write_time(start.elapsed());
-        self.metrics.add_write_bytes(write_bytes);
-
-        Ok(())
-    }
-
-    #[allow(dead_code)]
     fn get_undecided_block_data(
         &self,
         height: Height,
@@ -698,7 +647,6 @@ impl Db {
         Ok(value)
     }
 
-    #[allow(dead_code)]
     fn insert_undecided_block_data(
         &self,
         height: Height,
@@ -964,28 +912,38 @@ impl Store {
         .await?
     }
 
-    pub async fn get_block_data(
+    pub async fn get_decided_block_data(
         &self,
         height: Height,
-        round: Round,
+    ) -> Result<Option<Bytes>, StoreError> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || db.get_decided_block_data(height)).await?
+    }
+
+    pub async fn get_undecided_block_data(
+        &self,
+        height: Height,
         value_id: ValueId,
     ) -> Result<Option<Bytes>, StoreError> {
         let db = Arc::clone(&self.db);
-        tokio::task::spawn_blocking(move || db.get_block_data(height, round, value_id)).await?
+        tokio::task::spawn_blocking(move || db.get_undecided_block_data(height, value_id)).await?
     }
 
     pub async fn store_undecided_block_data(
         &self,
         height: Height,
-        round: Round,
         value_id: ValueId,
         data: Bytes,
     ) -> Result<(), StoreError> {
         let db = Arc::clone(&self.db);
-        tokio::task::spawn_blocking(move || {
-            db.insert_legacy_undecided_block_data(height, round, value_id, data)
-        })
-        .await?
+        tokio::task::spawn_blocking(move || db.insert_undecided_block_data(height, value_id, data))
+            .await?
+    }
+
+    #[cfg(test)]
+    pub async fn undecided_block_data_len(&self) -> Result<u64, StoreError> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || db.undecided_block_data_len()).await?
     }
 
     pub async fn store_decided_block_data(
@@ -1187,14 +1145,20 @@ mod tests {
             db.insert_undecided_proposal(proposal).unwrap();
 
             // Undecided block data table
-            db.insert_legacy_undecided_block_data(
+            db.insert_undecided_block_data(
                 Height::new(h),
-                Round::new(0),
                 ValueId::new(h),
                 Bytes::from(vec![h as u8; 40]),
             )
             .unwrap();
         }
+
+        db.insert_undecided_block_data(
+            Height::new(3),
+            ValueId::new(33),
+            Bytes::from_static(b"second-surviving-payload"),
+        )
+        .unwrap();
 
         // Verify all data is present before pruning
         for h in 1..=4u64 {
@@ -1209,7 +1173,7 @@ mod tests {
                 "certificate at height {h} should exist before pruning"
             );
             assert!(
-                db.get_block_data(Height::new(h), Round::new(0), ValueId::new(h))
+                db.get_undecided_block_data(Height::new(h), ValueId::new(h))
                     .unwrap()
                     .is_some(),
                 "block data at height {h} should exist before pruning"
@@ -1271,19 +1235,16 @@ mod tests {
         );
 
         // === Decided block data (retain height = 3, heights > 2 survive) ===
-        // Use a dummy round/value_id — decided block data is keyed by height only
-        let r = Round::new(0);
-        let vid = ValueId::new(0);
         assert!(
-            db.get_block_data(Height::new(3), r, vid).unwrap().is_some(),
+            db.get_decided_block_data(Height::new(3)).unwrap().is_some(),
             "decided block data at height 3 should survive"
         );
         assert!(
-            db.get_block_data(Height::new(2), r, vid).unwrap().is_none(),
+            db.get_decided_block_data(Height::new(2)).unwrap().is_none(),
             "decided block data at height 2 should not survive (retain height = 3)"
         );
         assert!(
-            db.get_block_data(Height::new(1), r, vid).unwrap().is_none(),
+            db.get_decided_block_data(Height::new(1)).unwrap().is_none(),
             "decided block data at height 1 should be pruned"
         );
 
@@ -1305,22 +1266,28 @@ mod tests {
 
         // === Undecided block data (retain height = 3, heights > 2 survive) ===
         assert!(
-            db.get_block_data(Height::new(3), Round::new(0), ValueId::new(3))
+            db.get_undecided_block_data(Height::new(3), ValueId::new(3))
                 .unwrap()
                 .is_some(),
             "undecided block data at height 3 should survive"
         );
         assert!(
-            db.get_block_data(Height::new(2), Round::new(0), ValueId::new(2))
+            db.get_undecided_block_data(Height::new(2), ValueId::new(2))
                 .unwrap()
                 .is_none(),
             "undecided block data at height 2 should be pruned"
         );
         assert!(
-            db.get_block_data(Height::new(1), Round::new(0), ValueId::new(1))
+            db.get_undecided_block_data(Height::new(1), ValueId::new(1))
                 .unwrap()
                 .is_none(),
             "undecided block data at height 1 should be pruned"
+        );
+        assert!(
+            db.get_undecided_block_data(Height::new(3), ValueId::new(33))
+                .unwrap()
+                .is_some(),
+            "distinct undecided block data at height 3 should survive"
         );
 
         // === Undecided proposals (retain height = 3, heights > 2 survive) ===
