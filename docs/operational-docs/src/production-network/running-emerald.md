@@ -114,6 +114,26 @@ An example Malachite BFT config file is provided:
 The `--config` flag should contain the explicit file path to the Emerald config:
 - Example: `--config=/home/emerald/.emerald/config/emerald.toml`
 
+## Undecided Payload Storage Upgrade
+
+The first startup with the round-independent payload schema migrates the local redb
+`undecided_block_data` table to `undecided_block_data_v2`. The migration keeps one payload per
+`(height, value_id)`, removes identical round duplicates, and deletes the legacy table in the same transaction.
+
+Before upgrading each node:
+
+1. Stop Emerald cleanly.
+2. Back up `store.redb`.
+3. Reserve temporary free space for approximately one deduplicated undecided payload set plus redb overhead.
+4. Start the new binary and wait for the `undecided_block_data_migration` event before upgrading another validator.
+
+If legacy rows use the same `(height, value_id)` with different bytes, startup fails without changing the legacy
+table. Investigate or restore the backup; the node must not choose either payload automatically.
+
+The migration is one-way. To run an older Emerald binary, restore the database backup taken before the upgrade.
+Deleting the legacy table frees redb pages for reuse but might not reduce the file size immediately. Startup does not
+run full database compaction; reclaiming filesystem space is a separate offline maintenance operation.
+
 ## Monitoring
 
 Emerald exposes Prometheus metrics on port `30000` (configurable in `config.toml`):
