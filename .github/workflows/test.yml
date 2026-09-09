@@ -26,6 +26,33 @@ env:
   RUSTUP_MAX_RETRIES: 10
 
 jobs:
+  msrv:
+    name: MSRV (Rust 1.91.1)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: "1.91.1"
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+      - name: Build contracts
+        run: forge build
+      - name: Check locked workspace and key-provider features
+        run: |
+          cargo check --locked --workspace --all-targets --all-features
+          cargo check --locked -p key-provider --no-default-features --all-targets
+          cargo check --locked -p key-provider --no-default-features --features gcp-sm-kms --all-targets
+          cargo check --locked -p key-provider --no-default-features --features aws-sm-kms --all-targets
+
   unit:
     name: Unit Tests
     runs-on: ubuntu-latest

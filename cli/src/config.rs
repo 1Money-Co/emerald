@@ -102,7 +102,7 @@ pub struct EmeraldConfig {
     #[serde(default = "prune_at_interval_default")]
     pub prune_at_block_interval: u64,
 
-    /// Key provider configuration (file-based or AWS SM+KMS).
+    /// Key provider configuration (file-based, AWS SM+KMS, or GCP SM+KMS).
     /// Defaults to file-based for backward compatibility.
     #[serde(default)]
     pub key_provider: key_provider::KeyProviderConfig,
@@ -320,6 +320,46 @@ kms_key_id = "alias/emerald-validator-keys"
             }
             other => panic!("expected AwsSmKms, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn emerald_config_parses_gcp_sm_kms_key_provider() {
+        let toml = r#"
+moniker = "node-0"
+fee_recipient = "0x0000000000000000000000000000000000000000"
+
+[ethereum_config]
+execution_authrpc_address = "http://127.0.0.1:8551"
+engine_authrpc_address    = "http://127.0.0.1:8552"
+jwt_token_path            = "./assets/jwt.hex"
+
+[key_provider]
+type = "gcp_sm_kms"
+secret_version = "projects/ceremony-test/secrets/validator-general/versions/7"
+kms_crypto_key = "projects/ceremony-test/locations/global/keyRings/validators/cryptoKeys/envelope"
+kms_aad = "1money:ceremony-test:validator:1:general:v1"
+"#;
+
+        let cfg = toml::from_str::<EmeraldConfig>(toml).unwrap();
+        match &cfg.key_provider {
+            key_provider::KeyProviderConfig::GcpSmKms(c) => {
+                assert_eq!(
+                    c.secret_version,
+                    "projects/ceremony-test/secrets/validator-general/versions/7"
+                );
+                assert_eq!(
+                    c.kms_crypto_key,
+                    "projects/ceremony-test/locations/global/keyRings/validators/cryptoKeys/envelope"
+                );
+                assert_eq!(c.kms_aad, "1money:ceremony-test:validator:1:general:v1");
+            }
+            other => panic!("expected GcpSmKms, got {other:?}"),
+        }
+
+        let serialized = toml::to_string(&cfg.key_provider).unwrap();
+        assert!(serialized.contains("type = \"gcp_sm_kms\""));
+        let round_trip = toml::from_str::<key_provider::KeyProviderConfig>(&serialized).unwrap();
+        assert_eq!(round_trip, cfg.key_provider);
     }
 
     #[test]

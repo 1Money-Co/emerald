@@ -1,0 +1,8 @@
+{
+  "secret_version": "projects/ceremony-test/secrets/validator-general/versions/7",
+  "kms_crypto_key": "projects/ceremony-test/locations/global/keyRings/validators/cryptoKeys/envelope",
+  "kms_aad": "1money:ceremony-test:validator:1:general:v1",
+  "plaintext_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+  "expected_address": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+  "expected_peer_id": "16Uiu2HAmEWQnHq2jLKJypwVnVoQeFCULuyop6atvq2eWjYSUjzNi"
+}

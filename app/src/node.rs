@@ -48,7 +48,7 @@ pub struct App {
     /// `build_runtime`. The sync `Node::load_private_key_file` callback (invoked
     /// inside `start_engine`) reads from here so that network keypair, consensus
     /// signing provider, and `State` all share the same key — including in the
-    /// AWS SM+KMS provider mode where the file on disk is not the source of truth.
+    /// cloud-provider modes where the file on disk is not the source of truth.
     /// Stays empty for non-engine subcommands (init/testnet/generate).
     pub resolved_private_key: Arc<OnceLock<PrivateKey>>,
 }
@@ -83,7 +83,7 @@ impl App {
         // Resolve the private key once, via the configured provider. Caching it
         // in `resolved_private_key` makes the sync `Node::load_private_key_file`
         // callback invoked inside `start_engine` see the same key — without this,
-        // the AWS SM+KMS provider mode would still fall back to the on-disk file
+        // a cloud-provider mode would still fall back to the on-disk file
         // for the libp2p keypair and consensus signing provider.
         let key_bytes = build_key_provider(&emerald_config, &self.private_key_file)
             .load_private_key()
@@ -369,6 +369,7 @@ fn key_provider_kind(config: &key_provider::KeyProviderConfig) -> &'static str {
     match config {
         key_provider::KeyProviderConfig::File => "file",
         key_provider::KeyProviderConfig::AwsSmKms(_) => "aws_sm_kms",
+        key_provider::KeyProviderConfig::GcpSmKms(_) => "gcp_sm_kms",
     }
 }
 
@@ -385,6 +386,9 @@ fn build_key_provider(
         }
         key_provider::KeyProviderConfig::AwsSmKms(cfg) => {
             Box::new(key_provider::AwsSmKmsKeyProvider::new(cfg.clone()))
+        }
+        key_provider::KeyProviderConfig::GcpSmKms(cfg) => {
+            Box::new(key_provider::GcpSmKmsKeyProvider::new(cfg.clone()))
         }
     }
 }
@@ -428,15 +432,64 @@ impl CanMakePrivateKeyFile for App {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, OnceLock};
+
+    use malachitebft_app_channel::app::node::Node;
     use malachitebft_eth_types::secp256k1::PrivateKey;
 
-    use super::{key_provider_kind, public_key_hex};
+    use super::{key_provider_kind, public_key_hex, App};
+
+    #[test]
+    fn resolved_private_key_takes_precedence_over_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let private_key_file = dir.path().join("priv_validator_key.json");
+        let disk_key = PrivateKey::from_slice(&[2_u8; 32]).unwrap();
+        std::fs::write(&private_key_file, serde_json::to_vec(&disk_key).unwrap()).unwrap();
+        let app = App {
+            config: Default::default(),
+            home_dir: dir.path().to_path_buf(),
+            genesis_file: Default::default(),
+            emerald_config_file: Default::default(),
+            private_key_file,
+            start_height: None,
+            resolved_private_key: Arc::new(OnceLock::new()),
+        };
+        let loaded = app.load_private_key_file().unwrap();
+        assert_eq!(loaded.public_key(), disk_key.public_key());
+
+        let cached_key = PrivateKey::from_slice(&[1_u8; 32]).unwrap();
+        app.resolved_private_key.set(cached_key.clone()).unwrap();
+        let loaded = app.load_private_key(app.load_private_key_file().unwrap());
+        assert_eq!(loaded.public_key(), cached_key.public_key());
+        assert_eq!(
+            app.get_keypair(loaded).public().to_peer_id().to_string(),
+            "16Uiu2HAmEWQnHq2jLKJypwVnVoQeFCULuyop6atvq2eWjYSUjzNi"
+        );
+
+        std::fs::remove_file(&app.private_key_file).unwrap();
+        let loaded = app.load_private_key_file().unwrap();
+        assert_eq!(loaded.public_key(), cached_key.public_key());
+    }
 
     #[test]
     fn key_provider_kind_names_file_provider() {
         assert_eq!(
             key_provider_kind(&key_provider::KeyProviderConfig::File),
             "file"
+        );
+    }
+
+    #[test]
+    fn key_provider_kind_names_gcp_provider() {
+        let config = key_provider::config::GcpSmKmsConfig {
+            secret_version: "projects/project/secrets/key/versions/1".to_string(),
+            kms_crypto_key: "projects/project/locations/global/keyRings/ring/cryptoKeys/key"
+                .to_string(),
+            kms_aad: "1money:testnet:validator:1:general:v1".to_string(),
+        };
+        assert_eq!(
+            key_provider_kind(&key_provider::KeyProviderConfig::GcpSmKms(config)),
+            "gcp_sm_kms"
         );
     }
 

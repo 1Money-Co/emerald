@@ -24,9 +24,23 @@ aws-config             = { workspace = true, optional = true }
 aws-sdk-kms            = { workspace = true, optional = true }
 aws-sdk-secretsmanager = { workspace = true, optional = true }
 
+# GCP — gated on feature flag and enabled in ordinary node builds
+bytes                         = { workspace = true, optional = true }
+crc32c                        = { workspace = true, optional = true }
+google-cloud-kms-v1           = { workspace = true, optional = true }
+google-cloud-secretmanager-v1 = { workspace = true, optional = true }
+tokio                         = { workspace = true, features = [ "time" ], optional = true }
+
 [features]
-default    = ["aws-sm-kms"]
+default    = ["aws-sm-kms", "gcp-sm-kms"]
 aws-sm-kms = ["dep:aws-config", "dep:aws-sdk-kms", "dep:aws-sdk-secretsmanager"]
+gcp-sm-kms = [
+  "dep:bytes",
+  "dep:crc32c",
+  "dep:google-cloud-kms-v1",
+  "dep:google-cloud-secretmanager-v1",
+  "dep:tokio",
+]
 
 [dev-dependencies]
 tokio    = { workspace = true, features = ["rt-multi-thread", "macros"] }
@@ -34,3 +48,6 @@ tempfile = "3"
 aws-config             = { workspace = true }
 aws-sdk-kms            = { workspace = true }
 aws-sdk-secretsmanager = { workspace = true }
+google-cloud-gax       = { workspace = true }
+libp2p-identity        = { version = "0.2", features = ["secp256k1"] }
+malachitebft-eth-types = { workspace = true }

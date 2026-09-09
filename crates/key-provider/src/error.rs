@@ -10,4 +10,7 @@ pub enum KeyProviderError {
     #[cfg(feature = "aws-sm-kms")]
     #[error("KMS error: {0}")]
     Kms(String),
+    #[cfg(feature = "gcp-sm-kms")]
+    #[error(transparent)]
+    Gcp(#[from] crate::gcp_sm_kms::GcpSmKmsError),
 }

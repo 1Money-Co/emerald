@@ -1,4 +1,4 @@
-FROM rust:1.90.0-bookworm AS build-env
+FROM rust:1.91.1-bookworm AS build-env
 
 ARG TAG
 
@@ -26,6 +26,7 @@ RUN curl -sSL https://foundry.paradigm.xyz | bash && \
 ENV PATH="/root/.foundry/bin:${PATH}"
 
 COPY . /root
+RUN forge build
 RUN cargo build --release --locked
 
 FROM debian:trixie-slim
