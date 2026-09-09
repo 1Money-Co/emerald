@@ -107,19 +107,27 @@ impl Protobuf for Value {
             .value
             .ok_or_else(|| ProtoError::missing_field::<Self::Proto>("value"))?;
 
-        let value = bytes[0..8].try_into().map_err(|_| {
-            ProtoError::Other(format!(
-                "Too few bytes, expected at least {}",
-                u64::BITS / 8
-            ))
-        })?;
+        let id_len = u64::BITS as usize / 8;
+        if bytes.len() < id_len {
+            return Err(ProtoError::Other(format!(
+                "Too few bytes, expected at least {id_len}"
+            )));
+        }
 
-        let extensions = bytes.slice(8..);
+        let value = u64::from_be_bytes(
+            bytes[..id_len]
+                .try_into()
+                .map_err(|_| ProtoError::Other("Failed to decode value ID".to_owned()))?,
+        );
 
-        Ok(Self {
-            value: u64::from_be_bytes(value),
-            extensions,
-        })
+        let decoded = Self::new(bytes.slice(id_len..));
+        if decoded.value != value {
+            return Err(ProtoError::Other(
+                "Encoded value ID does not match its payload".to_owned(),
+            ));
+        }
+
+        Ok(decoded)
     }
 
     #[cfg_attr(coverage_nightly, coverage(off))]
@@ -131,5 +139,49 @@ impl Protobuf for Value {
         Ok(proto::Value {
             value: Some(bytes.freeze()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_from_proto_accepts_an_id_derived_from_its_payload() {
+        let original = Value::new(Bytes::from_static(b"execution-payload"));
+
+        let decoded = Value::from_proto(original.to_proto().unwrap())
+            .expect("matching transported value ID must decode");
+
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn value_from_proto_rejects_short_bytes_without_panicking() {
+        let error = Value::from_proto(proto::Value {
+            value: Some(Bytes::from_static(b"short")),
+        })
+        .expect_err("short encoded values must be rejected");
+
+        assert!(
+            error.to_string().contains("Too few bytes"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn value_from_proto_rejects_an_id_that_does_not_match_the_payload() {
+        let mut encoded = vec![0; u64::BITS as usize / 8];
+        encoded.extend_from_slice(b"execution-payload");
+
+        let error = Value::from_proto(proto::Value {
+            value: Some(Bytes::from(encoded)),
+        })
+        .expect_err("transported value ID must be bound to the payload");
+
+        assert!(
+            error.to_string().contains("does not match its payload"),
+            "unexpected error: {error}"
+        );
     }
 }

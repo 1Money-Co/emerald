@@ -591,7 +591,7 @@ async fn on_decided_inner(
     let block_bytes = state.get_undecided_block_data(height, value_id).await;
     timings.observe(AwaitedStage::BlockDataRead, started.elapsed(), metrics);
     let block_bytes =
-        block_bytes.ok_or_eyre("app: certificate should have associated block data")?;
+        block_bytes?.ok_or_eyre("app: certificate should have associated block data")?;
     timings.enter_preparation();
     debug!("🎁 block size: {:?}, height: {}", block_bytes.len(), height);
 
@@ -800,16 +800,11 @@ pub async fn on_process_synced_value(
     }
 
     // Store block data so on_decided() can retrieve it when the Decided message arrives.
-    if !state
-        .store_peer_undecided_value(&proposed_value, block_bytes)
-        .await?
-    {
-        proposed_value.validity = Validity::Invalid;
-        if reply.send(Some(proposed_value)).is_err() {
-            error!(%height, %round, "Failed to send invalid ProcessSyncedValue reply");
-        }
-        return Ok(());
-    }
+    // A conflict here is local durable-state corruption: retrying another peer cannot repair it,
+    // so propagate the error instead of repeatedly rejecting and penalizing healthy peers.
+    state
+        .store_undecided_value(&proposed_value, block_bytes)
+        .await?;
 
     // Send to consensus to see if it has been decided on
     if reply.send(Some(proposed_value)).is_err() {

@@ -517,12 +517,8 @@ impl State {
         &self,
         height: Height,
         value_id: ValueId,
-    ) -> Option<Bytes> {
-        self.store
-            .get_undecided_block_data(height, value_id)
-            .await
-            .ok()
-            .flatten()
+    ) -> Result<Option<Bytes>, StoreError> {
+        self.store.get_undecided_block_data(height, value_id).await
     }
 
     /// Stores an undecided proposal along with its block data.
@@ -1435,6 +1431,18 @@ jwt_token_path = "./assets/jwt.hex"
     }
 
     #[tokio::test]
+    async fn get_undecided_block_data_reports_absence_without_error() {
+        let (state, _dir) = make_test_state().await;
+
+        assert!(matches!(
+            state
+                .get_undecided_block_data(Height::new(1426), ValueId::new(7))
+                .await,
+            Ok(None)
+        ));
+    }
+
+    #[tokio::test]
     async fn shared_undecided_block_data_stores_synced_value() {
         let (mut state, _dir) = make_test_state().await;
         let height = Height::new(1426);
@@ -1555,7 +1563,7 @@ jwt_token_path = "./assets/jwt.hex"
     }
 
     #[tokio::test]
-    async fn synced_value_id_must_match_execution_payload() {
+    async fn synced_value_with_mismatched_wire_id_is_rejected_during_decoding() {
         let (mut state, _dir) = make_test_state().await;
         let height = Height::new(1426);
         let round = Round::new(3);
@@ -1580,12 +1588,7 @@ jwt_token_path = "./assets/jwt.hex"
         .await
         .unwrap();
 
-        let rejected = receiver
-            .await
-            .unwrap()
-            .expect("decoded invalid value must be forwarded to consensus");
-        assert_eq!(rejected.value, forged);
-        assert_eq!(rejected.validity, Validity::Invalid);
+        assert!(receiver.await.unwrap().is_none());
         assert!(state
             .store
             .get_undecided_block_data(height, forged.id())
@@ -1609,7 +1612,7 @@ jwt_token_path = "./assets/jwt.hex"
             .unwrap();
         let (reply, receiver) = tokio::sync::oneshot::channel();
 
-        on_process_synced_value(
+        let error = on_process_synced_value(
             AppMsg::ProcessSyncedValue {
                 height,
                 round,
@@ -1620,14 +1623,13 @@ jwt_token_path = "./assets/jwt.hex"
             &mut state,
         )
         .await
-        .unwrap();
+        .expect_err("a conflicting local payload must stop sync processing");
 
-        let rejected = receiver
-            .await
-            .unwrap()
-            .expect("conflicting decoded value must be forwarded to consensus");
-        assert_eq!(rejected.value, value);
-        assert_eq!(rejected.validity, Validity::Invalid);
+        assert!(matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::ConflictingUndecidedBlockData { .. })
+        ));
+        assert!(receiver.await.is_err());
         assert_eq!(
             state
                 .store
