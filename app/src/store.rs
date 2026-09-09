@@ -558,16 +558,13 @@ impl Db {
         Some(key.value())
     }
 
-    fn max_decided_value_height(&self) -> Option<Height> {
-        let tx = self
-            .db
-            .begin_read()
-            .expect("failed for open db for reading");
-        let table = tx
-            .open_table(DECIDED_VALUES_TABLE)
-            .expect("failed to open DECIDED_VALUES_TABLE");
-        let (key, _) = table.last().ok()??;
-        Some(key.value())
+    fn max_decided_value_height(&self) -> Result<Option<Height>, StoreError> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(DECIDED_VALUES_TABLE)?;
+        let Some((key, _)) = table.last()? else {
+            return Ok(None);
+        };
+        Ok(Some(key.value()))
     }
 
     fn initialize_schema(&self) -> Result<(), StoreError> {
@@ -903,12 +900,9 @@ impl Store {
             .flatten()
     }
 
-    pub async fn max_decided_value_height(&self) -> Option<Height> {
+    pub async fn max_decided_value_height(&self) -> Result<Option<Height>, StoreError> {
         let db = Arc::clone(&self.db);
-        tokio::task::spawn_blocking(move || db.max_decided_value_height())
-            .await
-            .ok()
-            .flatten()
+        tokio::task::spawn_blocking(move || db.max_decided_value_height()).await?
     }
 
     /// Retrieves a decided value for the given height.
@@ -1183,6 +1177,13 @@ mod tests {
         let tx = db.db.begin_read().unwrap();
         let has_table = tx.list_tables().unwrap().any(|table| table.name() == name);
         has_table
+    }
+
+    #[test]
+    fn max_decided_value_height_reports_an_empty_store() {
+        let (db, _dir) = create_test_db("max-decided-value-height-empty");
+
+        assert!(matches!(db.max_decided_value_height(), Ok(None)));
     }
 
     #[test]

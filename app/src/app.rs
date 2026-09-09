@@ -47,7 +47,7 @@ pub async fn on_consensus_ready(
     engine.check_capabilities().await?;
 
     // Get latest decided height from local store
-    let latest_height_from_store = state.store.max_decided_value_height().await;
+    let latest_height_from_store = state.store.max_decided_value_height().await?;
     match latest_height_from_store {
         Some(h) => {
             initialize_state_from_existing_block(state, engine, h, emerald_config).await?;
@@ -765,31 +765,7 @@ pub async fn on_process_synced_value(
     };
 
     let block_bytes = value.extensions.clone();
-
-    if let Err(error) = ExecutionPayloadV3::from_ssz_bytes(&block_bytes) {
-        warn!(%height, %round, error = ?error, "Rejecting synced value with malformed execution payload");
-        if reply.send(None).is_err() {
-            error!(%height, %round, "Failed to send ProcessSyncedValue None reply");
-        }
-        return Ok(());
-    }
-
-    let derived_value_id = Value::new(block_bytes.clone()).id();
-    if derived_value_id != value.id() {
-        warn!(
-            %height,
-            %round,
-            certified_value = %value.id(),
-            derived_value = %derived_value_id,
-            "Rejecting synced value whose ID does not match its execution payload"
-        );
-        if reply.send(None).is_err() {
-            error!(%height, %round, "Failed to send ProcessSyncedValue None reply");
-        }
-        return Ok(());
-    }
-
-    let proposed_value: ProposedValue<EmeraldContext> = ProposedValue {
+    let mut proposed_value: ProposedValue<EmeraldContext> = ProposedValue {
         height,
         round,
         valid_round: Round::Nil,
@@ -798,13 +774,39 @@ pub async fn on_process_synced_value(
         validity: Validity::Valid, // already validated by 2/3+ of the validator set
     };
 
+    if let Err(error) = ExecutionPayloadV3::from_ssz_bytes(&block_bytes) {
+        warn!(%height, %round, error = ?error, "Rejecting synced value with malformed execution payload");
+        proposed_value.validity = Validity::Invalid;
+        if reply.send(Some(proposed_value)).is_err() {
+            error!(%height, %round, "Failed to send invalid ProcessSyncedValue reply");
+        }
+        return Ok(());
+    }
+
+    let derived_value_id = Value::new(block_bytes.clone()).id();
+    if derived_value_id != proposed_value.value.id() {
+        warn!(
+            %height,
+            %round,
+            certified_value = %proposed_value.value.id(),
+            derived_value = %derived_value_id,
+            "Rejecting synced value whose ID does not match its execution payload"
+        );
+        proposed_value.validity = Validity::Invalid;
+        if reply.send(Some(proposed_value)).is_err() {
+            error!(%height, %round, "Failed to send invalid ProcessSyncedValue reply");
+        }
+        return Ok(());
+    }
+
     // Store block data so on_decided() can retrieve it when the Decided message arrives.
     if !state
         .store_peer_undecided_value(&proposed_value, block_bytes)
         .await?
     {
-        if reply.send(None).is_err() {
-            error!(%height, %round, "Failed to send ProcessSyncedValue None reply");
+        proposed_value.validity = Validity::Invalid;
+        if reply.send(Some(proposed_value)).is_err() {
+            error!(%height, %round, "Failed to send invalid ProcessSyncedValue reply");
         }
         return Ok(());
     }

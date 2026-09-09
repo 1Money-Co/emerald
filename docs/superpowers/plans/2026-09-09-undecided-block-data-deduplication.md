@@ -1087,7 +1087,8 @@ That temporary copy requires headroom even when many legacy rows are duplicates;
 but it does not let redb reclaim the legacy pages until the transaction commits.
 
 If legacy rows use the same `(height, value_id)` with different bytes, startup fails without changing the legacy
-table. The error and structured log identify both available rounds and payload lengths without logging payload bytes.
+table. The error and structured log identify the incoming legacy round, the existing round when it came from legacy
+data, and both payload lengths without logging payload bytes.
 Emerald has no safe automated repair for this corrupted state: preserve the database and logs for diagnosis, or
 restore the backup and continue with the previous binary. Do not delete either row without determining the
 authoritative payload.
