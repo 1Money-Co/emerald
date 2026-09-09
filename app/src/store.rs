@@ -16,9 +16,9 @@ use malachitebft_eth_types::codec::proto::ProtobufCodec;
 use malachitebft_eth_types::{proto, EmeraldContext, Height, Value, ValueId};
 use malachitebft_proto::{Error as ProtoError, Protobuf};
 use prost::Message;
-use redb::ReadableTable;
 #[cfg(test)]
 use redb::ReadableTableMetadata;
+use redb::{ReadableTable, TableHandle};
 use thiserror::Error;
 
 mod keys;
@@ -97,7 +97,6 @@ const UNDECIDED_PROPOSALS_TABLE: redb::TableDefinition<'_, UndecidedValueKey, Ve
 const DECIDED_BLOCK_DATA_TABLE: redb::TableDefinition<'_, HeightKey, Vec<u8>> =
     redb::TableDefinition::new("decided_block_data");
 
-#[allow(dead_code)]
 const LEGACY_UNDECIDED_BLOCK_DATA_TABLE: redb::TableDefinition<'_, UndecidedValueKey, Vec<u8>> =
     redb::TableDefinition::new("undecided_block_data");
 
@@ -116,6 +115,14 @@ const PENDING_PROPOSAL_PARTS_TABLE: redb::TableDefinition<'_, PendingValueKey, V
 struct Db {
     db: redb::Database,
     metrics: DbMetrics,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct UndecidedBlockDataMigrationStats {
+    legacy_rows: u64,
+    inserted_payloads: u64,
+    duplicate_payloads: u64,
+    inserted_bytes: u64,
 }
 
 impl Db {
@@ -538,22 +545,84 @@ impl Db {
         Some(key.value())
     }
 
-    fn create_tables(&self) -> Result<(), StoreError> {
+    fn initialize_schema(&self) -> Result<(), StoreError> {
+        let start = Instant::now();
         let tx = self.db.begin_write()?;
+        let legacy_exists = {
+            let mut tables = tx.list_tables()?;
+            tables.any(|table| table.name() == LEGACY_UNDECIDED_BLOCK_DATA_TABLE.name())
+        };
 
-        // Implicitly creates the tables if they do not exist yet
-        let _ = tx.open_table(DECIDED_VALUES_TABLE)?;
-        let _ = tx.open_table(CERTIFICATES_TABLE)?;
-        let _ = tx.open_table(UNDECIDED_PROPOSALS_TABLE)?;
-        let _ = tx.open_table(DECIDED_BLOCK_DATA_TABLE)?;
-        let _ = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
-        let _ = tx.open_table(DECIDED_BLOCK_HEADERS_TABLE)?;
-        let _ = tx.open_table(PERSISTENT_METRICS_TABLE)?;
-        let _ = tx.open_table(PENDING_PROPOSAL_PARTS_TABLE)?;
+        {
+            let _ = tx.open_table(DECIDED_VALUES_TABLE)?;
+            let _ = tx.open_table(CERTIFICATES_TABLE)?;
+            let _ = tx.open_table(UNDECIDED_PROPOSALS_TABLE)?;
+            let _ = tx.open_table(DECIDED_BLOCK_DATA_TABLE)?;
+            let _ = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
+            let _ = tx.open_table(DECIDED_BLOCK_HEADERS_TABLE)?;
+            let _ = tx.open_table(PERSISTENT_METRICS_TABLE)?;
+            let _ = tx.open_table(PENDING_PROPOSAL_PARTS_TABLE)?;
+        }
+
+        let migration = legacy_exists
+            .then(|| Self::migrate_undecided_block_data(&tx))
+            .transpose()?;
 
         tx.commit()?;
 
+        if let Some(stats) = migration {
+            self.metrics.observe_write_time(start.elapsed());
+            self.metrics
+                .add_writes(stats.inserted_payloads, stats.inserted_bytes);
+            tracing::info!(
+                event = "undecided_block_data_migration",
+                legacy_rows = stats.legacy_rows,
+                inserted_payloads = stats.inserted_payloads,
+                duplicate_payloads = stats.duplicate_payloads,
+                duration_seconds = start.elapsed().as_secs_f64(),
+                "Migrated legacy undecided block data"
+            );
+        }
+
         Ok(())
+    }
+
+    fn migrate_undecided_block_data(
+        tx: &redb::WriteTransaction,
+    ) -> Result<UndecidedBlockDataMigrationStats, StoreError> {
+        let mut stats = UndecidedBlockDataMigrationStats::default();
+        {
+            let legacy = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
+            let mut target = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
+            for entry in legacy.iter()? {
+                let (legacy_key, legacy_value) = entry?;
+                let (height, _round, value_id) = legacy_key.value();
+                let payload = legacy_value.value().to_vec();
+                let key = (height, value_id);
+                let existing = target.get(&key)?.map(|value| value.value().to_vec());
+
+                stats.legacy_rows += 1;
+                match existing {
+                    Some(existing) if existing == payload => stats.duplicate_payloads += 1,
+                    Some(_) => {
+                        tracing::error!(
+                            event = "undecided_block_data_migration_conflict",
+                            %height,
+                            value = %value_id,
+                            "Conflicting legacy undecided block data"
+                        );
+                        return Err(StoreError::ConflictingUndecidedBlockData { height, value_id });
+                    }
+                    None => {
+                        stats.inserted_payloads += 1;
+                        stats.inserted_bytes += payload.len() as u64;
+                        target.insert(key, payload)?;
+                    }
+                }
+            }
+        }
+        tx.delete_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
+        Ok(stats)
     }
 
     fn insert_cumulative_metrics(
@@ -760,7 +829,7 @@ impl Store {
 
         tokio::task::spawn_blocking(move || {
             let db = Db::new(path, cache_size_bytes, metrics)?;
-            db.create_tables()?;
+            db.initialize_schema()?;
             Ok(Self { db: Arc::new(db) })
         })
         .await?
@@ -1016,7 +1085,7 @@ mod tests {
             DbMetrics::new(),
         )
         .unwrap();
-        db.create_tables().unwrap();
+        db.initialize_schema().unwrap();
         (db, dir)
     }
 
@@ -1029,8 +1098,150 @@ mod tests {
             metrics.clone(),
         )
         .unwrap();
-        db.create_tables().unwrap();
+        db.initialize_schema().unwrap();
         (db, dir, metrics)
+    }
+
+    fn create_legacy_test_db(
+        name: &str,
+        rows: &[(Height, Round, ValueId, Bytes)],
+    ) -> (Db, tempfile::TempDir, DbMetrics) {
+        let dir = tempfile::tempdir().unwrap();
+        let metrics = DbMetrics::new();
+        let db = Db::new(
+            dir.path().join(format!("{name}.redb")),
+            1024 * 1024,
+            metrics.clone(),
+        )
+        .unwrap();
+        let tx = db.db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE).unwrap();
+            for (height, round, value_id, bytes) in rows {
+                table
+                    .insert((*height, *round, *value_id), bytes.to_vec())
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        (db, dir, metrics)
+    }
+
+    fn has_table(db: &Db, name: &str) -> bool {
+        use redb::TableHandle;
+
+        let tx = db.db.begin_read().unwrap();
+        let has_table = tx.list_tables().unwrap().any(|table| table.name() == name);
+        has_table
+    }
+
+    #[test]
+    fn legacy_undecided_block_data_migration_deduplicates_and_reopens() {
+        let height = Height::new(9);
+        let first_id = ValueId::new(21);
+        let second_id = ValueId::new(22);
+        let first = Bytes::from_static(b"first-payload");
+        let second = Bytes::from_static(b"second-payload");
+        let (db, dir, metrics) = create_legacy_test_db(
+            "legacy_success",
+            &[
+                (height, Round::new(0), first_id, first.clone()),
+                (height, Round::new(1), first_id, first.clone()),
+                (height, Round::new(2), second_id, second.clone()),
+            ],
+        );
+
+        db.initialize_schema().unwrap();
+        assert!(!has_table(&db, "undecided_block_data"));
+        assert!(has_table(&db, "undecided_block_data_v2"));
+        assert_eq!(db.undecided_block_data_len().unwrap(), 2);
+        assert_eq!(metrics.write_count(), 2);
+        assert_eq!(metrics.write_bytes(), (first.len() + second.len()) as u64);
+
+        let path = dir.path().join("legacy_success.redb");
+        drop(db);
+        let reopened = Db::new(path, 1024 * 1024, DbMetrics::new()).unwrap();
+        reopened.initialize_schema().unwrap();
+        assert_eq!(
+            reopened.get_undecided_block_data(height, first_id).unwrap(),
+            Some(first)
+        );
+        assert_eq!(
+            reopened
+                .get_undecided_block_data(height, second_id)
+                .unwrap(),
+            Some(second)
+        );
+    }
+
+    #[test]
+    fn legacy_undecided_block_data_migration_new_database_never_creates_legacy_table() {
+        let (db, _dir, _metrics) = create_test_db_with_metrics("new_v2_only");
+
+        assert!(!has_table(&db, "undecided_block_data"));
+        assert!(has_table(&db, "undecided_block_data_v2"));
+    }
+
+    #[test]
+    fn legacy_undecided_block_data_migration_conflict_rolls_back() {
+        let height = Height::new(9);
+        let value_id = ValueId::new(21);
+        let (db, _dir, metrics) = create_legacy_test_db(
+            "legacy_conflict",
+            &[
+                (
+                    height,
+                    Round::new(0),
+                    value_id,
+                    Bytes::from_static(b"first"),
+                ),
+                (
+                    height,
+                    Round::new(1),
+                    value_id,
+                    Bytes::from_static(b"different"),
+                ),
+            ],
+        );
+
+        let error = db.initialize_schema().unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::ConflictingUndecidedBlockData {
+                height: error_height,
+                value_id: error_value_id,
+            } if error_height == height && error_value_id == value_id
+        ));
+        assert!(has_table(&db, "undecided_block_data"));
+        assert!(!has_table(&db, "undecided_block_data_v2"));
+        assert_eq!(metrics.write_count(), 0);
+        assert_eq!(metrics.write_bytes(), 0);
+    }
+
+    #[test]
+    fn legacy_undecided_block_data_migration_merges_existing_v2_data() {
+        let height = Height::new(9);
+        let value_id = ValueId::new(21);
+        let payload = Bytes::from_static(b"existing-payload");
+        let (db, _dir, metrics) = create_legacy_test_db(
+            "legacy_merge",
+            &[
+                (height, Round::new(0), value_id, payload.clone()),
+                (height, Round::new(1), value_id, payload.clone()),
+            ],
+        );
+        let tx = db.db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE).unwrap();
+            table.insert((height, value_id), payload.to_vec()).unwrap();
+        }
+        tx.commit().unwrap();
+
+        db.initialize_schema().unwrap();
+        assert_eq!(db.undecided_block_data_len().unwrap(), 1);
+        assert_eq!(metrics.write_count(), 0);
+        assert_eq!(metrics.write_bytes(), 0);
+        assert!(!has_table(&db, "undecided_block_data"));
     }
 
     #[test]
@@ -1052,7 +1263,7 @@ mod tests {
         let path = dir.path().join("deduplicate_payload.redb");
         drop(db);
         let reopened = Db::new(path, 1024 * 1024, DbMetrics::new()).unwrap();
-        reopened.create_tables().unwrap();
+        reopened.initialize_schema().unwrap();
         assert_eq!(
             reopened.get_undecided_block_data(height, value_id).unwrap(),
             Some(payload)
