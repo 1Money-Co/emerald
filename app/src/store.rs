@@ -17,10 +17,12 @@ use malachitebft_eth_types::{proto, EmeraldContext, Height, Value, ValueId};
 use malachitebft_proto::{Error as ProtoError, Protobuf};
 use prost::Message;
 use redb::ReadableTable;
+#[cfg(test)]
+use redb::ReadableTableMetadata;
 use thiserror::Error;
 
 mod keys;
-use keys::{HeightKey, UndecidedValueKey};
+use keys::{HeightKey, UndecidedBlockDataKey, UndecidedValueKey};
 
 use crate::metrics::DbMetrics;
 use crate::store::keys::PendingValueKey;
@@ -78,6 +80,9 @@ pub enum StoreError {
 
     #[error("Failed to serialize/deserialize JSON: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    #[error("Conflicting undecided block data at height {height}, value {value_id}")]
+    ConflictingUndecidedBlockData { height: Height, value_id: ValueId },
 }
 
 const CERTIFICATES_TABLE: redb::TableDefinition<'_, HeightKey, Vec<u8>> =
@@ -92,8 +97,11 @@ const UNDECIDED_PROPOSALS_TABLE: redb::TableDefinition<'_, UndecidedValueKey, Ve
 const DECIDED_BLOCK_DATA_TABLE: redb::TableDefinition<'_, HeightKey, Vec<u8>> =
     redb::TableDefinition::new("decided_block_data");
 
-const UNDECIDED_BLOCK_DATA_TABLE: redb::TableDefinition<'_, UndecidedValueKey, Vec<u8>> =
+const LEGACY_UNDECIDED_BLOCK_DATA_TABLE: redb::TableDefinition<'_, UndecidedValueKey, Vec<u8>> =
     redb::TableDefinition::new("undecided_block_data");
+
+const UNDECIDED_BLOCK_DATA_TABLE: redb::TableDefinition<'_, UndecidedBlockDataKey, Vec<u8>> =
+    redb::TableDefinition::new("undecided_block_data_v2");
 
 const DECIDED_BLOCK_HEADERS_TABLE: redb::TableDefinition<'_, HeightKey, Vec<u8>> =
     redb::TableDefinition::new("decided_block_headers");
@@ -441,7 +449,7 @@ impl Db {
             undecided.retain(|k, _| k.0 >= block_data_retain_height)?;
 
             // Remove all undecided block data with height < retain_height
-            let mut undecided_block_data = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
+            let mut undecided_block_data = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
             undecided_block_data.retain(|k, _| k.0 >= block_data_retain_height)?;
 
             // Remove all pending proposal parts with height < retain_height
@@ -615,7 +623,7 @@ impl Db {
         let tx = self.db.begin_read()?;
 
         // Try undecided block data first
-        let undecided_table = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
+        let undecided_table = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
         if let Some(data) = undecided_table.get(&(height, round, value_id))? {
             let bytes = data.value();
             let read_bytes = bytes.len() as u64;
@@ -642,7 +650,7 @@ impl Db {
         Ok(None)
     }
 
-    fn insert_undecided_block_data(
+    fn insert_legacy_undecided_block_data(
         &self,
         height: Height,
         round: Round,
@@ -654,7 +662,7 @@ impl Db {
 
         let tx = self.db.begin_write()?;
         {
-            let mut table = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
+            let mut table = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
             let key = (height, round, value_id);
             // Only insert if no value exists at this key
             if table.get(&key)?.is_none() {
@@ -667,6 +675,69 @@ impl Db {
         self.metrics.add_write_bytes(write_bytes);
 
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn get_undecided_block_data(
+        &self,
+        height: Height,
+        value_id: ValueId,
+    ) -> Result<Option<Bytes>, StoreError> {
+        let start = Instant::now();
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
+        let value = table
+            .get(&(height, value_id))?
+            .map(|data| Bytes::copy_from_slice(&data.value()));
+
+        self.metrics.observe_read_time(start.elapsed());
+        self.metrics
+            .add_read_bytes(value.as_ref().map_or(0, |bytes| bytes.len() as u64));
+        self.metrics
+            .add_key_read_bytes((size_of::<Height>() + size_of::<ValueId>()) as u64);
+        Ok(value)
+    }
+
+    #[allow(dead_code)]
+    fn insert_undecided_block_data(
+        &self,
+        height: Height,
+        value_id: ValueId,
+        data: Bytes,
+    ) -> Result<(), StoreError> {
+        let start = Instant::now();
+        let tx = self.db.begin_write()?;
+        let inserted = {
+            let mut table = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
+            let key = (height, value_id);
+            let existing = table.get(&key)?.map(|value| value.value().to_vec());
+
+            match existing {
+                Some(existing) if existing.as_slice() == data.as_ref() => false,
+                Some(_) => {
+                    return Err(StoreError::ConflictingUndecidedBlockData { height, value_id });
+                }
+                None => {
+                    table.insert(key, data.to_vec())?;
+                    true
+                }
+            }
+        };
+
+        if !inserted {
+            return Ok(());
+        }
+
+        tx.commit()?;
+        self.metrics.observe_write_time(start.elapsed());
+        self.metrics.add_write_bytes(data.len() as u64);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn undecided_block_data_len(&self) -> Result<u64, StoreError> {
+        let tx = self.db.begin_read()?;
+        Ok(tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?.len()?)
     }
 
     fn insert_decided_block_data(&self, height: Height, data: Bytes) -> Result<(), StoreError> {
@@ -912,7 +983,7 @@ impl Store {
     ) -> Result<(), StoreError> {
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            db.insert_undecided_block_data(height, round, value_id, data)
+            db.insert_legacy_undecided_block_data(height, round, value_id, data)
         })
         .await?
     }
@@ -991,6 +1062,86 @@ mod tests {
         (db, dir)
     }
 
+    fn create_test_db_with_metrics(name: &str) -> (Db, tempfile::TempDir, DbMetrics) {
+        let dir = tempfile::tempdir().unwrap();
+        let metrics = DbMetrics::new();
+        let db = Db::new(
+            dir.path().join(format!("{name}.redb")),
+            1024 * 1024,
+            metrics.clone(),
+        )
+        .unwrap();
+        db.create_tables().unwrap();
+        (db, dir, metrics)
+    }
+
+    #[test]
+    fn undecided_block_data_deduplicates_identical_payloads() {
+        let (db, dir, metrics) = create_test_db_with_metrics("deduplicate_payload");
+        let height = Height::new(7);
+        let value_id = ValueId::new(11);
+        let payload = Bytes::from_static(b"one-payload");
+
+        db.insert_undecided_block_data(height, value_id, payload.clone())
+            .unwrap();
+        db.insert_undecided_block_data(height, value_id, payload.clone())
+            .unwrap();
+
+        assert_eq!(db.undecided_block_data_len().unwrap(), 1);
+        assert_eq!(metrics.write_count(), 1);
+        assert_eq!(metrics.write_bytes(), payload.len() as u64);
+
+        let path = dir.path().join("deduplicate_payload.redb");
+        drop(db);
+        let reopened = Db::new(path, 1024 * 1024, DbMetrics::new()).unwrap();
+        reopened.create_tables().unwrap();
+        assert_eq!(
+            reopened.get_undecided_block_data(height, value_id).unwrap(),
+            Some(payload)
+        );
+    }
+
+    #[test]
+    fn undecided_block_data_keeps_distinct_values_at_one_height() {
+        let (db, _dir, _metrics) = create_test_db_with_metrics("distinct_payloads");
+        let height = Height::new(7);
+
+        db.insert_undecided_block_data(height, ValueId::new(11), Bytes::from_static(b"first"))
+            .unwrap();
+        db.insert_undecided_block_data(height, ValueId::new(12), Bytes::from_static(b"second"))
+            .unwrap();
+
+        assert_eq!(db.undecided_block_data_len().unwrap(), 2);
+    }
+
+    #[test]
+    fn undecided_block_data_rejects_conflicting_bytes_without_overwrite() {
+        let (db, _dir, metrics) = create_test_db_with_metrics("conflicting_payload");
+        let height = Height::new(7);
+        let value_id = ValueId::new(11);
+        let original = Bytes::from_static(b"original");
+
+        db.insert_undecided_block_data(height, value_id, original.clone())
+            .unwrap();
+        let error = db
+            .insert_undecided_block_data(height, value_id, Bytes::from_static(b"conflict"))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::ConflictingUndecidedBlockData {
+                height: error_height,
+                value_id: error_value_id,
+            } if error_height == height && error_value_id == value_id
+        ));
+        assert_eq!(
+            db.get_undecided_block_data(height, value_id).unwrap(),
+            Some(original.clone())
+        );
+        assert_eq!(metrics.write_count(), 1);
+        assert_eq!(metrics.write_bytes(), original.len() as u64);
+    }
+
     /// Build a DecidedValue (Value + CommitCertificate) and a block header for a given height.
     fn make_decided_value(height: u64) -> (DecidedValue, Bytes) {
         let value = Value::new(Bytes::from(vec![height as u8; 10]));
@@ -1036,7 +1187,7 @@ mod tests {
             db.insert_undecided_proposal(proposal).unwrap();
 
             // Undecided block data table
-            db.insert_undecided_block_data(
+            db.insert_legacy_undecided_block_data(
                 Height::new(h),
                 Round::new(0),
                 ValueId::new(h),
