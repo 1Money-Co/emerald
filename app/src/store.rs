@@ -25,6 +25,8 @@ use ssz::{Decode, Encode};
 use thiserror::Error;
 
 mod keys;
+#[cfg(test)]
+mod proposal_metadata;
 use keys::{HeightKey, UndecidedBlockDataKey, UndecidedValueKey};
 
 use crate::metrics::DbMetrics;

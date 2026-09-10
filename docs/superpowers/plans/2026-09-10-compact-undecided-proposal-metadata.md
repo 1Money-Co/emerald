@@ -47,7 +47,7 @@ recovery repairs ID-only decided values created by N-1.
 - Produces `DecodedStoredProposal { metadata, embedded_payload }`, where `embedded_payload` is `None` for compact
   records and `Some` only for legacy-full records.
 
-- [ ] **Step 1: Add the module and write failing compact-codec tests**
+- [x] **Step 1: Add the module and write failing compact-codec tests**
 
 Create `app/src/store/proposal_metadata.rs` with tests that express the desired API before defining it:
 
@@ -108,7 +108,7 @@ mod tests {
 
 Add `mod proposal_metadata;` next to `mod keys;` in `app/src/store.rs`. Do not yet add production definitions.
 
-- [ ] **Step 2: Run the codec tests and verify red**
+- [x] **Step 2: Run the codec tests and verify red**
 
 Run:
 
@@ -118,7 +118,7 @@ cargo test -p emerald compact_proposal_metadata_ -- --nocapture
 
 Expected: compilation fails because `StoredProposalMetadata` and `decode_stored_proposal` do not exist.
 
-- [ ] **Step 3: Implement the compact and legacy-full decoders**
+- [x] **Step 3: Implement the compact and legacy-full decoders**
 
 Define the production types and functions in `proposal_metadata.rs`:
 
@@ -173,7 +173,7 @@ let (value_id, embedded_payload) = if value_bytes.len() == VALUE_ID_LEN {
 
 Return metadata constructed from the protobuf fields. Keep the strict `Value::from_proto` path for legacy-full rows.
 
-- [ ] **Step 4: Run the codec tests and verify green**
+- [x] **Step 4: Run the codec tests and verify green**
 
 Run:
 
@@ -183,7 +183,7 @@ cargo test -p emerald compact_proposal_metadata_ -- --nocapture
 
 Expected: both tests pass, the compact nested value is exactly eight bytes, and the encoded row is below 128 bytes.
 
-- [ ] **Step 5: Commit the codec increment**
+- [x] **Step 5: Commit the codec increment**
 
 ```bash
 git add app/src/store.rs app/src/store/proposal_metadata.rs
