@@ -204,7 +204,7 @@ git commit -m "feat: encode compact proposal metadata"
 - Produces `Db::hydrate_stored_proposal(tx, key, encoded) -> Result<ProposedValue<EmeraldContext>, StoreError>`.
 - Preserves the existing `Db::{get_undecided_proposal,get_undecided_proposals,insert_undecided_proposal}` signatures.
 
-- [ ] **Step 1: Write failing runtime storage tests**
+- [x] **Step 1: Write failing runtime storage tests**
 
 Add raw-table helpers and these tests to `app/src/store.rs`:
 
@@ -269,7 +269,7 @@ fn compact_proposal_metadata_read_rejects_missing_shared_payload() {
 }
 ```
 
-- [ ] **Step 2: Run the runtime tests and verify red**
+- [x] **Step 2: Run the runtime tests and verify red**
 
 Run:
 
@@ -281,7 +281,7 @@ cargo test -p emerald compact_proposal_metadata_read_ -- --nocapture
 Expected: the first test fails because raw proposal rows still contain the full payload; the second fails because the
 legacy full proposal currently decodes without consulting shared storage.
 
-- [ ] **Step 3: Add contextual integrity errors and hydration**
+- [x] **Step 3: Add contextual integrity errors and hydration**
 
 Add this `StoreError` variant:
 
@@ -317,7 +317,7 @@ shared payload does not match the stored value ID
 embedded proposal payload does not match shared storage
 ```
 
-- [ ] **Step 4: Switch runtime proposal writes and reads**
+- [x] **Step 4: Switch runtime proposal writes and reads**
 
 In `insert_undecided_proposal`, replace `ProtobufCodec.encode(&proposal)` with:
 
@@ -331,7 +331,7 @@ transaction is alive. Retain first-write-wins and count only the compact row len
 Remove the function-local `use redb::TableHandle;` from the test helper because `TableHandle` is already imported at
 module scope, addressing Frank's P3 comment.
 
-- [ ] **Step 5: Run runtime, state-flow, and metrics tests**
+- [x] **Step 5: Run runtime, state-flow, and metrics tests**
 
 Run:
 
@@ -344,7 +344,7 @@ cargo test -p emerald undecided_proposal_duplicate_does_not_increment_write_metr
 
 Expected: all discovered tests pass; no exact filter reports zero tests.
 
-- [ ] **Step 6: Commit the runtime increment**
+- [x] **Step 6: Commit the runtime increment**
 
 ```bash
 git add app/src/store.rs app/src/store/proposal_metadata.rs

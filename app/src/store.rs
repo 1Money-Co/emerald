@@ -25,9 +25,9 @@ use ssz::{Decode, Encode};
 use thiserror::Error;
 
 mod keys;
-#[cfg(test)]
 mod proposal_metadata;
 use keys::{HeightKey, UndecidedBlockDataKey, UndecidedValueKey};
+use proposal_metadata::{decode_stored_proposal, StoredProposalMetadata};
 
 use crate::metrics::DbMetrics;
 use crate::payload::extract_block_header;
@@ -110,6 +110,16 @@ pub enum StoreError {
     #[error("Irrecoverable decided state at height {height}: {reason}")]
     IrrecoverableDecidedState {
         height: Height,
+        reason: &'static str,
+    },
+
+    #[error(
+        "Irrecoverable undecided proposal at height {height}, round {round}, value {value_id}: {reason}"
+    )]
+    IrrecoverableUndecidedProposal {
+        height: Height,
+        round: Round,
+        value_id: ValueId,
         reason: &'static str,
     },
 
@@ -446,14 +456,12 @@ impl Db {
         let tx = self.db.begin_read()?;
         let table = tx.open_table(UNDECIDED_PROPOSALS_TABLE)?;
 
-        let value = if let Ok(Some(value)) = table.get(&(height, round, value_id)) {
+        let key = (height, round, value_id);
+        let value = if let Some(value) = table.get(&key)? {
             let bytes = value.value();
             read_bytes += bytes.len() as u64;
-
-            let proposal = ProtobufCodec
-                .decode(Bytes::from(bytes))
-                .map_err(StoreError::Protobuf)?;
-
+            let proposal = self.hydrate_stored_proposal(&tx, key, Bytes::from(bytes))?;
+            read_bytes += proposal.value.extensions.len() as u64;
             Some(proposal)
         } else {
             None
@@ -481,16 +489,14 @@ impl Db {
         let mut proposals = Vec::new();
         for result in table.iter()? {
             let (key, value) = result?;
-            let (h, r, _) = key.value();
+            let key = key.value();
+            let (h, r, _) = key;
 
             if h == height && r == round {
                 let bytes = value.value();
                 read_bytes += bytes.len() as u64;
-
-                let proposal = ProtobufCodec
-                    .decode(Bytes::from(bytes))
-                    .map_err(StoreError::Protobuf)?;
-
+                let proposal = self.hydrate_stored_proposal(&tx, key, Bytes::from(bytes))?;
+                read_bytes += proposal.value.extensions.len() as u64;
                 proposals.push(proposal);
             }
         }
@@ -511,7 +517,7 @@ impl Db {
         let start = Instant::now();
 
         let key = (proposal.height, proposal.round, proposal.value.id());
-        let value = ProtobufCodec.encode(&proposal)?;
+        let value = StoredProposalMetadata::from_proposal(&proposal).encode()?;
 
         let tx = self.db.begin_write()?;
         let inserted = {
@@ -536,6 +542,78 @@ impl Db {
         self.metrics.add_write_bytes(value.len() as u64);
 
         Ok(())
+    }
+
+    fn hydrate_stored_proposal(
+        &self,
+        tx: &redb::ReadTransaction,
+        key: (Height, Round, ValueId),
+        encoded: Bytes,
+    ) -> Result<ProposedValue<EmeraldContext>, StoreError> {
+        let (height, round, value_id) = key;
+        let decoded = decode_stored_proposal(encoded).map_err(|_| {
+            StoreError::IrrecoverableUndecidedProposal {
+                height,
+                round,
+                value_id,
+                reason: "stored proposal metadata cannot be decoded",
+            }
+        })?;
+        if decoded.metadata.height != height
+            || decoded.metadata.round != round
+            || decoded.metadata.value_id != value_id
+        {
+            return Err(StoreError::IrrecoverableUndecidedProposal {
+                height,
+                round,
+                value_id,
+                reason: "stored proposal key does not match its metadata",
+            });
+        }
+
+        let primary_payload = {
+            let table = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
+            table
+                .get(&(height, value_id))?
+                .map(|payload| payload.value())
+        };
+        let payload = match primary_payload {
+            Some(payload) => payload,
+            None => {
+                let table = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
+                table
+                    .get(&(height, round, value_id))?
+                    .map(|payload| payload.value())
+                    .ok_or(StoreError::IrrecoverableUndecidedProposal {
+                        height,
+                        round,
+                        value_id,
+                        reason: "missing shared payload",
+                    })?
+            }
+        };
+        let payload = Bytes::from(payload);
+        if Value::new(payload.clone()).id() != value_id {
+            return Err(StoreError::IrrecoverableUndecidedProposal {
+                height,
+                round,
+                value_id,
+                reason: "shared payload does not match the stored value ID",
+            });
+        }
+        if decoded
+            .embedded_payload
+            .is_some_and(|embedded| embedded != payload)
+        {
+            return Err(StoreError::IrrecoverableUndecidedProposal {
+                height,
+                round,
+                value_id,
+                reason: "embedded proposal payload does not match shared storage",
+            });
+        }
+
+        Ok(decoded.metadata.hydrate(payload))
     }
 
     fn get_pending_proposal_parts(
@@ -1613,8 +1691,6 @@ mod tests {
     }
 
     fn has_table(db: &Db, name: &str) -> bool {
-        use redb::TableHandle;
-
         let tx = db.db.begin_read().unwrap();
         let has_table = tx.list_tables().unwrap().any(|table| table.name() == name);
         has_table
@@ -1632,6 +1708,16 @@ mod tests {
             .get(&(height, round, value_id))
             .unwrap()
             .map(|value| Bytes::copy_from_slice(&value.value()))
+    }
+
+    fn raw_undecided_proposal(db: &Db, key: (Height, Round, ValueId)) -> Vec<u8> {
+        let tx = db.db.begin_read().unwrap();
+        tx.open_table(UNDECIDED_PROPOSALS_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .unwrap()
+            .value()
     }
 
     fn assert_no_decided_rows(db: &Db, height: Height) {
@@ -2477,6 +2563,58 @@ mod tests {
 
         assert_eq!(metrics.write_count(), writes);
         assert_eq!(metrics.write_bytes(), bytes);
+    }
+
+    #[test]
+    fn compact_proposal_metadata_runtime_stores_one_primary_payload_copy_across_rounds() {
+        let (db, _dir, _metrics) = create_test_db_with_metrics("compact_runtime_rounds");
+        let payload = Bytes::from(vec![0xCD; 4 * 1024 * 1024]);
+        let value = Value::new(payload.clone());
+
+        for round in 0..4 {
+            let round = Round::new(round);
+            db.insert_undecided_block_data(Height::new(51), round, value.id(), payload.clone())
+                .unwrap();
+            let proposal = ProposedValue {
+                height: Height::new(51),
+                round,
+                valid_round: if round == Round::new(0) {
+                    Round::Nil
+                } else {
+                    Round::new(round.as_u32().unwrap() - 1)
+                },
+                proposer: Address::new([round.as_u32().unwrap() as u8; 20]),
+                value: value.clone(),
+                validity: Validity::Valid,
+            };
+            db.insert_undecided_proposal(proposal.clone()).unwrap();
+
+            let raw =
+                raw_undecided_proposal(&db, (proposal.height, proposal.round, proposal.value.id()));
+            assert!(raw.len() < 128);
+            assert!(!raw
+                .windows(payload.len())
+                .any(|window| window == payload.as_ref()));
+            assert_eq!(
+                db.get_undecided_proposal(proposal.height, proposal.round, value.id())
+                    .unwrap(),
+                Some(proposal),
+            );
+        }
+
+        assert_eq!(db.undecided_block_data_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn compact_proposal_metadata_read_rejects_missing_shared_payload() {
+        let (db, _dir) = create_test_db("compact_missing_payload");
+        let proposal = make_proposed_value(52);
+        db.insert_undecided_proposal(proposal.clone()).unwrap();
+
+        let error = db
+            .get_undecided_proposal(proposal.height, proposal.round, proposal.value.id())
+            .unwrap_err();
+        assert!(error.to_string().contains("missing shared payload"));
     }
 
     #[test]

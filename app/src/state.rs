@@ -1687,9 +1687,7 @@ jwt_token_path = "./assets/jwt.hex"
             Ok(_) => panic!("missing block data must be an error"),
         };
 
-        assert!(error
-            .to_string()
-            .contains("Block data not found for restream proposal"));
+        assert!(error.to_string().contains("missing shared payload"));
         assert!(error.to_string().contains("1426"));
     }
 
