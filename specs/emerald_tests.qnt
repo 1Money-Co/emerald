@@ -242,6 +242,16 @@ module emerald_tests {
         }
       ))
 
+  // Recovery path: a proposer reuses its persisted value after a process restart.
+  run emeraldGetValueReusesProposalAfterRestartTest =
+    genesisStart
+      .then("node1".getValue(proposal(1, 0, 0)))
+      .then("node1".restart())
+      .then("node1".consensusReady(1, 0))
+      .then("node1".startedRound(1, 0))
+      .then("node1".getValue(proposal(1, 0, 0)))
+      .expect(s.system.get("node1").proposals == Set(proposal(1, 0, 0)))
+
   // Unhappy path: node decides after skipping a round
   run emeraldSkipsRoundAndDecide =
     genesisStart

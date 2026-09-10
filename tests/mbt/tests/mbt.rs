@@ -34,6 +34,17 @@ fn test_restream_proposal_and_decide() -> impl Driver {
     EmeraldDriver::default()
 }
 
+/// Preserved-state recovery: after restarting in the same height and round,
+/// the proposer reuses its existing value rather than building another one.
+#[quint_test(
+    spec = "../../specs/emerald_tests.qnt",
+    test = "emeraldGetValueReusesProposalAfterRestartTest",
+    max_samples = 1
+)]
+fn test_get_value_reuses_proposal_after_restart() -> impl Driver {
+    EmeraldDriver::default()
+}
+
 /// Round skipping: nodes 1 and 2 timeout and move ahead, deciding on round 1,
 /// node 3 skips to round 1 and decide.
 #[quint_test(

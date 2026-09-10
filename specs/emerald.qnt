@@ -193,7 +193,7 @@ module emerald {
     and {
       s.phase == Working,
       s.process_id == proposer,
-      get_local_proposal(s, s.consensus_height, s.consensus_round) == None,
+      s.handled_proposal_request != Some((s.consensus_height, s.consensus_round)),
     }
   }
 
@@ -218,7 +218,8 @@ module emerald {
     {
       post_state: {
         ...s,
-        proposals: s.proposals.setAdd(proposal)
+        proposals: s.proposals.setAdd(proposal),
+        handled_proposal_request: Some((s.consensus_height, s.consensus_round)),
       },
       effects: Set(
         choreo::CustomEffect(RecordProposal(proposal)),
@@ -242,8 +243,9 @@ module emerald {
   // not modeled. Each model proposal is assumed to map to SUT proposal metadata
   // and block data under the same (height, round, value_id) key. Malachite
   // requests either GetValue or RestreamProposal in a round. The model may
-  // initially enable both, but taking either records a current-round proposal
-  // and disables both actions for that round.
+  // initially enable both, but taking either records the handled request and
+  // disables both actions for that round. That transient record is cleared by
+  // a restart while persisted proposals remain available for GetValue reuse.
 
   pure def listen_restream_proposal(ctx: LocalContext): Set[Proposal] = {
     val s = ctx.state
@@ -253,6 +255,7 @@ module emerald {
       s.phase == Working,
       s.process_id == proposer,
       s.consensus_round > 0,
+      s.handled_proposal_request != Some((s.consensus_height, s.consensus_round)),
       get_local_proposal(s, s.consensus_height, s.consensus_round) == None,
     })
       s.proposals.filter(p => and {
@@ -275,6 +278,7 @@ module emerald {
       post_state: {
         ...s,
         proposals: s.proposals.setAdd(proposal),
+        handled_proposal_request: Some((s.consensus_height, s.consensus_round)),
       },
       effects: Set(
         choreo::CustomEffect(RecordProposal(proposal)),
@@ -717,6 +721,7 @@ module emerald {
       phase: Uninitialized,
       consensus_height: 0,
       consensus_round: 0,
+      handled_proposal_request: None,
       proposals: Set(),
       last_decided_height: 0,
       last_decided_payload: None

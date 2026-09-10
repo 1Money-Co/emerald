@@ -3,12 +3,43 @@
 use anyhow::{anyhow, ensure, Result};
 use emerald::app::process_consensus_message;
 use malachitebft_app_channel::app::types::core::{Round as EmeraldRound, Validity};
-use malachitebft_app_channel::{AppMsg, NetworkMsg};
-use malachitebft_eth_types::{Height as EmeraldHeight, Value};
+use malachitebft_app_channel::{AppMsg, Channels, NetworkMsg};
+use malachitebft_eth_types::{EmeraldContext, Height as EmeraldHeight, Value};
+use tokio::sync::mpsc;
 
 use super::Sut;
 use crate::history::History;
 use crate::state::Proposal;
+
+struct NetworkChannelOverride<'a> {
+    channels: &'a mut Channels<EmeraldContext>,
+    original: Option<mpsc::Sender<NetworkMsg<EmeraldContext>>>,
+}
+
+impl<'a> NetworkChannelOverride<'a> {
+    fn new(
+        channels: &'a mut Channels<EmeraldContext>,
+        replacement: mpsc::Sender<NetworkMsg<EmeraldContext>>,
+    ) -> Self {
+        let original = core::mem::replace(&mut channels.network, replacement);
+        Self {
+            channels,
+            original: Some(original),
+        }
+    }
+
+    fn channels(&mut self) -> &mut Channels<EmeraldContext> {
+        self.channels
+    }
+}
+
+impl Drop for NetworkChannelOverride<'_> {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.take() {
+            self.channels.network = original;
+        }
+    }
+}
 
 impl Sut {
     /// Replays the RestreamProposal Quint action (see emerald.qnt
@@ -53,7 +84,6 @@ impl Sut {
         // Temporarily replace the network sender so this action can observe the
         // real handler output without changing production channels.
         let (network_tx, mut network_rx) = tokio::sync::mpsc::channel(1);
-        let network = core::mem::replace(&mut self.components.channels.network, network_tx);
 
         let capture = tokio::spawn(async move {
             let mut stream = Vec::new();
@@ -70,15 +100,22 @@ impl Sut {
             ))
         });
 
-        let process_result = process_consensus_message(
-            msg,
-            &mut self.components.state,
-            &mut self.components.channels,
-            &self.components.engine,
-            &self.components.emerald_config,
-        )
-        .await;
-        self.components.channels.network = network;
+        let components = &mut self.components;
+        let state = &mut components.state;
+        let channels = &mut components.channels;
+        let engine = &components.engine;
+        let emerald_config = &components.emerald_config;
+        let process_result = {
+            let mut network_override = NetworkChannelOverride::new(channels, network_tx);
+            process_consensus_message(
+                msg,
+                state,
+                network_override.channels(),
+                engine,
+                emerald_config,
+            )
+            .await
+        };
 
         process_result
             .map_err(|err| anyhow!("Failed to process RestreamProposal message: {err:?}"))?;
@@ -138,5 +175,36 @@ impl Sut {
 
         hist.record_proposal(proposal, value, stream);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_channel_override_restores_original_sender_when_dropped() {
+        let (_consensus_tx, consensus_rx) = mpsc::channel(1);
+        let (network_tx, _network_rx) = mpsc::channel(1);
+        let (requests_tx, _requests_rx) = mpsc::channel(1);
+        let mut channels = Channels::<EmeraldContext> {
+            consensus: consensus_rx,
+            network: network_tx.clone(),
+            events: Default::default(),
+            requests: requests_tx,
+        };
+        let (replacement_tx, _replacement_rx) = mpsc::channel(1);
+
+        {
+            let mut network_override =
+                NetworkChannelOverride::new(&mut channels, replacement_tx.clone());
+            assert!(network_override
+                .channels()
+                .network
+                .same_channel(&replacement_tx));
+        }
+
+        assert!(channels.network.same_channel(&network_tx));
+        assert!(!channels.network.is_closed());
     }
 }
