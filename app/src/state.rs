@@ -1256,9 +1256,7 @@ jwt_token_path = "./assets/jwt.hex"
             .unwrap_err();
 
         assert!(
-            error
-                .to_string()
-                .contains("missing shared payload"),
+            error.to_string().contains("missing shared payload"),
             "unexpected error: {error:#}"
         );
         assert!(state

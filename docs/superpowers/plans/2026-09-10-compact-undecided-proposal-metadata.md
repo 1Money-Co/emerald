@@ -677,7 +677,7 @@ cargo test -p emerald --lib
 
 Expected: every Emerald library test passes with no ignored failure.
 
-- [ ] **Step 2: Run the practical workspace and MBT gates**
+- [x] **Step 2: Run the practical workspace and MBT gates**
 
 Run:
 
@@ -689,7 +689,7 @@ cargo test -p emerald-mbt --no-run
 
 Expected: all selected workspace tests pass and both MBT binaries compile.
 
-- [ ] **Step 3: Run repository-required lint and format gates**
+- [x] **Step 3: Run repository-required lint and format gates**
 
 Run:
 
@@ -707,7 +707,7 @@ cargo +nightly fmt -p emerald -p emerald-mbt --check
 
 Expected: change-scoped gates pass. Do not edit unrelated baseline files merely to make workspace-wide gates green.
 
-- [ ] **Step 4: Run final static checks and inspect the diff**
+- [x] **Step 4: Run final static checks and inspect the diff**
 
 Run:
 
