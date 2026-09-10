@@ -69,6 +69,8 @@ module emerald_mbt {
     }
   }
 
+  // Without timeout failures, nodes remain at round 0 for each height, so this
+  // action cannot exercise RestreamProposal.
   action step_no_failures = step_with_filter(no_failures_filter)
   action step_with_failures = step_with_filter(one_failure_per_height)
 }

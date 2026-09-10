@@ -54,6 +54,11 @@ impl quint_connect::Driver for EmeraldDriver {
                     app.get_value(hist, height, round, proposal)
                 )?;
             },
+            RestreamProposalAction(node, source_proposal, proposal) => {
+                self.perform(node, |app, hist|
+                    app.restream_proposal(hist, source_proposal, proposal)
+                )?;
+            },
             ReceivedProposalAction(node, proposal) => {
                 self.perform(node, |app, hist|
                     app.receive_proposal(hist, proposal)
