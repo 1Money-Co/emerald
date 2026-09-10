@@ -65,6 +65,32 @@ pub(super) struct DecodedStoredProposal {
     pub embedded_payload: Option<Bytes>,
 }
 
+impl DecodedStoredProposal {
+    pub fn hydrate_verified(
+        self,
+        key: (Height, Round, ValueId),
+        payload: Bytes,
+    ) -> Result<ProposedValue<EmeraldContext>, &'static str> {
+        let (height, round, value_id) = key;
+        if self.metadata.height != height
+            || self.metadata.round != round
+            || self.metadata.value_id != value_id
+        {
+            return Err("stored proposal key does not match its metadata");
+        }
+        if self
+            .embedded_payload
+            .is_some_and(|embedded| embedded != payload)
+        {
+            return Err("embedded proposal payload does not match shared storage");
+        }
+        if Value::new(payload.clone()).id() != value_id {
+            return Err("shared payload does not match the stored value ID");
+        }
+        Ok(self.metadata.hydrate(payload))
+    }
+}
+
 pub(super) fn decode_stored_proposal(bytes: Bytes) -> Result<DecodedStoredProposal, ProtoError> {
     let stored = proto::ProposedValue::decode(bytes)?;
     let proposer = stored

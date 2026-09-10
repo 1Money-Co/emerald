@@ -365,7 +365,7 @@ git commit -m "fix: hydrate proposals from shared payloads"
 - Produces `Db::compact_undecided_proposals(&WriteTransaction, &mut MigrationStats)`.
 - Extends migration statistics with proposal rows read, compacted rows, source bytes, and compact bytes.
 
-- [ ] **Step 1: Write the successful migration and reopen test**
+- [x] **Step 1: Write the successful migration and reopen test**
 
 Create a raw pre-change database containing a legacy-full `ProtobufCodec` proposal row and matching legacy payload.
 After `initialize_schema`, assert the raw row is compact and a normal read reconstructs the full value:
@@ -411,7 +411,7 @@ fn proposal_metadata_migration_compacts_legacy_full_rows_and_reopens() {
 }
 ```
 
-- [ ] **Step 2: Write table-driven migration rollback tests**
+- [x] **Step 2: Write table-driven migration rollback tests**
 
 For each of these corrupt fixtures, snapshot the raw proposal and legacy tables, call `initialize_schema`, assert the
 fixed error reason, and assert both tables remain byte-for-byte unchanged:
@@ -432,7 +432,7 @@ fixed error reason, and assert both tables remain byte-for-byte unchanged:
 Name the test `proposal_metadata_migration_rejects_corruption_without_mutation` and build every fixture through raw
 redb writes so no production validation preconditions mask the migration behavior.
 
-- [ ] **Step 3: Run migration tests and verify red**
+- [x] **Step 3: Run migration tests and verify red**
 
 Run:
 
@@ -443,7 +443,7 @@ cargo test -p emerald proposal_metadata_migration_ -- --nocapture
 Expected: the successful case retains a full row and the corruption fixtures do not produce the new contextual
 errors because startup compaction is not implemented.
 
-- [ ] **Step 4: Implement validate-then-rewrite migration**
+- [x] **Step 4: Implement validate-then-rewrite migration**
 
 Extend `UndecidedBlockDataMigrationStats`:
 
@@ -483,7 +483,7 @@ self.metrics.add_writes(
 );
 ```
 
-- [ ] **Step 5: Run migration, compatibility, and reopen tests**
+- [x] **Step 5: Run migration, compatibility, and reopen tests**
 
 Run:
 
@@ -495,7 +495,7 @@ cargo test -p emerald legacy_undecided_block_data_migration_ -- --nocapture
 
 Expected: every test passes and failed initialization leaves all pre-existing rows unchanged.
 
-- [ ] **Step 6: Commit the migration increment**
+- [x] **Step 6: Commit the migration increment**
 
 ```bash
 git add app/src/store.rs
