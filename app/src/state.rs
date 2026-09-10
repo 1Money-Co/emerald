@@ -814,9 +814,10 @@ impl State {
 
         let mut parts = Vec::with_capacity(record.payload.chunks(CHUNK_SIZE).len() + 2);
         parts.push(ProposalPart::Init(attestation.init));
-        for chunk in record.payload.chunks(CHUNK_SIZE) {
+        for start in (0..record.payload.len()).step_by(CHUNK_SIZE) {
+            let end = (start + CHUNK_SIZE).min(record.payload.len());
             parts.push(ProposalPart::Data(ProposalData::new(
-                Bytes::copy_from_slice(chunk),
+                record.payload.slice(start..end),
             )));
         }
         parts.push(ProposalPart::Fin(attestation.fin));
@@ -851,37 +852,25 @@ impl State {
         Bytes::from(random_bytes)
     }
 
-    /// Creates a new proposal value for the given height
-    /// Returns either a previously built proposal or creates a new one
-    pub async fn propose_value(
+    /// Builds, authenticates, and atomically persists a fresh local proposal before returning it.
+    pub async fn prepare_local_proposal(
         &mut self,
         height: Height,
         round: Round,
         data: Bytes,
-    ) -> eyre::Result<LocallyProposedValue<EmeraldContext>> {
+    ) -> eyre::Result<(
+        LocallyProposedValue<EmeraldContext>,
+        Vec<StreamMessage<ProposalPart>>,
+    )> {
         assert_eq!(height, self.consensus_height);
         assert_eq!(round, self.consensus_round);
 
-        // We create a new value.
-        let value = Value::new(data.clone());
+        let proposal = LocallyProposedValue::new(height, round, Value::new(data.clone()));
+        let messages = self
+            .stream_proposal(proposal.clone(), data, Round::Nil)
+            .await?;
 
-        let proposal: ProposedValue<EmeraldContext> = ProposedValue {
-            height,
-            round,
-            valid_round: Round::Nil,
-            proposer: self.address, // We are the proposer
-            value,
-            validity: Validity::Valid, // Our proposals are de facto valid
-        };
-
-        // Store the proposal and its block data
-        self.store_undecided_value(&proposal, data).await?;
-
-        Ok(LocallyProposedValue::new(
-            proposal.height,
-            proposal.round,
-            proposal.value,
-        ))
+        Ok((proposal, messages))
     }
 
     fn stream_id(&mut self, height: Height, round: Round) -> StreamId {
@@ -988,10 +977,12 @@ impl State {
 
         // Data
         {
-            for chunk in data.chunks(CHUNK_SIZE) {
-                let chunk_data = ProposalData::new(Bytes::copy_from_slice(chunk));
-                parts.push(ProposalPart::Data(chunk_data));
-                hasher.update(chunk);
+            for start in (0..data.len()).step_by(CHUNK_SIZE) {
+                let end = (start + CHUNK_SIZE).min(data.len());
+                hasher.update(&data[start..end]);
+                parts.push(ProposalPart::Data(ProposalData::new(
+                    data.slice(start..end),
+                )));
             }
         }
 
@@ -1121,6 +1112,7 @@ pub fn decode_value(bytes: Bytes) -> Result<Value, ProtoError> {
 #[cfg(test)]
 mod tests {
     use malachitebft_app_channel::{AppMsg, Channels, NetworkMsg};
+    use malachitebft_eth_cli::config::TimeoutConfig;
     use malachitebft_eth_types::secp256k1::PrivateKey;
     use malachitebft_eth_types::Validator;
     use tokio::sync::mpsc;
@@ -1481,20 +1473,19 @@ jwt_token_path = "./assets/jwt.hex"
     }
 
     #[tokio::test]
-    async fn local_stream_persists_attestation_before_returning_messages() {
+    async fn local_proposal_persists_attestation_in_one_write() {
         let (mut state, _dir) = make_test_state().await;
         let height = Height::new(1426);
         let round = Round::new(0);
         let payload = Bytes::from_static(b"local-attested-proposal");
-        let proposal = state
-            .propose_value(height, round, payload.clone())
+        let writes_before = state.store.write_count();
+
+        let (proposal, messages) = state
+            .prepare_local_proposal(height, round, payload)
             .await
             .unwrap();
 
-        let messages = state
-            .stream_proposal(proposal.clone(), payload, Round::Nil)
-            .await
-            .unwrap();
+        assert_eq!(state.store.write_count(), writes_before + 1);
         assert!(!messages.is_empty());
 
         let stored = state
@@ -1504,6 +1495,39 @@ jwt_token_path = "./assets/jwt.hex"
             .unwrap()
             .expect("streamed proposal must be stored");
         assert!(stored.attestation.is_some());
+    }
+
+    #[tokio::test]
+    async fn maximum_local_proposal_preparation_meets_default_deadline() {
+        let (mut state, _dir) = make_test_state().await;
+        let payload = Bytes::from(vec![0xA5; BLOCK_SIZE]);
+        let deadline = TimeoutConfig::default().timeout_propose;
+
+        let (proposal, messages) = tokio::time::timeout(
+            deadline,
+            state.prepare_local_proposal(Height::new(1426), Round::new(0), payload),
+        )
+        .await
+        .expect("maximum local proposal must be durable before timeout_propose")
+        .unwrap();
+
+        assert_eq!(proposal.value.extensions.len(), BLOCK_SIZE);
+        assert_eq!(messages.len(), BLOCK_SIZE.div_ceil(CHUNK_SIZE) + 3);
+    }
+
+    #[tokio::test]
+    async fn local_proposal_parts_share_the_payload_allocation() {
+        let (state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(0);
+        let payload = Bytes::from(vec![0xA5; CHUNK_SIZE * 2 + 17]);
+        let proposal = LocallyProposedValue::new(height, round, Value::new(payload.clone()));
+
+        let parts = state.make_proposal_parts(proposal, payload, Round::Nil);
+        let data_parts: Vec<_> = parts.iter().filter_map(ProposalPart::as_data).collect();
+
+        assert_eq!(data_parts.len(), 3);
+        assert!(data_parts.iter().all(|part| !part.bytes.is_unique()));
     }
 
     #[tokio::test]
@@ -1591,12 +1615,8 @@ jwt_token_path = "./assets/jwt.hex"
         let height = Height::new(1426);
         let round = Round::new(0);
         let payload = Bytes::from_static(b"authenticated-replay");
-        let proposal = state
-            .propose_value(height, round, payload.clone())
-            .await
-            .unwrap();
-        let streamed = state
-            .stream_proposal(proposal.clone(), payload, Round::Nil)
+        let (proposal, streamed) = state
+            .prepare_local_proposal(height, round, payload)
             .await
             .unwrap();
 
@@ -1631,17 +1651,37 @@ jwt_token_path = "./assets/jwt.hex"
     }
 
     #[tokio::test]
+    async fn attested_replay_parts_share_one_payload_allocation() {
+        let (mut state, _dir) = make_test_state().await;
+        let (proposal, _) = store_foreign_attested_proposal(&mut state, true).await;
+
+        let AttestedReplay::Ready(parts) = state
+            .prepare_attested_replay(
+                proposal.height,
+                proposal.round,
+                proposal.valid_round,
+                proposal.proposer,
+                proposal.value.id(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("stored foreign proposal must be replayable");
+        };
+        let data_parts: Vec<_> = parts.iter().filter_map(ProposalPart::as_data).collect();
+
+        assert_eq!(data_parts.len(), 2);
+        assert!(data_parts.iter().all(|part| !part.bytes.is_unique()));
+    }
+
+    #[tokio::test]
     async fn attested_replay_rejects_an_effect_with_a_different_pol_round() {
         let (mut state, _dir) = make_test_state().await;
         let height = Height::new(1426);
         let round = Round::new(0);
         let payload = Bytes::from_static(b"attested-replay-identity");
-        let proposal = state
-            .propose_value(height, round, payload.clone())
-            .await
-            .unwrap();
-        state
-            .stream_proposal(proposal.clone(), payload, Round::Nil)
+        let (proposal, _) = state
+            .prepare_local_proposal(height, round, payload)
             .await
             .unwrap();
 

@@ -7,7 +7,7 @@ use color_eyre::eyre::{self, eyre, OptionExt};
 use malachitebft_app_channel::app::engine::host::Next;
 use malachitebft_app_channel::app::streaming::StreamContent;
 use malachitebft_app_channel::app::types::core::{Round, Validity};
-use malachitebft_app_channel::app::types::{LocallyProposedValue, ProposedValue};
+use malachitebft_app_channel::app::types::ProposedValue;
 use malachitebft_app_channel::{AppMsg, Channels, NetworkMsg};
 use malachitebft_eth_cli::config::EmeraldConfig;
 use malachitebft_eth_engine::engine::Engine;
@@ -215,7 +215,7 @@ pub async fn on_get_value(
 
     // Here it is important that, if we have previously built a value for this height and round,
     // we send back the very same value.
-    let (proposal, bytes) = match state.get_previously_built_value(height, round).await? {
+    let (proposal, stream_messages) = match state.get_previously_built_value(height, round).await? {
         PreviouslyBuiltValue::UnsafeCandidates {
             candidate_count,
             has_non_local_proposer,
@@ -246,7 +246,10 @@ pub async fn on_get_value(
                 .get_block_data(height, round, proposal.value.id())
                 .await?
                 .ok_or_else(|| eyre!("Block data not found for previously built value"))?;
-            (proposal, bytes)
+            let stream_messages = state
+                .stream_proposal(proposal.clone(), bytes, Round::Nil)
+                .await?;
+            (proposal, stream_messages)
         }
         PreviouslyBuiltValue::Absent => {
             // Check if the execution client is syncing and behind the consensus height
@@ -283,21 +286,10 @@ pub async fn on_get_value(
                 let bytes = Bytes::from(execution_payload.as_ssz_bytes());
                 debug!("🎁 block size: {:?}, height: {}", bytes.len(), height);
 
-                // Prepare block proposal.
-                let proposal: LocallyProposedValue<EmeraldContext> =
-                    state.propose_value(height, round, bytes.clone()).await?;
-
-                (proposal, bytes)
+                state.prepare_local_proposal(height, round, bytes).await?
             }
         }
     };
-
-    // Malachite requests GetValue only when it has no valid value, so its proposal always uses a
-    // nil POL round. A stored defined-POL proposal is handled by recovery instead of being
-    // rewritten into a different envelope for this round.
-    let stream_messages = state
-        .stream_proposal(proposal.clone(), bytes, Round::Nil)
-        .await?;
 
     // Send it to consensus only after the attested stream is durable.
     if reply.send(proposal.clone()).is_err() {

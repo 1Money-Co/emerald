@@ -635,11 +635,16 @@ proposers/POL rounds, and `conflict.field`, then return `Ok(None)`. Propagate `S
 `on_received_proposal_part` return before sending its reply. Malachite deduplicates a same-value proposal before
 reconsidering `pol_round`, so forwarding a `ValidRound` conflict to consensus would not repair the retained envelope.
 
-- [ ] **Step 5: Convert local construction and streaming to the two-phase aggregate write**
+- [ ] **Step 5: Persist fresh local proposals in one attested aggregate write**
 
-Make `propose_value` and the build branch of `prepare_restream_proposal` call `store_unattested_proposal` with
-`UndecidedWriteSource::Proposal`. Accept only `Canonical`; turn `Conflict` into an `eyre` error carrying the key
-and field.
+Add `prepare_local_proposal(height, round, data)`. It constructs the `LocallyProposedValue`, builds and signs the
+proposal parts, and calls `write_undecided_proposal` once with payload, metadata, and attestation. Only after that
+transaction succeeds does it assign a stream ID and return the proposal plus prepared messages. Accept only
+`Canonical`; turn `Conflict` into an `eyre` error carrying the key and field.
+
+The build branch of `prepare_restream_proposal` remains an unattested write followed by `stream_proposal`, because
+the current-round metadata must exist before a later proposer-driven restream creates its envelope. Sync and upgrade
+recovery also continue to use the aggregate backfill transition.
 
 Change `stream_id` and `stream_proposal` as follows:
 
@@ -684,11 +689,19 @@ pub async fn stream_proposal(
 ```
 
 Extract `make_stream_messages(height, round, parts)` from the current sequence-building loop. It appends the stream
-terminator and calls `stream_id(height, round)`, eliminating the consensus-round unwrap.
+terminator and calls `stream_id(height, round)`, eliminating the consensus-round unwrap. Build data parts with
+`Bytes::slice` ranges so local construction and authenticated replay share one payload allocation instead of copying
+each chunk.
+
+Add `local_proposal_persists_attestation_in_one_write` using the real redb write counter. Add
+`maximum_local_proposal_preparation_meets_default_deadline` with the 10 MiB maximum test payload and Malachite's
+default `timeout_propose`. Add allocation-sharing regressions for local and authenticated replay parts.
 
 - [ ] **Step 6: Prepare before replying in `on_get_value`**
 
-Call `state.stream_proposal(..., Round::Nil).await?` before `reply.send(proposal.clone())`. Malachite reaches
+For a fresh value, call `state.prepare_local_proposal(...)` so creation, signing, and persistence complete in one
+aggregate write before `reply.send(proposal.clone())`. A reusable stored nil-POL proposal still calls
+`state.stream_proposal(..., Round::Nil).await?` to backfill any missing attestation before the reply. Malachite reaches
 `GetValue` only when it has no valid value and its `propose()` transition uses a nil POL round. Make
 `get_previously_built_value` classify the stored candidates as `Absent`, `Reusable`, or `UnsafeCandidates`. Exactly
 one local proposal is reusable and retains its stored `valid_round`; multiple candidates or any candidate from a

@@ -121,12 +121,11 @@ Four properties of the existing storage make this sharper than a fresh-database 
 - Databases upgraded into this release legitimately hold payload and metadata with no attestation, for every
   undecided proposal carried across the upgrade. A later stream for the same key would otherwise attach its own
   attestation to first-writer metadata it does not describe.
-- Three write paths have no envelope available when they write. `propose_value` and the build branch in
-  `prepare_restream_proposal` store payload and metadata before `stream_proposal` builds the parts, so the signature
-  does not exist yet and arrives a moment later; `on_process_synced_value` stores a value that came through a
-  verified certificate and never had parts, so no signature ever arrives. A single-transaction write of all three
-  records is therefore unreachable on those paths, and the rules below define attested and unattested writes
-  separately rather than assuming an envelope is always present.
+- Two write paths have no envelope available when they first write. The build branch in `prepare_restream_proposal`
+  stores payload and metadata before `stream_proposal` builds the parts, so its signature arrives later;
+  `on_process_synced_value` stores a value that came through a verified certificate and never had parts. Fresh local
+  proposals instead build and sign their parts before one aggregate write, avoiding a second payload-sized database
+  pass on the GetValue deadline. The rules below retain attested and unattested writes for recovery and sync.
 - `ValueId` is a 64-bit `DefaultHasher` digest of the payload (`Value::new`), so the storage key does not pin the
   payload bytes. Byte equality must be checked, not inferred from a key match.
 - `ProposedValue` is not metadata-only on disk: its protobuf encoding includes `Value.extensions`, while the
@@ -140,12 +139,11 @@ Four properties of the existing storage make this sharper than a fresh-database 
 Every write of an undecided proposal goes through one function with two input shapes and an explicit source:
 
 - An **attested write** carries payload, metadata, and a `ProposalInit` and `ProposalFin` whose signature has
-  verified. Two paths produce one: `process_complete_proposal_parts`, for a peer's stream, and `stream_proposal`,
-  for parts the node has just built itself.
+  verified. Fresh local preparation, `process_complete_proposal_parts`, and `stream_proposal` produce this shape.
 - An **unattested write** carries payload and metadata with no envelope, because none is available at that moment.
-  Three paths produce one: `propose_value`, the build branch in `prepare_restream_proposal`, and
-  `on_process_synced_value`. Proposal construction and received streams share the proposal source. Sync has its own
-  source because it does not know the proposal's `pol_round` and synthesizes `Round::Nil`.
+  Two paths produce one: the build branch in `prepare_restream_proposal` and `on_process_synced_value`. Proposal
+  construction and received streams share the proposal source. Sync has its own source because it does not know the
+  proposal's `pol_round` and synthesizes `Round::Nil`.
 
 Before inspecting stored state, every input must be internally coherent:
 
@@ -288,8 +286,8 @@ exhaustion vector.
 All four write paths use the same function and therefore share these rules:
 
 - Received proposals, from `process_complete_proposal_parts`: one attested write. Every conflict returns no value.
-- Local proposals, from `propose_value` then `stream_proposal`: an unattested write followed by an attested one that
-  backfills the envelope from the parts just built.
+- Fresh local proposals, from `prepare_local_proposal`: build and sign the envelope, then persist payload, metadata,
+  and attestation in one aggregate write before returning the prepared stream.
 - Locally rebuilt re-proposals, from the build branch in `prepare_restream_proposal` then `stream_proposal`: the same
   two-phase shape.
 - Synced values, from `on_process_synced_value`: one unattested sync write. It either inserts a new nil-valid-round
@@ -308,19 +306,16 @@ Caller behavior is explicit so that a storage outcome cannot leave consensus and
 | Sync | Reply `Some(canonical value)` | Warn and reply `None` | Return error; no reply |
 | Foreign replay | Publish after all checks | Warn; publish nothing | Log and publish nothing |
 
-`stream_proposal` therefore becomes a fallible preparation step rather than an infallible iterator. It builds and
-signs the parts, performs the attested write, and returns the messages only after persistence succeeds. `on_get_value`
-performs this preparation before sending its `LocallyProposedValue` reply to consensus; it then publishes the already
-prepared messages. This closes the existing window in which consensus could retain a local proposal whose attestation
-failed to persist. `on_get_value` streams a nil POL round only for a new or previously stored nil-POL proposal. A
-stored defined-POL proposal is left for recovery, and the handler returns immediately without replying. The pinned
-connector absorbs the closed reply channel and forwards no local value to consensus. Re-proposal preparation follows
-the same persist-before-publish order.
+`prepare_local_proposal` builds and signs a fresh proposal, performs one attested aggregate write, and returns the
+proposal and stream messages only after persistence succeeds. `on_get_value` can therefore reply and publish without
+a second database pass. `stream_proposal` remains the fallible attestation/backfill step for stored nil-POL proposals
+and locally rebuilt re-proposals. This closes the window in which consensus could retain a local proposal whose
+attestation failed to persist while keeping upgrade and sync backfill behavior intact.
 
-Signing at proposal-construction time, so that the local paths could insert all three records at once, is a viable
-alternative that would remove the two-phase window. It is not adopted here because it restructures `propose_value`
-and `make_proposal_parts` for no behavioral gain over the backfill transition, which sync and upgraded databases
-require regardless.
+Both local construction and authenticated replay make `ProposalData` chunks with `Bytes::slice`, so the parts share
+one owning payload allocation instead of copying every chunk. A stored defined-POL proposal is left for recovery, and
+the handler returns immediately without replying. The pinned connector absorbs the closed reply channel and forwards
+no local value to consensus.
 
 ### Restream Dispatch
 
@@ -356,9 +351,9 @@ deduplicates by value ID before reconsidering `pol_round`.
 
 The replay branch loads the metadata, attestation, and payload from `(height, round, value_id)` and checks the same
 key, embedded-value, separate-payload, and envelope coherence invariant before publishing. It then emits
-`ProposalPart::Init(stored init)`, re-chunks the payload at `CHUNK_SIZE` into `ProposalPart::Data` parts, and emits
-`ProposalPart::Fin(stored fin)`. Re-chunking is safe because the digest hashes the concatenated chunk bytes rather
-than the chunk boundaries, so a payload rechunked at a different size produces the same hash.
+`ProposalPart::Init(stored init)`, re-chunks the payload at `CHUNK_SIZE` into zero-copy `ProposalPart::Data` slices,
+and emits `ProposalPart::Fin(stored fin)`. Re-chunking is safe because the digest hashes the concatenated chunk bytes
+rather than the chunk boundaries, so a payload rechunked at a different size produces the same hash.
 
 The build branch is unchanged in behavior and keeps the `valid_round` lookup. That lookup exists to re-propose an
 older value at a new round, which legitimately requires a fresh signature over the new round, and it is reached only
@@ -555,8 +550,8 @@ Storage transition tests, covering each cell of the state machine:
 11. Empty key: an unattested write inserts payload and metadata; an attested write inserts all three.
 12. Full match: a byte-identical repeat of a stored proposal is idempotent under both write shapes and writes
     nothing.
-13. Backfill: coherent payload and metadata exist with no attestation, as after an upgrade, a local two-phase write,
-    or a synced value, and a matching attested write backfills only the attestation.
+13. Backfill: coherent payload and metadata exist with no attestation, as after an upgrade, a locally rebuilt
+    re-proposal, or a synced value, and a matching attested write backfills only the attestation.
 14. Backfill conflict: any attested write whose `init.pol_round` disagrees with the stored `valid_round` leaves the
     record unchanged and returns no proposal. This holds in both directions and for local and received streams.
 15. Payload disagreement on an attested proposal: a write whose payload bytes differ from the stored payload for the
@@ -586,6 +581,10 @@ Storage transition tests, covering each cell of the state machine:
 27. Stored candidate safety: assert `get_previously_built_value` marks both multiple candidates for one round and a
     single candidate authored by a non-local proposer as unsafe. Exercise `on_get_value` for both cases and assert it
     returns successfully without replying, building, or publishing.
+28. Fresh local persistence: prepare the maximum test payload, assert exactly one aggregate database write, and
+    require the durable attested proposal to be ready within Malachite's default proposal timeout.
+29. Payload allocation: assert locally built and authenticated replay data parts share one `Bytes` allocation rather
+    than owning per-chunk copies.
 
 ### Model-based coverage
 
@@ -625,9 +624,9 @@ The first access to a legacy record also validates the payload embedded in `Prop
 block-data record. A mismatch is surfaced as an integrity error rather than guessed or migrated; creating one
 requires both an interrupted old-format write and a second payload with the same 64-bit value ID.
 
-The backfill row in the transition rules is what makes that transition quiet rather than requiring an operator step.
-It also covers the ordinary local two-phase write, so it is exercised on every proposal a node makes rather than only
-during upgrades, which is the reason it is specified as a normal rule instead of a migration special case.
+The backfill row in the transition rules makes upgrade and locally rebuilt re-proposal transitions quiet rather than
+requiring an operator step. Fresh local proposals no longer depend on backfill because their attestation is included
+in the initial aggregate write.
 
 ## Out-of-Scope Finding
 

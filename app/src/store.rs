@@ -1015,6 +1015,11 @@ pub struct Store {
 }
 
 impl Store {
+    #[cfg(test)]
+    pub(crate) fn write_count(&self) -> u64 {
+        self.db.metrics.write_count()
+    }
+
     /// Opens a new store at the given path with the provided metrics.
     /// Called by the application when initializing the store.
     pub async fn open(
