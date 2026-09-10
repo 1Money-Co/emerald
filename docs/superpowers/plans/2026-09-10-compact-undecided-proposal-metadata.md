@@ -721,7 +721,7 @@ git diff --stat origin/seb/deduplicate-undecided-block-data...HEAD
 Expected: no whitespace errors, no forbidden proposal encoding or redundant copies/imports, and only planned files
 are modified or committed.
 
-- [ ] **Step 5: Push the existing PR branch**
+- [x] **Step 5: Push the existing PR branch**
 
 ```bash
 git push origin seb/deduplicate-undecided-block-data
@@ -730,7 +730,7 @@ gh pr view 22 --repo 1Money-Co/emerald --json url,headRefOid,state,statusCheckRo
 
 Expected: PR #22 is open and its head SHA matches local `HEAD`.
 
-- [ ] **Step 6: Reply to Frank's P1 thread**
+- [x] **Step 6: Reply to Frank's P1 thread**
 
 Reply to comment `3977079924` with this body:
 
@@ -755,7 +755,7 @@ one payload copy in the primary layout. The temporary N-1 block-data shadow rema
 release; its activated removal and offline redb compaction are tracked by interop issue #325.'
 ```
 
-- [ ] **Step 7: Reply to Frank's P3 thread**
+- [x] **Step 7: Reply to Frank's P3 thread**
 
 Reply to comment `3977083106` with this body:
 
