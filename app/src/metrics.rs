@@ -160,6 +160,11 @@ impl DbMetrics {
         self.db_write_count.inc();
     }
 
+    #[cfg(test)]
+    pub fn write_count(&self) -> u64 {
+        self.db_write_count.get()
+    }
+
     pub fn add_read_bytes(&self, bytes: u64) {
         self.db_read_bytes.inc_by(bytes);
         self.db_read_count.inc();
