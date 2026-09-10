@@ -517,7 +517,7 @@ git commit -m "fix: migrate proposal rows to compact metadata"
 - Produces `DecodedStoredValue::{Full(Value), IdOnly(ValueId)}`.
 - Extends `Db::recover_legacy_partial_commits` to repair ID-only decided rows in the same startup transaction.
 
-- [ ] **Step 1: Pin N-1 decoding of compact proposal rows**
+- [x] **Step 1: Pin N-1 decoding of compact proposal rows**
 
 Add a test helper that reproduces the N-1 value decoder without calling current strict `Value::from_proto`:
 
@@ -535,7 +535,7 @@ Write `rollback_compact_proposal_is_readable_by_n_minus_one` to encode a compact
 this helper, assert the ID is preserved and extensions are empty, then retrieve identical bytes from the exact legacy
 `(height, round, value_id)` row.
 
-- [ ] **Step 2: Write the failing N-1 commit re-upgrade test**
+- [x] **Step 2: Write the failing N-1 commit re-upgrade test**
 
 Simulate N-1 committing a compact proposal by raw-inserting:
 
@@ -548,7 +548,7 @@ Then call `initialize_schema` and assert `get_decided_value` returns `Value::new
 unchanged, the repaired row survives reopen, and migration statistics count one repaired decided-value row. Name the
 test `rollback_compact_proposal_n_minus_one_commit_is_repaired_on_reupgrade`.
 
-- [ ] **Step 3: Run rollback tests and verify red**
+- [x] **Step 3: Run rollback tests and verify red**
 
 Run:
 
@@ -559,7 +559,7 @@ cargo test -p emerald rollback_compact_proposal_ -- --nocapture
 Expected: the proposal compatibility test passes only after Task 1, while re-upgrade fails because current recovery
 routes the ID-only decided row through strict `Value::from_bytes`.
 
-- [ ] **Step 4: Implement storage-only decided-value decoding and repair**
+- [x] **Step 4: Implement storage-only decided-value decoding and repair**
 
 In `proposal_metadata.rs`, decode the outer `proto::Value`. Return `IdOnly` only when its nested bytes are exactly
 eight bytes; otherwise call strict `Value::from_proto` and return `Full`.
@@ -578,7 +578,7 @@ Update `recover_legacy_partial_commits` to:
 
 The ID-only path must remain private to store recovery; do not modify `types/src/value.rs`.
 
-- [ ] **Step 5: Run rollback, recovery, and atomic decided-state tests**
+- [x] **Step 5: Run rollback, recovery, and atomic decided-state tests**
 
 Run:
 
@@ -590,7 +590,7 @@ cargo test -p emerald decided_state_commit_ -- --nocapture
 
 Expected: every test passes, including existing hybrid-state and failpoint regressions.
 
-- [ ] **Step 6: Commit the rollback increment**
+- [x] **Step 6: Commit the rollback increment**
 
 ```bash
 git add app/src/store.rs app/src/store/proposal_metadata.rs

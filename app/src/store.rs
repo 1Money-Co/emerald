@@ -27,7 +27,9 @@ use thiserror::Error;
 mod keys;
 mod proposal_metadata;
 use keys::{HeightKey, UndecidedBlockDataKey, UndecidedValueKey};
-use proposal_metadata::{decode_stored_proposal, StoredProposalMetadata};
+use proposal_metadata::{
+    decode_stored_proposal, decode_stored_value, DecodedStoredValue, StoredProposalMetadata,
+};
 
 use crate::metrics::DbMetrics;
 use crate::payload::extract_block_header;
@@ -911,109 +913,135 @@ impl Db {
         tx: &redb::WriteTransaction,
         stats: &mut UndecidedBlockDataMigrationStats,
     ) -> Result<(), StoreError> {
-        let values = tx.open_table(DECIDED_VALUES_TABLE)?;
-        let certificates = tx.open_table(CERTIFICATES_TABLE)?;
-        let headers = tx.open_table(DECIDED_BLOCK_HEADERS_TABLE)?;
-        let primary = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
-        let legacy = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
-        let mut decided_payloads = tx.open_table(DECIDED_BLOCK_DATA_TABLE)?;
+        let mut value_repairs = Vec::new();
+        {
+            let values = tx.open_table(DECIDED_VALUES_TABLE)?;
+            let certificates = tx.open_table(CERTIFICATES_TABLE)?;
+            let headers = tx.open_table(DECIDED_BLOCK_HEADERS_TABLE)?;
+            let primary = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
+            let legacy = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
+            let mut decided_payloads = tx.open_table(DECIDED_BLOCK_DATA_TABLE)?;
 
-        for entry in values.iter()? {
-            let (height_key, encoded_value) = entry?;
-            let height = height_key.value();
-            let existing_decided_payload = decided_payloads
-                .get(&height)?
-                .map(|stored_payload| stored_payload.value());
-            let needs_promotion = existing_decided_payload.is_none();
-
-            let encoded_value = encoded_value.value();
-            let value = Value::from_bytes(&encoded_value).map_err(|_| {
-                StoreError::IrrecoverableDecidedState {
-                    height,
-                    reason: "stored value cannot be decoded",
-                }
-            })?;
-            let encoded_certificate =
-                certificates
+            for entry in values.iter()? {
+                let (height_key, encoded_value) = entry?;
+                let height = height_key.value();
+                let existing_decided_payload = decided_payloads
                     .get(&height)?
-                    .ok_or(StoreError::IrrecoverableDecidedState {
-                        height,
-                        reason: "missing certificate",
-                    })?;
-            let encoded_certificate = encoded_certificate.value();
-            let certificate = decode_certificate(&encoded_certificate).map_err(|_| {
-                StoreError::IrrecoverableDecidedState {
-                    height,
-                    reason: "stored certificate cannot be decoded",
-                }
-            })?;
-            let stored_header =
-                headers
-                    .get(&height)?
-                    .ok_or(StoreError::IrrecoverableDecidedState {
-                        height,
-                        reason: "missing stored header",
-                    })?;
+                    .map(|stored_payload| stored_payload.value());
+                let needs_promotion = existing_decided_payload.is_none();
 
-            if certificate.height != height {
-                return Err(StoreError::IrrecoverableDecidedState {
-                    height,
-                    reason: "certificate height does not match the decided value key",
-                });
-            }
-            if certificate.value_id != value.id() {
-                return Err(StoreError::IrrecoverableDecidedState {
-                    height,
-                    reason: "certificate value ID does not match the stored value",
-                });
-            }
-
-            let payload = match existing_decided_payload {
-                Some(payload) => payload,
-                None => {
-                    let primary_payload = primary.get(&(height, certificate.value_id))?;
-                    let legacy_payload = if primary_payload.is_none() {
-                        legacy.get(&(height, certificate.round, certificate.value_id))?
-                    } else {
-                        None
-                    };
-                    primary_payload
-                        .as_ref()
-                        .map(|value| value.value())
-                        .or_else(|| legacy_payload.as_ref().map(|value| value.value()))
+                let encoded_value = encoded_value.value();
+                let stored_value =
+                    decode_stored_value(Bytes::from(encoded_value)).map_err(|_| {
+                        StoreError::IrrecoverableDecidedState {
+                            height,
+                            reason: "stored value cannot be decoded",
+                        }
+                    })?;
+                let stored_value_id = match &stored_value {
+                    DecodedStoredValue::Full(value) => value.id(),
+                    DecodedStoredValue::IdOnly(value_id) => *value_id,
+                };
+                let encoded_certificate =
+                    certificates
+                        .get(&height)?
                         .ok_or(StoreError::IrrecoverableDecidedState {
                             height,
-                            reason: "missing its execution payload",
-                        })?
-                }
-            };
+                            reason: "missing certificate",
+                        })?;
+                let encoded_certificate = encoded_certificate.value();
+                let certificate = decode_certificate(&encoded_certificate).map_err(|_| {
+                    StoreError::IrrecoverableDecidedState {
+                        height,
+                        reason: "stored certificate cannot be decoded",
+                    }
+                })?;
+                let stored_header =
+                    headers
+                        .get(&height)?
+                        .ok_or(StoreError::IrrecoverableDecidedState {
+                            height,
+                            reason: "missing stored header",
+                        })?;
 
-            let recomputed = Value::new(Bytes::copy_from_slice(&payload));
-            if recomputed.id() != certificate.value_id || value.extensions.as_ref() != payload {
-                return Err(StoreError::IrrecoverableDecidedState {
-                    height,
-                    reason: "execution payload does not match the stored value ID and bytes",
-                });
-            }
-            let execution_payload = ExecutionPayloadV3::from_ssz_bytes(&payload).map_err(|_| {
-                StoreError::IrrecoverableDecidedState {
-                    height,
-                    reason: "execution payload cannot be decoded",
+                if certificate.height != height {
+                    return Err(StoreError::IrrecoverableDecidedState {
+                        height,
+                        reason: "certificate height does not match the decided value key",
+                    });
                 }
-            })?;
-            let expected_header = extract_block_header(&execution_payload).as_ssz_bytes();
-            if stored_header.value() != expected_header {
-                return Err(StoreError::IrrecoverableDecidedState {
-                    height,
-                    reason: "stored header does not match the execution payload",
-                });
-            }
+                if certificate.value_id != stored_value_id {
+                    return Err(StoreError::IrrecoverableDecidedState {
+                        height,
+                        reason: "certificate value ID does not match the stored value",
+                    });
+                }
 
-            if needs_promotion {
-                let payload_len = payload.len() as u64;
-                decided_payloads.insert(height, payload)?;
-                stats.recovered_decided_payloads += 1;
-                stats.recovered_decided_bytes += payload_len;
+                let payload = match existing_decided_payload {
+                    Some(payload) => payload,
+                    None => {
+                        let primary_payload = primary.get(&(height, certificate.value_id))?;
+                        let legacy_payload = if primary_payload.is_none() {
+                            legacy.get(&(height, certificate.round, certificate.value_id))?
+                        } else {
+                            None
+                        };
+                        primary_payload
+                            .as_ref()
+                            .map(|value| value.value())
+                            .or_else(|| legacy_payload.as_ref().map(|value| value.value()))
+                            .ok_or(StoreError::IrrecoverableDecidedState {
+                                height,
+                                reason: "missing its execution payload",
+                            })?
+                    }
+                };
+
+                let recomputed = Value::new(Bytes::copy_from_slice(&payload));
+                let stored_payload_matches = match &stored_value {
+                    DecodedStoredValue::Full(value) => value.extensions.as_ref() == payload,
+                    DecodedStoredValue::IdOnly(_) => true,
+                };
+                if recomputed.id() != certificate.value_id || !stored_payload_matches {
+                    return Err(StoreError::IrrecoverableDecidedState {
+                        height,
+                        reason: "execution payload does not match the stored value ID and bytes",
+                    });
+                }
+                let execution_payload =
+                    ExecutionPayloadV3::from_ssz_bytes(&payload).map_err(|_| {
+                        StoreError::IrrecoverableDecidedState {
+                            height,
+                            reason: "execution payload cannot be decoded",
+                        }
+                    })?;
+                let expected_header = extract_block_header(&execution_payload).as_ssz_bytes();
+                if stored_header.value() != expected_header {
+                    return Err(StoreError::IrrecoverableDecidedState {
+                        height,
+                        reason: "stored header does not match the execution payload",
+                    });
+                }
+
+                if matches!(stored_value, DecodedStoredValue::IdOnly(_)) {
+                    let encoded = recomputed.to_bytes()?.to_vec();
+                    stats.repaired_compact_decided_values += 1;
+                    stats.repaired_compact_decided_value_bytes += encoded.len() as u64;
+                    value_repairs.push((height, encoded));
+                }
+                if needs_promotion {
+                    let payload_len = payload.len() as u64;
+                    decided_payloads.insert(height, payload)?;
+                    stats.recovered_decided_payloads += 1;
+                    stats.recovered_decided_bytes += payload_len;
+                }
+            }
+        }
+
+        if !value_repairs.is_empty() {
+            let mut values = tx.open_table(DECIDED_VALUES_TABLE)?;
+            for (height, encoded) in value_repairs {
+                values.insert(height, encoded)?;
             }
         }
 
@@ -2283,6 +2311,136 @@ mod tests {
             }
             assert!(!has_table(&db, "undecided_block_data_v2"));
         }
+    }
+
+    fn decode_value_like_n_minus_one(value: proto::Value) -> Value {
+        let bytes = value.value.unwrap();
+        Value {
+            value: u64::from_be_bytes(bytes[..8].try_into().unwrap()),
+            extensions: bytes.slice(8..),
+        }
+    }
+
+    #[test]
+    fn rollback_compact_proposal_is_readable_by_n_minus_one() {
+        let (db, _dir) = create_test_db("rollback_compact_proposal");
+        let height = Height::new(81);
+        let round = Round::new(4);
+        let payload = Bytes::from_static(b"rollback-compact-payload");
+        let value = Value::new(payload.clone());
+        let proposal = ProposedValue {
+            height,
+            round,
+            valid_round: Round::new(2),
+            proposer: Address::new([8; 20]),
+            value: value.clone(),
+            validity: Validity::Valid,
+        };
+        db.insert_undecided_block_data(height, round, value.id(), payload.clone())
+            .unwrap();
+        db.insert_undecided_proposal(proposal).unwrap();
+
+        let raw = raw_undecided_proposal(&db, (height, round, value.id()));
+        let stored = proto::ProposedValue::decode(raw.as_slice()).unwrap();
+        let decoded = decode_value_like_n_minus_one(stored.value.unwrap());
+
+        assert_eq!(decoded.id(), value.id());
+        assert!(decoded.extensions.is_empty());
+        assert_eq!(
+            get_legacy_undecided_block_data(&db, height, round, value.id()),
+            Some(payload)
+        );
+    }
+
+    #[test]
+    fn rollback_compact_proposal_n_minus_one_commit_is_repaired_on_reupgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollback_compact_commit.redb");
+        let metrics = DbMetrics::new();
+        let db = Db::new(&path, 1024 * 1024, metrics.clone()).unwrap();
+        let height = Height::new(82);
+        let round = Round::new(5);
+        let payload = make_execution_payload_bytes(height.as_u64());
+        let value = Value::new(payload.clone());
+        let execution_payload = ExecutionPayloadV3::from_ssz_bytes(&payload).unwrap();
+        let header = Bytes::from(extract_block_header(&execution_payload).as_ssz_bytes());
+        let certificate = CommitCertificate {
+            height,
+            round,
+            value_id: value.id(),
+            commit_signatures: Vec::new(),
+        };
+        let proposal = ProposedValue {
+            height,
+            round,
+            valid_round: Round::new(3),
+            proposer: Address::new([9; 20]),
+            value: value.clone(),
+            validity: Validity::Valid,
+        };
+        let compact_proposal = StoredProposalMetadata::from_proposal(&proposal)
+            .encode()
+            .unwrap();
+        let id_only_value = Value {
+            value: value.id().as_u64(),
+            extensions: Bytes::new(),
+        }
+        .to_bytes()
+        .unwrap();
+
+        let tx = db.db.begin_write().unwrap();
+        tx.open_table(UNDECIDED_PROPOSALS_TABLE)
+            .unwrap()
+            .insert((height, round, value.id()), compact_proposal.to_vec())
+            .unwrap();
+        tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)
+            .unwrap()
+            .insert((height, round, value.id()), payload.to_vec())
+            .unwrap();
+        tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)
+            .unwrap()
+            .insert((height, value.id()), payload.to_vec())
+            .unwrap();
+        tx.open_table(DECIDED_VALUES_TABLE)
+            .unwrap()
+            .insert(height, id_only_value.to_vec())
+            .unwrap();
+        tx.open_table(CERTIFICATES_TABLE)
+            .unwrap()
+            .insert(height, encode_certificate(&certificate).unwrap())
+            .unwrap();
+        tx.open_table(DECIDED_BLOCK_HEADERS_TABLE)
+            .unwrap()
+            .insert(height, header.to_vec())
+            .unwrap();
+        tx.open_table(DECIDED_BLOCK_DATA_TABLE)
+            .unwrap()
+            .insert(height, payload.to_vec())
+            .unwrap();
+        tx.commit().unwrap();
+
+        db.initialize_schema().unwrap();
+
+        assert_eq!(
+            db.get_decided_value(height).unwrap(),
+            Some(DecidedValue {
+                value: value.clone(),
+                certificate: certificate.clone(),
+            })
+        );
+        assert_eq!(metrics.write_count(), 1);
+        assert_eq!(
+            metrics.write_bytes(),
+            value.to_bytes().unwrap().len() as u64
+        );
+        drop(db);
+
+        let reopened = Db::new(path, 1024 * 1024, DbMetrics::new()).unwrap();
+        reopened.initialize_schema().unwrap();
+        assert_eq!(
+            reopened.get_decided_value(height).unwrap(),
+            Some(DecidedValue { value, certificate })
+        );
     }
 
     #[test]

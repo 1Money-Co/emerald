@@ -65,6 +65,34 @@ pub(super) struct DecodedStoredProposal {
     pub embedded_payload: Option<Bytes>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum DecodedStoredValue {
+    Full(Value),
+    IdOnly(ValueId),
+}
+
+pub(super) fn decode_stored_value(bytes: Bytes) -> Result<DecodedStoredValue, ProtoError> {
+    let stored = proto::Value::decode(bytes)?;
+    let value_bytes = stored
+        .value
+        .ok_or_else(|| ProtoError::missing_field::<proto::Value>("value"))?;
+
+    if value_bytes.len() == VALUE_ID_LEN {
+        let id = u64::from_be_bytes(
+            value_bytes
+                .as_ref()
+                .try_into()
+                .map_err(|_| ProtoError::Other("Failed to decode stored value ID".to_owned()))?,
+        );
+        Ok(DecodedStoredValue::IdOnly(ValueId::new(id)))
+    } else {
+        Value::from_proto(proto::Value {
+            value: Some(value_bytes),
+        })
+        .map(DecodedStoredValue::Full)
+    }
+}
+
 impl DecodedStoredProposal {
     pub fn hydrate_verified(
         self,
@@ -183,5 +211,23 @@ mod tests {
             StoredProposalMetadata::from_proposal(&proposal)
         );
         assert_eq!(decoded.embedded_payload, Some(payload));
+    }
+
+    #[test]
+    fn stored_value_decoder_distinguishes_full_and_id_only_values() {
+        let value = Value::new(Bytes::from_static(b"execution-payload"));
+        assert_eq!(
+            decode_stored_value(value.to_bytes().unwrap()).unwrap(),
+            DecodedStoredValue::Full(value.clone())
+        );
+
+        let id_only = Value {
+            value: value.id().as_u64(),
+            extensions: Bytes::new(),
+        };
+        assert_eq!(
+            decode_stored_value(id_only.to_bytes().unwrap()).unwrap(),
+            DecodedStoredValue::IdOnly(value.id())
+        );
     }
 }
