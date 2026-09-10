@@ -64,7 +64,7 @@ Round-specific and payload-specific data remain separate:
 
 | Data | Key | Contents |
 |------|-----|----------|
-| Undecided proposal metadata | `(height, round, value_id)` | Round, proposer, valid round, value, and validity |
+| Undecided proposal metadata | `(height, round, value_id)` | Identity and round fields; no payload |
 | Undecided block data v2 | `(height, value_id)` | Complete execution payload bytes |
 | Decided block data | `height` | Complete execution payload bytes after commitment |
 
@@ -113,6 +113,9 @@ the exact round so a missing v2 row can fall back to the legacy `(height, round,
 ignores round. Restream similarly selects source metadata by proposal round while loading shared payload bytes.
 Recovery and synced-value ingestion use the same shared write and read boundaries.
 
+Runtime proposal reads hydrate compact metadata from v2 or the exact legacy fallback, recompute `Value::new(payload)`,
+and require its `ValueId` to match both the table key and metadata before returning a full `ProposedValue`.
+
 Pruning remains height-based. The v2 block-data table retains rows whose height is at or above the existing temporary
 data retention boundary and removes older rows alongside undecided proposal metadata.
 
@@ -127,9 +130,10 @@ opening and accidentally creating it. When present, initialization performs migr
 4. Skip later rows when their bytes are identical.
 5. Abort on any same-key row whose bytes differ.
 6. Retain the legacy table as a rollback shadow for one compatibility release.
-7. Backfill legacy rows for v2-backed proposal metadata written by an earlier v2-only build.
-8. Recover valid N-1 partial decided commits from certificate-bound undecided data.
-9. Commit the transaction.
+7. Validate all `undecided_values` rows and atomically rewrite full legacy proposals as compact metadata.
+8. Backfill legacy rows for v2-backed proposal metadata written by an earlier v2-only build.
+9. Recover valid N-1 partial decided commits from certificate-bound undecided data.
+10. Commit the transaction.
 
 An interrupted or conflicting migration leaves the legacy table intact and publishes no successful migration
 metrics. The procedure also handles an existing v2 table defensively: identical rows merge as no-ops and conflicting
@@ -211,9 +215,15 @@ so full storage reclamation begins only after a later activated release removes 
 Deleting the legacy table frees its redb pages for reuse but may not immediately shrink the database file on the
 filesystem. Startup will not invoke redb's potentially slow full compaction. If returning file space to the filesystem
 is operationally necessary, operators may perform an explicit offline compaction as a separate maintenance action.
+Replacing full proposal rows with compact metadata has the same distinction: redb can reuse the released pages, but
+the logical migration does not guarantee that `store.db` shrinks.
+
+[Interop issue #325][issue-325] owns the activated removal of the temporary legacy shadow and the explicit offline
+compaction procedure. Until that release, the shadow is the only remaining round-keyed payload duplication.
 
 Update Emerald's production operator documentation with the backup, headroom, compatibility-window downgrade,
 migration-summary, and later-removal expectations.
 
 [issue-318]: https://github.com/1Money-Co/1money-interoperability-protocol/issues/318
+[issue-325]: https://github.com/1Money-Co/1money-interoperability-protocol/issues/325
 [pr-17]: https://github.com/1Money-Co/emerald/pull/17

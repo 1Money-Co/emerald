@@ -120,6 +120,9 @@ The first startup with the round-independent payload schema migrates the local r
 `undecided_block_data` table to `undecided_block_data_v2`. The migration keeps one payload per
 `(height, value_id)` and removes identical round duplicates from the primary v2 layout. For one compatibility release,
 the legacy table remains as an N-1 rollback shadow and receives the same payload under each proposal's round key.
+The same startup transaction rewrites existing `undecided_values` rows to payload-free proposal identity and
+round-specific metadata. Runtime reads hydrate each proposal from v2, fall back to the exact legacy round when
+required for compatibility, and verify that the payload-derived `ValueId` matches the stored key and metadata.
 
 Before upgrading each node:
 
@@ -128,15 +131,22 @@ Before upgrading each node:
 3. Reserve temporary free space for approximately one deduplicated undecided payload set plus redb overhead.
 4. Start the new binary and wait for the `undecided_block_data_migration` event before upgrading another validator.
 
-Migration copies every unique payload into the v2 table and validates all duplicate bytes in the same transaction.
-That copy requires headroom even when many legacy rows are duplicates. The legacy shadow is deliberately retained, so
-this release does not reclaim its pages and requires space for both layouts. A later activated release will remove the
-shadow after N-1 rollback is no longer required.
+Migration copies every unique payload into the v2 table, validates all duplicate bytes, and validates every proposal
+row before replacing any full proposal rows in the same transaction. That copy requires headroom even when many
+legacy rows are duplicates. Compact proposal replacement makes old redb pages reusable but does not guarantee that
+`store.db` shrinks. The legacy block-data shadow is deliberately retained and is the only round-keyed payload
+duplication in this release, so space is still required for both payload layouts.
+
+[Interop issue #325](https://github.com/1Money-Co/1money-interoperability-protocol/issues/325) owns the later activated
+release that removes the shadow and the operator procedure for explicit offline redb compaction when filesystem-space
+reclamation is required. This release does not delete the shadow or run automatic compaction during startup.
 
 The same startup transaction repairs the N-1 crash window where decided value, certificate, and header rows committed
 but their payload remained only in undecided storage. Emerald promotes the certificate-bound payload only after its
 value ID, stored value bytes, SSZ encoding, and stored header all agree. Missing or conflicting data aborts startup
-without changing the database. New commits persist the payload and all three metadata rows in one transaction.
+without changing the database. It also repairs the ID-only decided value that N-1 may write after reading compact
+proposal metadata, using the same certificate, payload, SSZ, and header checks. New commits persist the payload and all
+three metadata rows in one transaction.
 
 If legacy rows use the same `(height, value_id)` with different bytes, startup fails without changing the legacy
 table. The error and structured log identify the incoming legacy round, the existing round when it came from legacy

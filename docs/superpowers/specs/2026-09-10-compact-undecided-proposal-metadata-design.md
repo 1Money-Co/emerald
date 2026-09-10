@@ -81,7 +81,7 @@ For every `undecided_values` row:
 
 Only after all proposal rows validate does initialization replace queued full rows with compact rows. Any error
 aborts the complete initialization transaction, including payload migration, legacy backfill, and decided-state
-repair.
+repair. These logical replacements allow redb to reuse released pages but do not guarantee that `store.db` shrinks.
 
 ## N-1 Rollback and Re-upgrade
 
@@ -115,7 +115,12 @@ legacy-shadow writes; proposal compaction must not count metadata bytes as paylo
 The primary `undecided_values` plus `undecided_block_data_v2` layout stores one execution payload per
 `(height, value_id)`. The retained N-1 `undecided_block_data` shadow still contains round-keyed payload copies during
 the one-release compatibility window. That temporary duplication is explicit and is removed only by the later
-activated release that ends N-1 rollback support.
+activated release that ends N-1 rollback support. It is the only remaining round-keyed payload duplication in this
+release.
+
+[Interop issue #325](https://github.com/1Money-Co/1money-interoperability-protocol/issues/325) owns the activated
+shadow deletion and the optional explicit offline redb compaction procedure. Neither proposal-row replacement nor
+later table deletion guarantees immediate filesystem-space reclamation, and this release does not compact at startup.
 
 ## Testing
 

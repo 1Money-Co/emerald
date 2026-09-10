@@ -612,7 +612,7 @@ git commit -m "fix: repair compact values after rollback"
 - Consumes the completed primary-layout and compatibility behavior from Tasks 1-4.
 - Documents cleanup follow-up `1Money-Co/1money-interoperability-protocol#325` without implementing it here.
 
-- [ ] **Step 1: Update the storage model documentation**
+- [x] **Step 1: Update the storage model documentation**
 
 State explicitly in every relevant document:
 
@@ -625,7 +625,7 @@ State explicitly in every relevant document:
 
 Do not promise automatic compaction or immediate filesystem-space reclamation.
 
-- [ ] **Step 2: Run documentation and static storage checks**
+- [x] **Step 2: Run documentation and static storage checks**
 
 Run:
 
@@ -636,13 +636,14 @@ awk 'length($0) > 120 { print FNR ":" length($0) ":" $0 }' \
   docs/superpowers/specs/2026-09-09-undecided-block-data-deduplication-design.md \
   docs/superpowers/specs/2026-09-10-undecided-payload-rollback-hardening-design.md \
   docs/superpowers/specs/2026-09-10-compact-undecided-proposal-metadata-design.md
-rg -n 'ProtobufCodec\.encode\(&proposal\)|use redb::TableHandle' app/src/store.rs
+sed -n '1,/^#\[cfg(test)\]/p' app/src/store.rs | \
+  rg -n 'ProtobufCodec\.encode\(&proposal\)|use redb::TableHandle'
 ```
 
-Expected: the width command prints nothing. The search finds neither full runtime proposal encoding nor a
-function-local `TableHandle` import.
+Expected: the width command prints nothing. The production-code search finds neither full runtime proposal encoding
+nor a function-local `TableHandle` import. Full proposal encoding remains intentional in legacy-format test fixtures.
 
-- [ ] **Step 3: Commit the documentation increment**
+- [x] **Step 3: Commit the documentation increment**
 
 ```bash
 git add .changelog/unreleased/breaking-changes/22-deduplicate-undecided-block-data.md \

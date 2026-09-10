@@ -44,10 +44,15 @@ Runtime writes receive the proposal round and update missing v2 and legacy rows 
 rows are compared without the additional `.to_vec()` copy before mutation. Pinned redb 2.6.3 still decodes the
 existing `Vec<u8>` table value into an owned vector; changing the table to a borrowed-slice value type would break the
 recorded N-1 redb type. Any conflict aborts the transaction. Runtime reads prefer v2 and fall back to the exact legacy
-key. Pruning removes expired rows from both tables in the same transaction.
+key. Proposal rows contain only identity and round-specific metadata; reads hydrate them from the selected payload and
+verify its derived `ValueId`. Pruning removes expired rows from both tables in the same transaction.
 
 The shadow table necessarily retains round duplicates during the compatibility window. A later activated release may
 remove the dual-write and legacy fallback after operators no longer need N-1 rollback.
+
+Startup validates every legacy-full proposal row against shared storage before atomically rewriting the proposal table
+to compact metadata. The logical replacements make old redb pages reusable, but they do not guarantee that the
+database file shrinks.
 
 ## Legacy partial-commit recovery
 
@@ -100,5 +105,11 @@ The upgrade remains rolling and wire-compatible. Operators stop and back up each
 earlier one-way design, the same database remains readable by N-1 during the compatibility window. Operators must
 still quiesce a node before changing binaries and must not run two Emerald processes against one database.
 
-The migration log reports copied v2 payloads, compatibility backfills, recovered partial commits, and committed
-bytes. The runbook explains the temporary storage overhead and the later legacy-removal requirement.
+The migration log reports copied v2 payloads, compacted proposals, compatibility backfills, recovered partial commits,
+and committed bytes. The runbook explains the temporary storage overhead and the later legacy-removal requirement.
+
+The temporary legacy shadow is the only remaining round-keyed payload duplication in this release. Removal requires
+an activated release because it ends N-1 rollback compatibility. The follow-up also defines optional explicit offline
+redb compaction for operators who need filesystem-space reclamation; logical deletion or replacement alone does not
+promise that `store.db` shrinks. This work is tracked by
+[interop issue #325](https://github.com/1Money-Co/1money-interoperability-protocol/issues/325).
