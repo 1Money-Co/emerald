@@ -3058,6 +3058,13 @@ mod tests {
 
             // Undecided proposals table
             let proposal = make_proposed_value(h);
+            db.insert_undecided_block_data(
+                proposal.height,
+                proposal.round,
+                proposal.value.id(),
+                proposal.value.extensions.clone(),
+            )
+            .unwrap();
             db.insert_undecided_proposal(proposal).unwrap();
 
             // Undecided block data table

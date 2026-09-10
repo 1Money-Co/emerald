@@ -667,7 +667,7 @@ git commit -m "docs: explain compact proposal storage"
 - Produces a verified commit on `seb/deduplicate-undecided-block-data` and replies on review comments
   `3977079924` and `3977083106`.
 
-- [ ] **Step 1: Run the Emerald library suite**
+- [x] **Step 1: Run the Emerald library suite**
 
 Run:
 

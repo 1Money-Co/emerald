@@ -1258,7 +1258,7 @@ jwt_token_path = "./assets/jwt.hex"
         assert!(
             error
                 .to_string()
-                .contains("certificate should have associated block data"),
+                .contains("missing shared payload"),
             "unexpected error: {error:#}"
         );
         assert!(state
