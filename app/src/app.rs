@@ -222,7 +222,7 @@ pub async fn on_get_value(
             // Fetch the block data for the previously built value
             let bytes = state
                 .store
-                .get_undecided_block_data(height, proposal.value.id())
+                .get_undecided_block_data(height, round, proposal.value.id())
                 .await?
                 .ok_or_else(|| eyre!("Block data not found for previously built value"))?;
             (proposal, bytes)
@@ -588,7 +588,9 @@ async fn on_decided_inner(
     // that were completely received by the local node
     timings.enter_awaited(AwaitedStage::BlockDataRead);
     let started = Instant::now();
-    let block_bytes = state.get_undecided_block_data(height, value_id).await;
+    let block_bytes = state
+        .get_undecided_block_data(height, round, value_id)
+        .await;
     timings.observe(AwaitedStage::BlockDataRead, started.elapsed(), metrics);
     let block_bytes =
         block_bytes?.ok_or_eyre("app: certificate should have associated block data")?;

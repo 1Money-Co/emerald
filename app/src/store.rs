@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use alloy_rpc_types_engine::ExecutionPayloadV3;
 use bytes::Bytes;
 use color_eyre::eyre;
 use malachitebft_app_channel::app::types::codec::Codec;
@@ -20,16 +21,18 @@ use prost::Message;
 #[cfg(test)]
 use redb::ReadableTableMetadata;
 use redb::{ReadableTable, TableHandle};
+use ssz::{Decode, Encode};
 use thiserror::Error;
 
 mod keys;
 use keys::{HeightKey, UndecidedBlockDataKey, UndecidedValueKey};
 
 use crate::metrics::DbMetrics;
+use crate::payload::extract_block_header;
 use crate::store::keys::PendingValueKey;
 use crate::streaming::ProposalParts;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecidedValue {
     pub value: Value,
     pub certificate: CommitCertificate<EmeraldContext>,
@@ -101,6 +104,21 @@ pub enum StoreError {
         existing_len: usize,
         incoming_len: usize,
     },
+
+    #[error("Irrecoverable decided state at height {height}: {reason}")]
+    IrrecoverableDecidedState {
+        height: Height,
+        reason: &'static str,
+    },
+
+    #[error("Conflicting decided {component} at height {height}")]
+    ConflictingDecidedState {
+        height: Height,
+        component: &'static str,
+    },
+
+    #[error("Injected decided commit failure after {boundary}")]
+    InjectedDecidedCommitFailure { boundary: &'static str },
 }
 
 const CERTIFICATES_TABLE: redb::TableDefinition<'_, HeightKey, Vec<u8>> =
@@ -141,6 +159,32 @@ struct UndecidedBlockDataMigrationStats {
     inserted_payloads: u64,
     duplicate_payloads: u64,
     inserted_bytes: u64,
+    compatibility_rows: u64,
+    compatibility_bytes: u64,
+    recovered_decided_payloads: u64,
+    recovered_decided_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecidedCommitFailpoint {
+    Payload,
+    Value,
+    Certificate,
+    Header,
+}
+
+impl DecidedCommitFailpoint {
+    #[cfg(test)]
+    const ALL: [Self; 4] = [Self::Payload, Self::Value, Self::Certificate, Self::Header];
+
+    const fn boundary(self) -> &'static str {
+        match self {
+            Self::Payload => "payload write",
+            Self::Value => "value write",
+            Self::Certificate => "certificate write",
+            Self::Header => "header write",
+        }
+    }
 }
 
 impl Db {
@@ -195,42 +239,195 @@ impl Db {
         Ok(decided_value)
     }
 
-    fn insert_decided_value(
+    fn insert_decided_state(
         &self,
         decided_value: DecidedValue,
         block_header_bytes: Bytes,
+        block_data: Bytes,
+    ) -> Result<(), StoreError> {
+        self.insert_decided_state_inner(decided_value, block_header_bytes, block_data, None)
+    }
+
+    #[cfg(test)]
+    fn insert_decided_state_with_failpoint(
+        &self,
+        decided_value: DecidedValue,
+        block_header_bytes: Bytes,
+        block_data: Bytes,
+        failpoint: DecidedCommitFailpoint,
+    ) -> Result<(), StoreError> {
+        self.insert_decided_state_inner(
+            decided_value,
+            block_header_bytes,
+            block_data,
+            Some(failpoint),
+        )
+    }
+
+    fn insert_decided_state_inner(
+        &self,
+        decided_value: DecidedValue,
+        block_header_bytes: Bytes,
+        block_data: Bytes,
+        failpoint: Option<DecidedCommitFailpoint>,
     ) -> Result<(), StoreError> {
         let start = Instant::now();
-        let mut write_bytes = 0;
-
         let height = decided_value.certificate.height;
+        if decided_value.certificate.value_id != decided_value.value.id()
+            || decided_value.value.extensions.as_ref() != block_data.as_ref()
+        {
+            return Err(StoreError::IrrecoverableDecidedState {
+                height,
+                reason: "certificate, value, and execution payload do not match",
+            });
+        }
+        let execution_payload = ExecutionPayloadV3::from_ssz_bytes(&block_data).map_err(|_| {
+            StoreError::IrrecoverableDecidedState {
+                height,
+                reason: "execution payload cannot be decoded",
+            }
+        })?;
+        if extract_block_header(&execution_payload).as_ssz_bytes() != block_header_bytes {
+            return Err(StoreError::IrrecoverableDecidedState {
+                height,
+                reason: "stored header does not match the execution payload",
+            });
+        }
+
+        let value_bytes = decided_value.value.to_bytes()?.to_vec();
+        let certificate_bytes = encode_certificate(&decided_value.certificate)?;
+        let payload_bytes = block_data.to_vec();
+        let header_bytes = block_header_bytes.to_vec();
         let tx = self.db.begin_write()?;
+        let mut inserted_rows = 0;
+        let mut inserted_bytes = 0;
+
+        {
+            let mut payloads = tx.open_table(DECIDED_BLOCK_DATA_TABLE)?;
+            let existing = payloads
+                .get(&height)?
+                .map(|existing| existing.value() == payload_bytes);
+            match existing {
+                Some(true) => {}
+                Some(false) => return Err(StoreError::ConflictingDecidedBlockData { height }),
+                None => {
+                    let bytes = payload_bytes.len() as u64;
+                    payloads.insert(height, payload_bytes)?;
+                    inserted_rows += 1;
+                    inserted_bytes += bytes;
+                }
+            }
+        }
+        Self::fail_decided_commit(failpoint, DecidedCommitFailpoint::Payload)?;
 
         {
             let mut values = tx.open_table(DECIDED_VALUES_TABLE)?;
-            let values_bytes = decided_value.value.to_bytes()?.to_vec();
-            write_bytes += values_bytes.len() as u64;
-            values.insert(height, values_bytes)?;
+            let existing = values
+                .get(&height)?
+                .map(|existing| existing.value() == value_bytes);
+            match existing {
+                Some(true) => {}
+                Some(false) => {
+                    return Err(StoreError::ConflictingDecidedState {
+                        height,
+                        component: "value",
+                    });
+                }
+                None => {
+                    let bytes = value_bytes.len() as u64;
+                    values.insert(height, value_bytes)?;
+                    inserted_rows += 1;
+                    inserted_bytes += bytes;
+                }
+            }
         }
+        Self::fail_decided_commit(failpoint, DecidedCommitFailpoint::Value)?;
 
         {
             let mut certificates = tx.open_table(CERTIFICATES_TABLE)?;
-            let encoded_certificate = encode_certificate(&decided_value.certificate)?;
-            write_bytes += encoded_certificate.len() as u64;
-            certificates.insert(height, encoded_certificate)?;
+            let existing = certificates
+                .get(&height)?
+                .map(|existing| existing.value() == certificate_bytes);
+            match existing {
+                Some(true) => {}
+                Some(false) => {
+                    return Err(StoreError::ConflictingDecidedState {
+                        height,
+                        component: "certificate",
+                    });
+                }
+                None => {
+                    let bytes = certificate_bytes.len() as u64;
+                    certificates.insert(height, certificate_bytes)?;
+                    inserted_rows += 1;
+                    inserted_bytes += bytes;
+                }
+            }
         }
+        Self::fail_decided_commit(failpoint, DecidedCommitFailpoint::Certificate)?;
 
         {
             let mut headers = tx.open_table(DECIDED_BLOCK_HEADERS_TABLE)?;
-            write_bytes += block_header_bytes.len() as u64;
-            headers.insert(height, block_header_bytes.to_vec())?;
+            let existing = headers
+                .get(&height)?
+                .map(|existing| existing.value() == header_bytes);
+            match existing {
+                Some(true) => {}
+                Some(false) => {
+                    return Err(StoreError::ConflictingDecidedState {
+                        height,
+                        component: "header",
+                    });
+                }
+                None => {
+                    let bytes = header_bytes.len() as u64;
+                    headers.insert(height, header_bytes)?;
+                    inserted_rows += 1;
+                    inserted_bytes += bytes;
+                }
+            }
+        }
+        Self::fail_decided_commit(failpoint, DecidedCommitFailpoint::Header)?;
+
+        if inserted_rows == 0 {
+            return Ok(());
         }
 
         tx.commit()?;
 
         self.metrics.observe_write_time(start.elapsed());
-        self.metrics.add_write_bytes(write_bytes);
+        self.metrics.add_writes(inserted_rows, inserted_bytes);
 
+        Ok(())
+    }
+
+    fn fail_decided_commit(
+        configured: Option<DecidedCommitFailpoint>,
+        boundary: DecidedCommitFailpoint,
+    ) -> Result<(), StoreError> {
+        if configured == Some(boundary) {
+            return Err(StoreError::InjectedDecidedCommitFailure {
+                boundary: boundary.boundary(),
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn insert_legacy_decided_metadata(
+        &self,
+        decided_value: DecidedValue,
+        block_header_bytes: Bytes,
+    ) -> Result<(), StoreError> {
+        let height = decided_value.certificate.height;
+        let tx = self.db.begin_write()?;
+        tx.open_table(DECIDED_VALUES_TABLE)?
+            .insert(height, decided_value.value.to_bytes()?.to_vec())?;
+        tx.open_table(CERTIFICATES_TABLE)?
+            .insert(height, encode_certificate(&decided_value.certificate)?)?;
+        tx.open_table(DECIDED_BLOCK_HEADERS_TABLE)?
+            .insert(height, block_header_bytes.to_vec())?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -485,6 +682,11 @@ impl Db {
             let mut undecided_block_data = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
             undecided_block_data.retain(|k, _| k.0 >= block_data_retain_height)?;
 
+            // Keep the temporary N-1 rollback shadow aligned with the primary v2 retention boundary.
+            let mut legacy_undecided_block_data =
+                tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
+            legacy_undecided_block_data.retain(|k, _| k.0 >= block_data_retain_height)?;
+
             // Remove all pending proposal parts with height < retain_height
             let mut pending = tx.open_table(PENDING_PROPOSAL_PARTS_TABLE)?;
             pending.retain(|k, _| k.0 >= block_data_retain_height)?;
@@ -580,30 +782,161 @@ impl Db {
             let _ = tx.open_table(CERTIFICATES_TABLE)?;
             let _ = tx.open_table(UNDECIDED_PROPOSALS_TABLE)?;
             let _ = tx.open_table(DECIDED_BLOCK_DATA_TABLE)?;
+            let _ = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
             let _ = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
             let _ = tx.open_table(DECIDED_BLOCK_HEADERS_TABLE)?;
             let _ = tx.open_table(PERSISTENT_METRICS_TABLE)?;
             let _ = tx.open_table(PENDING_PROPOSAL_PARTS_TABLE)?;
         }
 
-        let migration = legacy_exists
+        let mut migration = legacy_exists
             .then(|| Self::migrate_undecided_block_data(&tx))
-            .transpose()?;
+            .transpose()?
+            .unwrap_or_default();
+        Self::backfill_legacy_undecided_block_data(&tx, &mut migration)?;
+        Self::recover_legacy_partial_commits(&tx, &mut migration)?;
 
         tx.commit()?;
 
-        if let Some(stats) = migration {
+        if legacy_exists
+            || migration.compatibility_rows > 0
+            || migration.recovered_decided_payloads > 0
+        {
             self.metrics.observe_write_time(start.elapsed());
-            self.metrics
-                .add_writes(stats.inserted_payloads, stats.inserted_bytes);
+            self.metrics.add_writes(
+                migration.inserted_payloads
+                    + migration.compatibility_rows
+                    + migration.recovered_decided_payloads,
+                migration.inserted_bytes
+                    + migration.compatibility_bytes
+                    + migration.recovered_decided_bytes,
+            );
             tracing::info!(
                 event = "undecided_block_data_migration",
-                legacy_rows = stats.legacy_rows,
-                inserted_payloads = stats.inserted_payloads,
-                duplicate_payloads = stats.duplicate_payloads,
+                legacy_rows = migration.legacy_rows,
+                inserted_payloads = migration.inserted_payloads,
+                inserted_bytes = migration.inserted_bytes,
+                duplicate_payloads = migration.duplicate_payloads,
+                compatibility_rows = migration.compatibility_rows,
+                compatibility_bytes = migration.compatibility_bytes,
+                recovered_decided_payloads = migration.recovered_decided_payloads,
+                recovered_decided_bytes = migration.recovered_decided_bytes,
                 duration_seconds = start.elapsed().as_secs_f64(),
                 "Migrated legacy undecided block data"
             );
+        }
+
+        Ok(())
+    }
+
+    fn recover_legacy_partial_commits(
+        tx: &redb::WriteTransaction,
+        stats: &mut UndecidedBlockDataMigrationStats,
+    ) -> Result<(), StoreError> {
+        let values = tx.open_table(DECIDED_VALUES_TABLE)?;
+        let certificates = tx.open_table(CERTIFICATES_TABLE)?;
+        let headers = tx.open_table(DECIDED_BLOCK_HEADERS_TABLE)?;
+        let primary = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
+        let legacy = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
+        let mut decided_payloads = tx.open_table(DECIDED_BLOCK_DATA_TABLE)?;
+
+        for entry in values.iter()? {
+            let (height_key, encoded_value) = entry?;
+            let height = height_key.value();
+            let existing_decided_payload = decided_payloads
+                .get(&height)?
+                .map(|stored_payload| stored_payload.value());
+            let needs_promotion = existing_decided_payload.is_none();
+
+            let encoded_value = encoded_value.value();
+            let value = Value::from_bytes(&encoded_value).map_err(|_| {
+                StoreError::IrrecoverableDecidedState {
+                    height,
+                    reason: "stored value cannot be decoded",
+                }
+            })?;
+            let encoded_certificate =
+                certificates
+                    .get(&height)?
+                    .ok_or(StoreError::IrrecoverableDecidedState {
+                        height,
+                        reason: "missing certificate",
+                    })?;
+            let encoded_certificate = encoded_certificate.value();
+            let certificate = decode_certificate(&encoded_certificate).map_err(|_| {
+                StoreError::IrrecoverableDecidedState {
+                    height,
+                    reason: "stored certificate cannot be decoded",
+                }
+            })?;
+            let stored_header =
+                headers
+                    .get(&height)?
+                    .ok_or(StoreError::IrrecoverableDecidedState {
+                        height,
+                        reason: "missing stored header",
+                    })?;
+
+            if certificate.height != height {
+                return Err(StoreError::IrrecoverableDecidedState {
+                    height,
+                    reason: "certificate height does not match the decided value key",
+                });
+            }
+            if certificate.value_id != value.id() {
+                return Err(StoreError::IrrecoverableDecidedState {
+                    height,
+                    reason: "certificate value ID does not match the stored value",
+                });
+            }
+
+            let payload = match existing_decided_payload {
+                Some(payload) => payload,
+                None => {
+                    let primary_payload = primary.get(&(height, certificate.value_id))?;
+                    let legacy_payload = if primary_payload.is_none() {
+                        legacy.get(&(height, certificate.round, certificate.value_id))?
+                    } else {
+                        None
+                    };
+                    primary_payload
+                        .as_ref()
+                        .map(|value| value.value())
+                        .or_else(|| legacy_payload.as_ref().map(|value| value.value()))
+                        .ok_or(StoreError::IrrecoverableDecidedState {
+                            height,
+                            reason: "missing its execution payload",
+                        })?
+                }
+            };
+
+            let recomputed = Value::new(Bytes::copy_from_slice(&payload));
+            if recomputed.id() != certificate.value_id || value.extensions.as_ref() != payload {
+                return Err(StoreError::IrrecoverableDecidedState {
+                    height,
+                    reason: "execution payload does not match the stored value ID and bytes",
+                });
+            }
+            let execution_payload = ExecutionPayloadV3::from_ssz_bytes(&payload).map_err(|_| {
+                StoreError::IrrecoverableDecidedState {
+                    height,
+                    reason: "execution payload cannot be decoded",
+                }
+            })?;
+            let expected_header = extract_block_header(&execution_payload).as_ssz_bytes();
+            if stored_header.value() != expected_header {
+                return Err(StoreError::IrrecoverableDecidedState {
+                    height,
+                    reason: "stored header does not match the execution payload",
+                });
+            }
+
+            if needs_promotion {
+                let payload_len = payload.len() as u64;
+                decided_payloads.insert(height, payload)?;
+                stats.recovered_decided_payloads += 1;
+                stats.recovered_decided_bytes += payload_len;
+            }
         }
 
         Ok(())
@@ -620,17 +953,23 @@ impl Db {
             for entry in legacy.iter()? {
                 let (legacy_key, legacy_value) = entry?;
                 let (height, round, value_id) = legacy_key.value();
-                let payload = legacy_value.value().to_vec();
                 let key = (height, value_id);
-                let existing = target.get(&key)?.map(|value| value.value().to_vec());
+                let payload = legacy_value.value();
+                let existing = match target.get(&key)? {
+                    Some(value) => {
+                        let existing = value.value();
+                        Some((existing == payload, existing.len()))
+                    }
+                    None => None,
+                };
 
                 stats.legacy_rows += 1;
                 match existing {
-                    Some(existing) if existing == payload => {
+                    Some((true, _)) => {
                         stats.duplicate_payloads += 1;
                         migrated_rounds.entry(key).or_insert(round);
                     }
-                    Some(existing) => {
+                    Some((false, existing_len)) => {
                         let existing_round = migrated_rounds.get(&key).copied();
                         tracing::error!(
                             event = "undecided_block_data_migration_conflict",
@@ -638,7 +977,7 @@ impl Db {
                             value = %value_id,
                             existing_round = ?existing_round,
                             incoming_round = %round,
-                            existing_len = existing.len(),
+                            existing_len,
                             incoming_len = payload.len(),
                             "Conflicting legacy undecided block data"
                         );
@@ -649,7 +988,7 @@ impl Db {
                                 .map(|round| round.to_string())
                                 .unwrap_or_else(|| "unknown (pre-existing v2 row)".to_owned()),
                             incoming_round: round,
-                            existing_len: existing.len(),
+                            existing_len,
                             incoming_len: payload.len(),
                         });
                     }
@@ -662,8 +1001,43 @@ impl Db {
                 }
             }
         }
-        tx.delete_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
         Ok(stats)
+    }
+
+    fn backfill_legacy_undecided_block_data(
+        tx: &redb::WriteTransaction,
+        stats: &mut UndecidedBlockDataMigrationStats,
+    ) -> Result<(), StoreError> {
+        let proposals = tx.open_table(UNDECIDED_PROPOSALS_TABLE)?;
+        let primary = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
+        let mut legacy = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
+
+        for entry in proposals.iter()? {
+            let (proposal_key, _) = entry?;
+            let (height, round, value_id) = proposal_key.value();
+            let Some(payload) = primary.get(&(height, value_id))? else {
+                continue;
+            };
+            let payload = payload.value();
+            let legacy_key = (height, round, value_id);
+            let existing = legacy
+                .get(&legacy_key)?
+                .map(|value| value.value() == payload);
+            match existing {
+                Some(true) => {}
+                Some(false) => {
+                    return Err(StoreError::ConflictingUndecidedBlockData { height, value_id });
+                }
+                None => {
+                    let payload_len = payload.len() as u64;
+                    legacy.insert(legacy_key, payload)?;
+                    stats.compatibility_rows += 1;
+                    stats.compatibility_bytes += payload_len;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn insert_cumulative_metrics(
@@ -740,14 +1114,26 @@ impl Db {
     fn get_undecided_block_data(
         &self,
         height: Height,
+        round: Round,
         value_id: ValueId,
     ) -> Result<Option<Bytes>, StoreError> {
         let start = Instant::now();
         let tx = self.db.begin_read()?;
-        let table = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
-        let value = table
-            .get(&(height, value_id))?
-            .map(|data| Bytes::copy_from_slice(&data.value()));
+        let value = {
+            let table = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
+            table
+                .get(&(height, value_id))?
+                .map(|data| Bytes::copy_from_slice(&data.value()))
+        };
+        let value = match value {
+            Some(value) => Some(value),
+            None => {
+                let legacy = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
+                legacy
+                    .get(&(height, round, value_id))?
+                    .map(|data| Bytes::copy_from_slice(&data.value()))
+            }
+        };
 
         self.metrics.observe_read_time(start.elapsed());
         self.metrics
@@ -760,35 +1146,59 @@ impl Db {
     fn insert_undecided_block_data(
         &self,
         height: Height,
+        round: Round,
         value_id: ValueId,
         data: Bytes,
     ) -> Result<(), StoreError> {
         let start = Instant::now();
         let tx = self.db.begin_write()?;
-        let inserted = {
+        let mut inserted_rows = 0;
+        let mut inserted_bytes = 0;
+        {
             let mut table = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
             let key = (height, value_id);
-            let existing = table.get(&key)?.map(|value| value.value().to_vec());
+            let existing = table.get(&key)?.map(|value| value.value() == data.as_ref());
 
             match existing {
-                Some(existing) if existing.as_slice() == data.as_ref() => false,
-                Some(_) => {
+                Some(true) => {}
+                Some(false) => {
                     return Err(StoreError::ConflictingUndecidedBlockData { height, value_id });
                 }
                 None => {
                     table.insert(key, data.to_vec())?;
-                    true
+                    inserted_rows += 1;
+                    inserted_bytes += data.len() as u64;
                 }
             }
-        };
+        }
 
-        if !inserted {
+        {
+            let mut legacy = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
+            let key = (height, round, value_id);
+            let existing = legacy
+                .get(&key)?
+                .map(|value| value.value() == data.as_ref());
+
+            match existing {
+                Some(true) => {}
+                Some(false) => {
+                    return Err(StoreError::ConflictingUndecidedBlockData { height, value_id });
+                }
+                None => {
+                    legacy.insert(key, data.to_vec())?;
+                    inserted_rows += 1;
+                    inserted_bytes += data.len() as u64;
+                }
+            }
+        }
+
+        if inserted_rows == 0 {
             return Ok(());
         }
 
         tx.commit()?;
         self.metrics.observe_write_time(start.elapsed());
-        self.metrics.add_write_bytes(data.len() as u64);
+        self.metrics.add_writes(inserted_rows, inserted_bytes);
         Ok(())
     }
 
@@ -798,12 +1208,13 @@ impl Db {
         Ok(tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?.len()?)
     }
 
+    #[cfg(test)]
     fn insert_decided_block_data(&self, height: Height, data: Bytes) -> Result<(), StoreError> {
         let start = Instant::now();
         let tx = self.db.begin_write()?;
         let inserted = {
             let mut table = tx.open_table(DECIDED_BLOCK_DATA_TABLE)?;
-            let existing = table.get(&height)?.map(|value| value.value().to_vec());
+            let existing = table.get(&height)?.map(|value| value.value());
             match existing {
                 Some(existing) if existing.as_slice() == data.as_ref() => false,
                 Some(_) => return Err(StoreError::ConflictingDecidedBlockData { height }),
@@ -916,13 +1327,14 @@ impl Store {
         tokio::task::spawn_blocking(move || db.get_decided_value(height)).await?
     }
 
-    /// Stores a decided value with its certificate.
+    /// Atomically stores a decided payload, value, certificate, and block header.
     /// Called by the application when it `commit`s a value decided by consensus.
-    pub async fn store_decided_value(
+    pub async fn store_decided_state(
         &self,
         certificate: &CommitCertificate<EmeraldContext>,
         value: Value,
         block_header_bytes: Bytes,
+        block_data: Bytes,
     ) -> Result<(), StoreError> {
         let decided_value = DecidedValue {
             value,
@@ -931,7 +1343,7 @@ impl Store {
 
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || {
-            db.insert_decided_value(decided_value, block_header_bytes)
+            db.insert_decided_state(decided_value, block_header_bytes, block_data)
         })
         .await?
     }
@@ -1036,21 +1448,26 @@ impl Store {
     pub async fn get_undecided_block_data(
         &self,
         height: Height,
+        round: Round,
         value_id: ValueId,
     ) -> Result<Option<Bytes>, StoreError> {
         let db = Arc::clone(&self.db);
-        tokio::task::spawn_blocking(move || db.get_undecided_block_data(height, value_id)).await?
+        tokio::task::spawn_blocking(move || db.get_undecided_block_data(height, round, value_id))
+            .await?
     }
 
     pub async fn store_undecided_block_data(
         &self,
         height: Height,
+        round: Round,
         value_id: ValueId,
         data: Bytes,
     ) -> Result<(), StoreError> {
         let db = Arc::clone(&self.db);
-        tokio::task::spawn_blocking(move || db.insert_undecided_block_data(height, value_id, data))
-            .await?
+        tokio::task::spawn_blocking(move || {
+            db.insert_undecided_block_data(height, round, value_id, data)
+        })
+        .await?
     }
 
     #[cfg(test)]
@@ -1059,13 +1476,32 @@ impl Store {
         tokio::task::spawn_blocking(move || db.undecided_block_data_len()).await?
     }
 
-    pub async fn store_decided_block_data(
+    #[cfg(test)]
+    pub(crate) async fn store_legacy_decided_block_data(
         &self,
         height: Height,
         data: Bytes,
     ) -> Result<(), StoreError> {
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || db.insert_decided_block_data(height, data)).await?
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn store_legacy_decided_metadata(
+        &self,
+        certificate: &CommitCertificate<EmeraldContext>,
+        value: Value,
+        block_header_bytes: Bytes,
+    ) -> Result<(), StoreError> {
+        let decided_value = DecidedValue {
+            value,
+            certificate: certificate.clone(),
+        };
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || {
+            db.insert_legacy_decided_metadata(decided_value, block_header_bytes)
+        })
+        .await?
     }
 
     pub async fn get_certificate_and_header(
@@ -1114,10 +1550,13 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3};
     use malachitebft_app_channel::app::types::core::{CommitCertificate, Validity};
     use malachitebft_eth_types::Address;
+    use ssz::{Decode, Encode};
 
     use super::*;
+    use crate::payload::extract_block_header;
 
     /// Create a test database backed by a temporary directory.
     /// Returns both the Db and the TempDir (must be kept alive for the DB to remain valid).
@@ -1179,6 +1618,116 @@ mod tests {
         has_table
     }
 
+    fn get_legacy_undecided_block_data(
+        db: &Db,
+        height: Height,
+        round: Round,
+        value_id: ValueId,
+    ) -> Option<Bytes> {
+        let tx = db.db.begin_read().unwrap();
+        let table = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE).unwrap();
+        table
+            .get(&(height, round, value_id))
+            .unwrap()
+            .map(|value| Bytes::copy_from_slice(&value.value()))
+    }
+
+    fn assert_no_decided_rows(db: &Db, height: Height) {
+        let tx = db.db.begin_read().unwrap();
+        assert!(tx
+            .open_table(DECIDED_BLOCK_DATA_TABLE)
+            .unwrap()
+            .get(&height)
+            .unwrap()
+            .is_none());
+        assert!(tx
+            .open_table(DECIDED_VALUES_TABLE)
+            .unwrap()
+            .get(&height)
+            .unwrap()
+            .is_none());
+        assert!(tx
+            .open_table(CERTIFICATES_TABLE)
+            .unwrap()
+            .get(&height)
+            .unwrap()
+            .is_none());
+        assert!(tx
+            .open_table(DECIDED_BLOCK_HEADERS_TABLE)
+            .unwrap()
+            .get(&height)
+            .unwrap()
+            .is_none());
+    }
+
+    fn make_execution_payload_bytes(block_number: u64) -> Bytes {
+        let payload = ExecutionPayloadV3 {
+            payload_inner: ExecutionPayloadV2 {
+                payload_inner: ExecutionPayloadV1 {
+                    parent_hash: Default::default(),
+                    fee_recipient: Default::default(),
+                    state_root: Default::default(),
+                    receipts_root: Default::default(),
+                    logs_bloom: Default::default(),
+                    prev_randao: Default::default(),
+                    block_number,
+                    gas_limit: 30_000_000,
+                    gas_used: 0,
+                    timestamp: block_number,
+                    extra_data: Default::default(),
+                    base_fee_per_gas: Default::default(),
+                    block_hash: Default::default(),
+                    transactions: Vec::new(),
+                },
+                withdrawals: Vec::new(),
+            },
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+        };
+        Bytes::from(payload.as_ssz_bytes())
+    }
+
+    fn insert_n_minus_one_partial_commit(
+        db: &Db,
+        decided_value: &DecidedValue,
+        block_header: &Bytes,
+        undecided_payload: Option<&Bytes>,
+    ) {
+        let height = decided_value.certificate.height;
+        let tx = db.db.begin_write().unwrap();
+        {
+            tx.open_table(DECIDED_VALUES_TABLE)
+                .unwrap()
+                .insert(height, decided_value.value.to_bytes().unwrap().to_vec())
+                .unwrap();
+            tx.open_table(CERTIFICATES_TABLE)
+                .unwrap()
+                .insert(
+                    height,
+                    encode_certificate(&decided_value.certificate).unwrap(),
+                )
+                .unwrap();
+            tx.open_table(DECIDED_BLOCK_HEADERS_TABLE)
+                .unwrap()
+                .insert(height, block_header.to_vec())
+                .unwrap();
+            if let Some(payload) = undecided_payload {
+                tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)
+                    .unwrap()
+                    .insert(
+                        (
+                            height,
+                            decided_value.certificate.round,
+                            decided_value.certificate.value_id,
+                        ),
+                        payload.to_vec(),
+                    )
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+    }
+
     #[test]
     fn max_decided_value_height_reports_an_empty_store() {
         let (db, _dir) = create_test_db("max-decided-value-height-empty");
@@ -1203,7 +1752,7 @@ mod tests {
         );
 
         db.initialize_schema().unwrap();
-        assert!(!has_table(&db, "undecided_block_data"));
+        assert!(has_table(&db, "undecided_block_data"));
         assert!(has_table(&db, "undecided_block_data_v2"));
         assert_eq!(db.undecided_block_data_len().unwrap(), 2);
         assert_eq!(metrics.write_count(), 2);
@@ -1214,22 +1763,24 @@ mod tests {
         let reopened = Db::new(path, 1024 * 1024, DbMetrics::new()).unwrap();
         reopened.initialize_schema().unwrap();
         assert_eq!(
-            reopened.get_undecided_block_data(height, first_id).unwrap(),
+            reopened
+                .get_undecided_block_data(height, Round::new(0), first_id)
+                .unwrap(),
             Some(first)
         );
         assert_eq!(
             reopened
-                .get_undecided_block_data(height, second_id)
+                .get_undecided_block_data(height, Round::new(2), second_id)
                 .unwrap(),
             Some(second)
         );
     }
 
     #[test]
-    fn legacy_undecided_block_data_migration_new_database_never_creates_legacy_table() {
+    fn legacy_undecided_block_data_migration_new_database_creates_rollback_table() {
         let (db, _dir, _metrics) = create_test_db_with_metrics("new_v2_only");
 
-        assert!(!has_table(&db, "undecided_block_data"));
+        assert!(has_table(&db, "undecided_block_data"));
         assert!(has_table(&db, "undecided_block_data_v2"));
     }
 
@@ -1298,7 +1849,512 @@ mod tests {
         assert_eq!(db.undecided_block_data_len().unwrap(), 1);
         assert_eq!(metrics.write_count(), 0);
         assert_eq!(metrics.write_bytes(), 0);
+        assert!(has_table(&db, "undecided_block_data"));
+    }
+
+    #[test]
+    fn rollback_compatibility_runtime_write_is_readable_by_n_minus_one() {
+        let (db, dir, _metrics) = create_test_db_with_metrics("rollback_runtime_write");
+        let height = Height::new(12);
+        let round = Round::new(3);
+        let payload = Bytes::from_static(b"rollback-compatible-payload");
+        let value = Value::new(payload.clone());
+        let proposal = ProposedValue {
+            height,
+            round,
+            valid_round: Round::Nil,
+            proposer: Address::new([7; 20]),
+            value: value.clone(),
+            validity: Validity::Valid,
+        };
+
+        db.insert_undecided_proposal(proposal).unwrap();
+        db.insert_undecided_block_data(height, round, value.id(), payload.clone())
+            .unwrap();
+
+        assert_eq!(
+            get_legacy_undecided_block_data(&db, height, round, value.id()),
+            Some(payload.clone())
+        );
+
+        let path = dir.path().join("rollback_runtime_write.redb");
+        drop(db);
+
+        let n_minus_one = Db::new(&path, 1024 * 1024, DbMetrics::new()).unwrap();
+        assert_eq!(
+            get_legacy_undecided_block_data(&n_minus_one, height, round, value.id()),
+            Some(payload.clone())
+        );
+        drop(n_minus_one);
+
+        let n = Db::new(path, 1024 * 1024, DbMetrics::new()).unwrap();
+        n.initialize_schema().unwrap();
+        assert_eq!(
+            n.get_undecided_block_data(height, round, value.id())
+                .unwrap(),
+            Some(payload)
+        );
+    }
+
+    #[test]
+    fn rollback_compatibility_backfills_legacy_rows_for_an_existing_v2_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollback_v2_backfill.redb");
+        let metrics = DbMetrics::new();
+        let db = Db::new(&path, 1024 * 1024, metrics.clone()).unwrap();
+        let height = Height::new(14);
+        let round = Round::new(5);
+        let payload = Bytes::from_static(b"pre-compatibility-v2-payload");
+        let value = Value::new(payload.clone());
+        let proposal = ProposedValue {
+            height,
+            round,
+            valid_round: Round::Nil,
+            proposer: Address::new([8; 20]),
+            value: value.clone(),
+            validity: Validity::Valid,
+        };
+
+        let tx = db.db.begin_write().unwrap();
+        {
+            let mut primary = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE).unwrap();
+            primary
+                .insert((height, value.id()), payload.to_vec())
+                .unwrap();
+            let mut proposals = tx.open_table(UNDECIDED_PROPOSALS_TABLE).unwrap();
+            proposals
+                .insert(
+                    (height, round, value.id()),
+                    ProtobufCodec.encode(&proposal).unwrap().to_vec(),
+                )
+                .unwrap();
+        }
+        tx.commit().unwrap();
         assert!(!has_table(&db, "undecided_block_data"));
+
+        db.initialize_schema().unwrap();
+
+        assert_eq!(
+            get_legacy_undecided_block_data(&db, height, round, value.id()),
+            Some(payload.clone())
+        );
+        assert_eq!(metrics.write_count(), 1);
+        assert_eq!(metrics.write_bytes(), payload.len() as u64);
+        drop(db);
+
+        let n_minus_one = Db::new(path, 1024 * 1024, DbMetrics::new()).unwrap();
+        assert_eq!(
+            get_legacy_undecided_block_data(&n_minus_one, height, round, value.id()),
+            Some(payload)
+        );
+    }
+
+    #[test]
+    fn rollback_compatibility_read_falls_back_to_the_exact_legacy_round() {
+        let height = Height::new(15);
+        let round = Round::new(6);
+        let payload = Bytes::from_static(b"legacy-fallback-payload");
+        let value_id = Value::new(payload.clone()).id();
+        let (db, _dir, _metrics) = create_legacy_test_db(
+            "rollback_legacy_fallback",
+            &[(height, round, value_id, payload.clone())],
+        );
+        db.initialize_schema().unwrap();
+
+        let tx = db.db.begin_write().unwrap();
+        tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)
+            .unwrap()
+            .remove(&(height, value_id))
+            .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(
+            db.get_undecided_block_data(height, round, value_id)
+                .unwrap(),
+            Some(payload)
+        );
+        assert!(db
+            .get_undecided_block_data(height, Round::new(7), value_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn legacy_partial_commit_upgrade_recovers_decided_payload_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_partial_commit.redb");
+        let db = Db::new(&path, 1024 * 1024, DbMetrics::new()).unwrap();
+        let height = Height::new(21);
+        let round = Round::new(2);
+        let payload = make_execution_payload_bytes(height.as_u64());
+        let value = Value::new(payload.clone());
+        let execution_payload = ExecutionPayloadV3::from_ssz_bytes(&payload).unwrap();
+        let header = Bytes::from(extract_block_header(&execution_payload).as_ssz_bytes());
+        let decided = DecidedValue {
+            value,
+            certificate: CommitCertificate {
+                height,
+                round,
+                value_id: Value::new(payload.clone()).id(),
+                commit_signatures: Vec::new(),
+            },
+        };
+        insert_n_minus_one_partial_commit(&db, &decided, &header, Some(&payload));
+
+        db.initialize_schema().unwrap();
+
+        assert_eq!(
+            db.get_decided_block_data(height).unwrap(),
+            Some(payload.clone())
+        );
+        drop(db);
+
+        let reopened = Db::new(path, 1024 * 1024, DbMetrics::new()).unwrap();
+        reopened.initialize_schema().unwrap();
+        assert_eq!(
+            reopened.get_decided_block_data(height).unwrap(),
+            Some(payload)
+        );
+    }
+
+    #[test]
+    fn legacy_partial_commit_upgrade_rejects_missing_payload_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_partial_commit_missing.redb");
+        let db = Db::new(&path, 1024 * 1024, DbMetrics::new()).unwrap();
+        let height = Height::new(22);
+        let payload = make_execution_payload_bytes(height.as_u64());
+        let value = Value::new(payload.clone());
+        let execution_payload = ExecutionPayloadV3::from_ssz_bytes(&payload).unwrap();
+        let header = Bytes::from(extract_block_header(&execution_payload).as_ssz_bytes());
+        let decided = DecidedValue {
+            certificate: CommitCertificate {
+                height,
+                round: Round::new(3),
+                value_id: value.id(),
+                commit_signatures: Vec::new(),
+            },
+            value,
+        };
+        insert_n_minus_one_partial_commit(&db, &decided, &header, None);
+
+        let error = db
+            .initialize_schema()
+            .expect_err("missing recovery payload must fail");
+
+        assert!(error.to_string().contains("missing its execution payload"));
+        assert!(!has_table(&db, "undecided_block_data_v2"));
+        assert!(db
+            .get_decided_block_data(height)
+            .unwrap_err()
+            .to_string()
+            .contains("does not exist"));
+    }
+
+    #[test]
+    fn legacy_partial_commit_upgrade_rejects_header_mismatch_without_promotion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_partial_commit_header.redb");
+        let db = Db::new(&path, 1024 * 1024, DbMetrics::new()).unwrap();
+        let height = Height::new(23);
+        let payload = make_execution_payload_bytes(height.as_u64());
+        let value = Value::new(payload.clone());
+        let decided = DecidedValue {
+            certificate: CommitCertificate {
+                height,
+                round: Round::new(4),
+                value_id: value.id(),
+                commit_signatures: Vec::new(),
+            },
+            value,
+        };
+        let wrong_header = Bytes::from_static(b"wrong-header");
+        insert_n_minus_one_partial_commit(&db, &decided, &wrong_header, Some(&payload));
+
+        let error = db
+            .initialize_schema()
+            .expect_err("mismatched header must fail recovery");
+
+        assert!(error.to_string().contains("stored header does not match"));
+        assert!(!has_table(&db, "undecided_block_data_v2"));
+        assert!(db
+            .get_decided_block_data(height)
+            .unwrap_err()
+            .to_string()
+            .contains("does not exist"));
+    }
+
+    #[test]
+    fn legacy_partial_commit_upgrade_rejects_certificate_value_id_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_partial_commit_value_id.redb");
+        let db = Db::new(&path, 1024 * 1024, DbMetrics::new()).unwrap();
+        let height = Height::new(24);
+        let payload = make_execution_payload_bytes(height.as_u64());
+        let value = Value::new(payload.clone());
+        let execution_payload = ExecutionPayloadV3::from_ssz_bytes(&payload).unwrap();
+        let header = Bytes::from(extract_block_header(&execution_payload).as_ssz_bytes());
+        let decided = DecidedValue {
+            certificate: CommitCertificate {
+                height,
+                round: Round::new(5),
+                value_id: ValueId::new(value.id().as_u64().wrapping_add(1)),
+                commit_signatures: Vec::new(),
+            },
+            value,
+        };
+        insert_n_minus_one_partial_commit(&db, &decided, &header, Some(&payload));
+
+        let error = db
+            .initialize_schema()
+            .expect_err("certificate/value mismatch must fail recovery");
+
+        assert!(error
+            .to_string()
+            .contains("certificate value ID does not match"));
+        assert!(!has_table(&db, "undecided_block_data_v2"));
+    }
+
+    #[test]
+    fn legacy_partial_commit_upgrade_rejects_malformed_execution_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_partial_commit_malformed.redb");
+        let db = Db::new(&path, 1024 * 1024, DbMetrics::new()).unwrap();
+        let height = Height::new(25);
+        let payload = Bytes::from_static(b"not-an-ssz-execution-payload");
+        let value = Value::new(payload.clone());
+        let decided = DecidedValue {
+            certificate: CommitCertificate {
+                height,
+                round: Round::new(6),
+                value_id: value.id(),
+                commit_signatures: Vec::new(),
+            },
+            value,
+        };
+        insert_n_minus_one_partial_commit(
+            &db,
+            &decided,
+            &Bytes::from_static(b"untrusted-header"),
+            Some(&payload),
+        );
+
+        let error = db
+            .initialize_schema()
+            .expect_err("malformed execution payload must fail recovery");
+
+        assert!(error
+            .to_string()
+            .contains("execution payload cannot be decoded"));
+        assert!(!has_table(&db, "undecided_block_data_v2"));
+    }
+
+    #[test]
+    fn legacy_partial_commit_upgrade_rejects_existing_decided_payload_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("legacy_partial_commit_existing_conflict.redb");
+        let db = Db::new(&path, 1024 * 1024, DbMetrics::new()).unwrap();
+        let height = Height::new(26);
+        let payload = make_execution_payload_bytes(height.as_u64());
+        let conflicting_payload = make_execution_payload_bytes(height.as_u64() + 1);
+        let value = Value::new(payload.clone());
+        let execution_payload = ExecutionPayloadV3::from_ssz_bytes(&payload).unwrap();
+        let header = Bytes::from(extract_block_header(&execution_payload).as_ssz_bytes());
+        let decided = DecidedValue {
+            certificate: CommitCertificate {
+                height,
+                round: Round::new(7),
+                value_id: value.id(),
+                commit_signatures: Vec::new(),
+            },
+            value,
+        };
+        insert_n_minus_one_partial_commit(&db, &decided, &header, Some(&payload));
+        let tx = db.db.begin_write().unwrap();
+        tx.open_table(DECIDED_BLOCK_DATA_TABLE)
+            .unwrap()
+            .insert(height, conflicting_payload.to_vec())
+            .unwrap();
+        tx.commit().unwrap();
+
+        let error = db
+            .initialize_schema()
+            .expect_err("an existing decided payload must be revalidated");
+
+        assert!(error
+            .to_string()
+            .contains("execution payload does not match the stored value ID and bytes"));
+        assert_eq!(
+            db.get_decided_block_data(height).unwrap(),
+            Some(conflicting_payload)
+        );
+        assert!(!has_table(&db, "undecided_block_data_v2"));
+    }
+
+    fn make_decided_state(height: u64) -> (DecidedValue, Bytes, Bytes) {
+        let payload = make_execution_payload_bytes(height);
+        let value = Value::new(payload.clone());
+        let execution_payload = ExecutionPayloadV3::from_ssz_bytes(&payload).unwrap();
+        let header = Bytes::from(extract_block_header(&execution_payload).as_ssz_bytes());
+        let decided = DecidedValue {
+            certificate: CommitCertificate {
+                height: Height::new(height),
+                round: Round::new(2),
+                value_id: value.id(),
+                commit_signatures: Vec::new(),
+            },
+            value,
+        };
+        (decided, header, payload)
+    }
+
+    #[test]
+    fn decided_state_commit_is_atomic_and_idempotent() {
+        let (db, _dir, metrics) = create_test_db_with_metrics("decided_state_atomic");
+        let (decided, header, payload) = make_decided_state(31);
+
+        db.insert_decided_state(decided.clone(), header.clone(), payload.clone())
+            .unwrap();
+        let writes = metrics.write_count();
+        let bytes = metrics.write_bytes();
+        assert_eq!(writes, 4);
+
+        db.insert_decided_state(decided.clone(), header.clone(), payload.clone())
+            .unwrap();
+
+        assert_eq!(metrics.write_count(), writes);
+        assert_eq!(metrics.write_bytes(), bytes);
+        assert_eq!(
+            db.get_decided_value(decided.certificate.height).unwrap(),
+            Some(decided)
+        );
+        assert_eq!(
+            db.get_decided_block_data(Height::new(31)).unwrap(),
+            Some(payload)
+        );
+        assert_eq!(
+            db.get_certificate_and_header(Height::new(31))
+                .unwrap()
+                .unwrap()
+                .1,
+            header
+        );
+    }
+
+    #[test]
+    fn decided_state_commit_conflicts_abort_every_component_atomically() {
+        for (offset, component) in ["value", "certificate", "header"].into_iter().enumerate() {
+            let (db, _dir, metrics) =
+                create_test_db_with_metrics(&format!("decided_state_{component}_conflict"));
+            let height = Height::new(40 + offset as u64);
+            let (decided, header, payload) = make_decided_state(height.as_u64());
+            let conflict = b"conflicting-existing-row".to_vec();
+            let tx = db.db.begin_write().unwrap();
+            match component {
+                "value" => {
+                    tx.open_table(DECIDED_VALUES_TABLE)
+                        .unwrap()
+                        .insert(height, conflict.clone())
+                        .unwrap();
+                }
+                "certificate" => {
+                    tx.open_table(CERTIFICATES_TABLE)
+                        .unwrap()
+                        .insert(height, conflict.clone())
+                        .unwrap();
+                }
+                "header" => {
+                    tx.open_table(DECIDED_BLOCK_HEADERS_TABLE)
+                        .unwrap()
+                        .insert(height, conflict.clone())
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            tx.commit().unwrap();
+
+            let error = db
+                .insert_decided_state(decided, header, payload)
+                .expect_err("a conflicting component must abort the whole transaction");
+            assert!(matches!(
+                error,
+                StoreError::ConflictingDecidedState {
+                    height: error_height,
+                    component: error_component,
+                } if error_height == height && error_component == component
+            ));
+            assert_eq!(metrics.write_count(), 0);
+
+            let tx = db.db.begin_read().unwrap();
+            assert!(tx
+                .open_table(DECIDED_BLOCK_DATA_TABLE)
+                .unwrap()
+                .get(&height)
+                .unwrap()
+                .is_none());
+            let stored_value = tx
+                .open_table(DECIDED_VALUES_TABLE)
+                .unwrap()
+                .get(&height)
+                .unwrap()
+                .map(|value| value.value());
+            let stored_certificate = tx
+                .open_table(CERTIFICATES_TABLE)
+                .unwrap()
+                .get(&height)
+                .unwrap()
+                .map(|value| value.value());
+            let stored_header = tx
+                .open_table(DECIDED_BLOCK_HEADERS_TABLE)
+                .unwrap()
+                .get(&height)
+                .unwrap()
+                .map(|value| value.value());
+            assert_eq!(
+                stored_value,
+                (component == "value").then_some(conflict.clone())
+            );
+            assert_eq!(
+                stored_certificate,
+                (component == "certificate").then_some(conflict.clone())
+            );
+            assert_eq!(stored_header, (component == "header").then_some(conflict));
+        }
+    }
+
+    #[test]
+    fn decided_state_commit_failpoints_publish_no_partial_rows_after_reopen() {
+        for failpoint in DecidedCommitFailpoint::ALL {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir
+                .path()
+                .join(format!("decided_state_failpoint_{failpoint:?}.redb"));
+            let db = Db::new(&path, 1024 * 1024, DbMetrics::new()).unwrap();
+            db.initialize_schema().unwrap();
+            let (decided, header, payload) = make_decided_state(32);
+
+            db.insert_decided_state_with_failpoint(decided, header, payload, failpoint)
+                .expect_err("injected commit failure must abort the transaction");
+            drop(db);
+
+            let reopened = Db::new(&path, 1024 * 1024, DbMetrics::new()).unwrap();
+            reopened.initialize_schema().unwrap();
+            assert_no_decided_rows(&reopened, Height::new(32));
+            assert!(reopened
+                .get_decided_value(Height::new(32))
+                .unwrap()
+                .is_none());
+            assert!(reopened
+                .get_decided_block_data(Height::new(32))
+                .unwrap()
+                .is_none());
+            assert!(reopened
+                .get_certificate_and_header(Height::new(32))
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[test]
@@ -1308,23 +2364,46 @@ mod tests {
         let value_id = ValueId::new(11);
         let payload = Bytes::from_static(b"one-payload");
 
-        db.insert_undecided_block_data(height, value_id, payload.clone())
+        db.insert_undecided_block_data(height, Round::new(0), value_id, payload.clone())
             .unwrap();
-        db.insert_undecided_block_data(height, value_id, payload.clone())
+        db.insert_undecided_block_data(height, Round::new(0), value_id, payload.clone())
             .unwrap();
 
         assert_eq!(db.undecided_block_data_len().unwrap(), 1);
-        assert_eq!(metrics.write_count(), 1);
-        assert_eq!(metrics.write_bytes(), payload.len() as u64);
+        assert_eq!(metrics.write_count(), 2);
+        assert_eq!(metrics.write_bytes(), (payload.len() * 2) as u64);
 
         let path = dir.path().join("deduplicate_payload.redb");
         drop(db);
         let reopened = Db::new(path, 1024 * 1024, DbMetrics::new()).unwrap();
         reopened.initialize_schema().unwrap();
         assert_eq!(
-            reopened.get_undecided_block_data(height, value_id).unwrap(),
+            reopened
+                .get_undecided_block_data(height, Round::new(0), value_id)
+                .unwrap(),
             Some(payload)
         );
+    }
+
+    #[test]
+    fn undecided_block_data_large_duplicate_does_not_add_physical_writes() {
+        let (db, _dir, metrics) = create_test_db_with_metrics("large_duplicate_payload");
+        let height = Height::new(8);
+        let round = Round::new(1);
+        let payload = Bytes::from(vec![0xAB; 4 * 1024 * 1024]);
+        let value_id = Value::new(payload.clone()).id();
+
+        db.insert_undecided_block_data(height, round, value_id, payload.clone())
+            .unwrap();
+        let writes = metrics.write_count();
+        let bytes = metrics.write_bytes();
+
+        db.insert_undecided_block_data(height, round, value_id, payload)
+            .unwrap();
+
+        assert_eq!(db.undecided_block_data_len().unwrap(), 1);
+        assert_eq!(metrics.write_count(), writes);
+        assert_eq!(metrics.write_bytes(), bytes);
     }
 
     #[test]
@@ -1332,10 +2411,20 @@ mod tests {
         let (db, _dir, _metrics) = create_test_db_with_metrics("distinct_payloads");
         let height = Height::new(7);
 
-        db.insert_undecided_block_data(height, ValueId::new(11), Bytes::from_static(b"first"))
-            .unwrap();
-        db.insert_undecided_block_data(height, ValueId::new(12), Bytes::from_static(b"second"))
-            .unwrap();
+        db.insert_undecided_block_data(
+            height,
+            Round::new(0),
+            ValueId::new(11),
+            Bytes::from_static(b"first"),
+        )
+        .unwrap();
+        db.insert_undecided_block_data(
+            height,
+            Round::new(0),
+            ValueId::new(12),
+            Bytes::from_static(b"second"),
+        )
+        .unwrap();
 
         assert_eq!(db.undecided_block_data_len().unwrap(), 2);
     }
@@ -1347,10 +2436,15 @@ mod tests {
         let value_id = ValueId::new(11);
         let original = Bytes::from_static(b"original");
 
-        db.insert_undecided_block_data(height, value_id, original.clone())
+        db.insert_undecided_block_data(height, Round::new(0), value_id, original.clone())
             .unwrap();
         let error = db
-            .insert_undecided_block_data(height, value_id, Bytes::from_static(b"conflict"))
+            .insert_undecided_block_data(
+                height,
+                Round::new(0),
+                value_id,
+                Bytes::from_static(b"conflict"),
+            )
             .unwrap_err();
 
         assert!(matches!(
@@ -1361,11 +2455,12 @@ mod tests {
             } if error_height == height && error_value_id == value_id
         ));
         assert_eq!(
-            db.get_undecided_block_data(height, value_id).unwrap(),
+            db.get_undecided_block_data(height, Round::new(0), value_id)
+                .unwrap(),
             Some(original.clone())
         );
-        assert_eq!(metrics.write_count(), 1);
-        assert_eq!(metrics.write_bytes(), original.len() as u64);
+        assert_eq!(metrics.write_count(), 2);
+        assert_eq!(metrics.write_bytes(), (original.len() * 2) as u64);
     }
 
     #[test]
@@ -1422,19 +2517,6 @@ mod tests {
         assert_eq!(metrics.write_bytes(), original.len() as u64);
     }
 
-    /// Build a DecidedValue (Value + CommitCertificate) and a block header for a given height.
-    fn make_decided_value(height: u64) -> (DecidedValue, Bytes) {
-        let value = Value::new(Bytes::from(vec![height as u8; 10]));
-        let certificate = CommitCertificate {
-            height: Height::new(height),
-            round: Round::new(0),
-            value_id: value.id(),
-            commit_signatures: vec![],
-        };
-        let block_header = Bytes::from(vec![height as u8; 20]);
-        (DecidedValue { value, certificate }, block_header)
-    }
-
     /// Build a minimal ProposedValue for a given height.
     fn make_proposed_value(height: u64) -> ProposedValue<EmeraldContext> {
         let value = Value::new(Bytes::from(vec![height as u8; 10]));
@@ -1455,12 +2537,8 @@ mod tests {
         // --- Populate all tables at heights 1, 2, 3 ---
         for h in 1..=4u64 {
             // Decided values table + certificates table + block headers table
-            let (decided, header) = make_decided_value(h);
-            db.insert_decided_value(decided, header).unwrap();
-
-            // Decided block data table
-            db.insert_decided_block_data(Height::new(h), Bytes::from(vec![h as u8; 30]))
-                .unwrap();
+            let (decided, header, payload) = make_decided_state(h);
+            db.insert_decided_state(decided, header, payload).unwrap();
 
             // Undecided proposals table
             let proposal = make_proposed_value(h);
@@ -1469,6 +2547,7 @@ mod tests {
             // Undecided block data table
             db.insert_undecided_block_data(
                 Height::new(h),
+                Round::new(0),
                 ValueId::new(h),
                 Bytes::from(vec![h as u8; 40]),
             )
@@ -1477,6 +2556,7 @@ mod tests {
 
         db.insert_undecided_block_data(
             Height::new(3),
+            Round::new(0),
             ValueId::new(33),
             Bytes::from_static(b"second-surviving-payload"),
         )
@@ -1495,7 +2575,7 @@ mod tests {
                 "certificate at height {h} should exist before pruning"
             );
             assert!(
-                db.get_undecided_block_data(Height::new(h), ValueId::new(h))
+                db.get_undecided_block_data(Height::new(h), Round::new(0), ValueId::new(h),)
                     .unwrap()
                     .is_some(),
                 "block data at height {h} should exist before pruning"
@@ -1588,29 +2668,43 @@ mod tests {
 
         // === Undecided block data (retain height = 3, heights > 2 survive) ===
         assert!(
-            db.get_undecided_block_data(Height::new(3), ValueId::new(3))
+            db.get_undecided_block_data(Height::new(3), Round::new(0), ValueId::new(3))
                 .unwrap()
                 .is_some(),
             "undecided block data at height 3 should survive"
         );
         assert!(
-            db.get_undecided_block_data(Height::new(2), ValueId::new(2))
+            db.get_undecided_block_data(Height::new(2), Round::new(0), ValueId::new(2))
                 .unwrap()
                 .is_none(),
             "undecided block data at height 2 should be pruned"
         );
+        assert!(get_legacy_undecided_block_data(
+            &db,
+            Height::new(2),
+            Round::new(0),
+            ValueId::new(2),
+        )
+        .is_none());
         assert!(
-            db.get_undecided_block_data(Height::new(1), ValueId::new(1))
+            db.get_undecided_block_data(Height::new(1), Round::new(0), ValueId::new(1))
                 .unwrap()
                 .is_none(),
             "undecided block data at height 1 should be pruned"
         );
         assert!(
-            db.get_undecided_block_data(Height::new(3), ValueId::new(33))
+            db.get_undecided_block_data(Height::new(3), Round::new(0), ValueId::new(33))
                 .unwrap()
                 .is_some(),
             "distinct undecided block data at height 3 should survive"
         );
+        assert!(get_legacy_undecided_block_data(
+            &db,
+            Height::new(3),
+            Round::new(0),
+            ValueId::new(33),
+        )
+        .is_some());
 
         // === Undecided proposals (retain height = 3, heights > 2 survive) ===
         assert!(
@@ -1639,10 +2733,8 @@ mod tests {
 
         // Populate data at heights 1-4
         for h in 1..=4u64 {
-            let (decided, header) = make_decided_value(h);
-            db.insert_decided_value(decided, header).unwrap();
-            db.insert_decided_block_data(Height::new(h), Bytes::from(vec![h as u8; 30]))
-                .unwrap();
+            let (decided, header, payload) = make_decided_state(h);
+            db.insert_decided_state(decided, header, payload).unwrap();
         }
 
         // Prune with prune_certificates = false
@@ -1678,8 +2770,8 @@ mod tests {
         let (db, _dir) = create_test_db("prune_no_op_test");
 
         // Populate data at height 1
-        let (decided, header) = make_decided_value(1);
-        db.insert_decided_value(decided, header).unwrap();
+        let (decided, header, payload) = make_decided_state(1);
+        db.insert_decided_state(decided, header, payload).unwrap();
 
         // Prune with curr_height <= num_temp_blocks_retained (no value pruning)
         // and prune_certificates = false (no cert pruning)
@@ -1709,8 +2801,8 @@ mod tests {
         let (db, _dir) = create_test_db("prune_saturating_test");
 
         // Populate data at height 1
-        let (decided, header) = make_decided_value(1);
-        db.insert_decided_value(decided, header).unwrap();
+        let (decided, header, payload) = make_decided_state(1);
+        db.insert_decided_state(decided, header, payload).unwrap();
 
         // Prune with values that would underflow without saturating_sub
         // curr_height = 2, num_certificates_to_retain = 100

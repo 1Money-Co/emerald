@@ -118,7 +118,8 @@ The `--config` flag should contain the explicit file path to the Emerald config:
 
 The first startup with the round-independent payload schema migrates the local redb
 `undecided_block_data` table to `undecided_block_data_v2`. The migration keeps one payload per
-`(height, value_id)`, removes identical round duplicates, and deletes the legacy table in the same transaction.
+`(height, value_id)` and removes identical round duplicates from the primary v2 layout. For one compatibility release,
+the legacy table remains as an N-1 rollback shadow and receives the same payload under each proposal's round key.
 
 Before upgrading each node:
 
@@ -127,9 +128,15 @@ Before upgrading each node:
 3. Reserve temporary free space for approximately one deduplicated undecided payload set plus redb overhead.
 4. Start the new binary and wait for the `undecided_block_data_migration` event before upgrading another validator.
 
-Migration copies every unique payload into the v2 table before deleting the legacy table in the same transaction.
-That temporary copy requires headroom even when many legacy rows are duplicates; deduplication reduces the copied set,
-but it does not let redb reclaim the legacy pages until the transaction commits.
+Migration copies every unique payload into the v2 table and validates all duplicate bytes in the same transaction.
+That copy requires headroom even when many legacy rows are duplicates. The legacy shadow is deliberately retained, so
+this release does not reclaim its pages and requires space for both layouts. A later activated release will remove the
+shadow after N-1 rollback is no longer required.
+
+The same startup transaction repairs the N-1 crash window where decided value, certificate, and header rows committed
+but their payload remained only in undecided storage. Emerald promotes the certificate-bound payload only after its
+value ID, stored value bytes, SSZ encoding, and stored header all agree. Missing or conflicting data aborts startup
+without changing the database. New commits persist the payload and all three metadata rows in one transaction.
 
 If legacy rows use the same `(height, value_id)` with different bytes, startup fails without changing the legacy
 table. The error and structured log identify the incoming legacy round, the existing round when it came from legacy
@@ -138,9 +145,13 @@ Emerald has no safe automated repair for this corrupted state: preserve the data
 restore the backup and continue with the previous binary. Do not delete either row without determining the
 authoritative payload.
 
-The migration is one-way. To run an older Emerald binary, restore the database backup taken before the upgrade.
-Deleting the legacy table frees redb pages for reuse but might not reduce the file size immediately. Startup does not
-run full database compaction; reclaiming filesystem space is a separate offline maintenance operation.
+During this compatibility release, a node may return to N-1 using the same `store.db`: stop N completely before
+starting N-1, and never let two Emerald processes open the database concurrently. N reads v2 first but atomically
+dual-writes and prunes the N-1 table. Keep the pre-upgrade backup despite this compatibility path; separately persisted
+Malachite WAL and Reth state still make arbitrary partial filesystem restoration unsafe.
+
+The deterministic test suite exercises the N-1 database contract through N-1 -> N -> N-1-compatible access -> N.
+A real mixed-binary rolling-network exercise is a release qualification step and is not implied by the unit test.
 
 ## Monitoring
 

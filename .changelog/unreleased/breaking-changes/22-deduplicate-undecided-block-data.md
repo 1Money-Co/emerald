@@ -1,3 +1,4 @@
-- `[app]` Deduplicate undecided block payloads across consensus rounds. The first startup migrates the local redb
-  database in place; downgrading requires restoring the pre-upgrade `<home>/store.db` backup.
+- `[app]` Deduplicate undecided block payloads across consensus rounds. During the compatibility release, Emerald
+  retains and dual-writes the legacy round-keyed table so a quiesced node can return to the previous binary without
+  restoring an out-of-date application database.
   ([#22](https://github.com/1Money-Co/emerald/pull/22))

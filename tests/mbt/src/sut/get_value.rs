@@ -38,7 +38,7 @@ impl Sut {
 
         let state = &mut self.components.state;
         let block_data = state
-            .get_undecided_block_data(height, value_id)
+            .get_undecided_block_data(height, emerald_proposal.round, value_id)
             .await?
             .ok_or(anyhow!("No block data for value id: {value_id}"))?;
 

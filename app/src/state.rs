@@ -516,9 +516,12 @@ impl State {
     pub async fn get_undecided_block_data(
         &self,
         height: Height,
+        round: Round,
         value_id: ValueId,
     ) -> Result<Option<Bytes>, StoreError> {
-        self.store.get_undecided_block_data(height, value_id).await
+        self.store
+            .get_undecided_block_data(height, round, value_id)
+            .await
     }
 
     /// Stores an undecided proposal along with its block data.
@@ -534,7 +537,7 @@ impl State {
         data: Bytes,
     ) -> eyre::Result<()> {
         self.store
-            .store_undecided_block_data(value.height, value.value.id(), data)
+            .store_undecided_block_data(value.height, value.round, value.value.id(), data)
             .await?;
         self.store.store_undecided_proposal(value.clone()).await?;
         Ok(())
@@ -601,7 +604,7 @@ impl State {
         // Get block data for decided value
         let block_data = self
             .store
-            .get_undecided_block_data(certificate.height, certificate.value_id)
+            .get_undecided_block_data(certificate.height, certificate.round, certificate.value_id)
             .await?
             .ok_or_else(|| eyre::eyre!("state: certificate should have associated block data"))?;
 
@@ -620,14 +623,10 @@ impl State {
         let block_header = extract_block_header(&execution_payload);
         let block_header_bytes = Bytes::from(block_header.as_ssz_bytes());
 
-        // Block data must be durable before the certificate/value becomes visible. A crash between
-        // these operations can leave an orphaned payload, which is safe and idempotently reused on
-        // retry; the inverse order can leave a certificate that makes restart panic or fail.
+        // Publish the payload, value, certificate, and header atomically so restart never observes
+        // a certificate whose execution payload is missing.
         self.store
-            .store_decided_block_data(certificate.height, block_data)
-            .await?;
-        self.store
-            .store_decided_value(&certificate, proposal.value, block_header_bytes)
+            .store_decided_state(&certificate, proposal.value, block_header_bytes, block_data)
             .await?;
 
         let prune_certificates = self.emerald_config.num_certificates_to_retain != u64::MAX
@@ -711,7 +710,7 @@ impl State {
 
         let bytes = self
             .store
-            .get_undecided_block_data(height, value_id)
+            .get_undecided_block_data(height, proposal_round, value_id)
             .await?
             .ok_or_else(|| {
                 eyre::eyre!(
@@ -1151,7 +1150,7 @@ jwt_token_path = "./assets/jwt.hex"
 
         let current_round_bytes = state
             .store
-            .get_undecided_block_data(height, value.id())
+            .get_undecided_block_data(height, current_round, value.id())
             .await
             .unwrap()
             .expect("restreamed block data must be stored at the current round");
@@ -1288,7 +1287,10 @@ jwt_token_path = "./assets/jwt.hex"
         state.store_undecided_value(&proposal, bytes).await.unwrap();
         state
             .store
-            .store_decided_block_data(height, Bytes::from_static(b"conflicting-decided-payload"))
+            .store_legacy_decided_block_data(
+                height,
+                Bytes::from_static(b"conflicting-decided-payload"),
+            )
             .await
             .unwrap();
 
@@ -1335,7 +1337,7 @@ jwt_token_path = "./assets/jwt.hex"
             .unwrap();
         state
             .store
-            .store_decided_block_data(height, bytes.clone())
+            .store_legacy_decided_block_data(height, bytes.clone())
             .await
             .unwrap();
 
@@ -1368,7 +1370,7 @@ jwt_token_path = "./assets/jwt.hex"
         let value = Value::new(make_execution_payload_bytes());
         state
             .store
-            .store_decided_value(
+            .store_legacy_decided_metadata(
                 &CommitCertificate {
                     height,
                     round: Round::new(0),
@@ -1399,7 +1401,7 @@ jwt_token_path = "./assets/jwt.hex"
         let value = Value::new(make_execution_payload_bytes());
         state
             .store
-            .store_decided_value(
+            .store_legacy_decided_metadata(
                 &CommitCertificate {
                     height,
                     round: Round::new(0),
@@ -1413,7 +1415,7 @@ jwt_token_path = "./assets/jwt.hex"
             .unwrap();
         state
             .store
-            .store_decided_block_data(height, Bytes::from_static(b"not-an-ssz-payload"))
+            .store_legacy_decided_block_data(height, Bytes::from_static(b"not-an-ssz-payload"))
             .await
             .unwrap();
 
@@ -1436,7 +1438,7 @@ jwt_token_path = "./assets/jwt.hex"
 
         assert!(matches!(
             state
-                .get_undecided_block_data(Height::new(1426), ValueId::new(7))
+                .get_undecided_block_data(Height::new(1426), Round::new(0), ValueId::new(7),)
                 .await,
             Ok(None)
         ));
@@ -1469,7 +1471,7 @@ jwt_token_path = "./assets/jwt.hex"
         assert_eq!(
             state
                 .store
-                .get_undecided_block_data(height, value.id())
+                .get_undecided_block_data(height, round, value.id())
                 .await
                 .unwrap(),
             Some(bytes)
@@ -1520,7 +1522,7 @@ jwt_token_path = "./assets/jwt.hex"
         assert_eq!(
             state
                 .store
-                .get_undecided_block_data(height, original_value.id())
+                .get_undecided_block_data(height, original_proposal.round, original_value.id())
                 .await
                 .unwrap(),
             Some(original_bytes)
@@ -1556,7 +1558,7 @@ jwt_token_path = "./assets/jwt.hex"
         assert_eq!(rejected.validity, Validity::Invalid);
         assert!(state
             .store
-            .get_undecided_block_data(height, malformed.id())
+            .get_undecided_block_data(height, round, malformed.id())
             .await
             .unwrap()
             .is_none());
@@ -1591,7 +1593,7 @@ jwt_token_path = "./assets/jwt.hex"
         assert!(receiver.await.unwrap().is_none());
         assert!(state
             .store
-            .get_undecided_block_data(height, forged.id())
+            .get_undecided_block_data(height, round, forged.id())
             .await
             .unwrap()
             .is_none());
@@ -1607,7 +1609,7 @@ jwt_token_path = "./assets/jwt.hex"
         let existing = Bytes::from_static(b"conflicting-stored-payload");
         state
             .store
-            .store_undecided_block_data(height, value.id(), existing.clone())
+            .store_undecided_block_data(height, round, value.id(), existing.clone())
             .await
             .unwrap();
         let (reply, receiver) = tokio::sync::oneshot::channel();
@@ -1633,7 +1635,7 @@ jwt_token_path = "./assets/jwt.hex"
         assert_eq!(
             state
                 .store
-                .get_undecided_block_data(height, value.id())
+                .get_undecided_block_data(height, round, value.id())
                 .await
                 .unwrap(),
             Some(existing)
