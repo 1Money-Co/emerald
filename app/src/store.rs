@@ -1058,6 +1058,21 @@ impl Db {
                 duration_seconds = start.elapsed().as_secs_f64(),
                 "Migrated legacy undecided block data"
             );
+        } else if migration.recovered_decided_payloads > 0 {
+            self.metrics.observe_write_time(start.elapsed());
+            self.metrics.add_writes(
+                migration.recovered_decided_payloads,
+                migration.recovered_decided_bytes,
+            );
+            tracing::info!(
+                event = "targeted_decided_payload_recovery",
+                decided_rows_visited = stats.targeted_decided_rows_visited,
+                expensive_rows_validated = stats.expensive_decided_rows_validated,
+                recovered_decided_payloads = migration.recovered_decided_payloads,
+                recovered_decided_bytes = migration.recovered_decided_bytes,
+                duration_seconds = start.elapsed().as_secs_f64(),
+                "Recovered missing decided payloads"
+            );
         }
 
         Ok(stats)
@@ -1072,7 +1087,7 @@ impl Db {
         stats.legacy_payload_rows_visited = migration.legacy_rows;
         Self::reconcile_undecided_proposals(tx, migration, stats)?;
         Self::backfill_legacy_undecided_block_data(tx, migration)?;
-        Self::recover_legacy_partial_commits(tx, migration)?;
+        Self::reconcile_existing_decided_state(tx, migration)?;
         Ok(())
     }
 
@@ -1082,16 +1097,113 @@ impl Db {
         stats: &mut SchemaInitializationStats,
     ) -> Result<(), StoreError> {
         let values = tx.open_table(DECIDED_VALUES_TABLE)?;
+        let certificates = tx.open_table(CERTIFICATES_TABLE)?;
+        let headers = tx.open_table(DECIDED_BLOCK_HEADERS_TABLE)?;
+        let primary = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
+        let legacy = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
+        let mut decided_payloads = tx.open_table(DECIDED_BLOCK_DATA_TABLE)?;
+
         for entry in values.iter()? {
-            entry?;
+            let (height_key, encoded_value) = entry?;
+            let height = height_key.value();
             stats.targeted_decided_rows_visited += 1;
+            if decided_payloads.get(&height)?.is_some() {
+                continue;
+            }
             stats.expensive_decided_rows_validated += 1;
+
+            let stored_value = match decode_stored_value(Bytes::from(encoded_value.value()))
+                .map_err(|_| StoreError::IrrecoverableDecidedState {
+                    height,
+                    reason: "stored value cannot be decoded",
+                })?
+            {
+                DecodedStoredValue::Full(value) => value,
+                DecodedStoredValue::IdOnly(_) => {
+                    return Err(StoreError::IrrecoverableDecidedState {
+                        height,
+                        reason: "stored value is ID-only after storage reconciliation",
+                    });
+                }
+            };
+            let encoded_certificate = certificates.get(&height)?.ok_or(
+                StoreError::IrrecoverableDecidedState {
+                    height,
+                    reason: "missing certificate",
+                },
+            )?;
+            let certificate = decode_certificate(&encoded_certificate.value()).map_err(|_| {
+                StoreError::IrrecoverableDecidedState {
+                    height,
+                    reason: "stored certificate cannot be decoded",
+                }
+            })?;
+            let stored_header =
+                headers
+                    .get(&height)?
+                    .ok_or(StoreError::IrrecoverableDecidedState {
+                        height,
+                        reason: "missing stored header",
+                    })?;
+
+            if certificate.height != height {
+                return Err(StoreError::IrrecoverableDecidedState {
+                    height,
+                    reason: "certificate height does not match the decided value key",
+                });
+            }
+            if certificate.value_id != stored_value.id() {
+                return Err(StoreError::IrrecoverableDecidedState {
+                    height,
+                    reason: "certificate value ID does not match the stored value",
+                });
+            }
+
+            let primary_payload = primary.get(&(height, certificate.value_id))?;
+            let legacy_payload = if primary_payload.is_none() {
+                legacy.get(&(height, certificate.round, certificate.value_id))?
+            } else {
+                None
+            };
+            let payload = primary_payload
+                .as_ref()
+                .map(|value| value.value())
+                .or_else(|| legacy_payload.as_ref().map(|value| value.value()))
+                .ok_or(StoreError::IrrecoverableDecidedState {
+                    height,
+                    reason: "missing its execution payload",
+                })?;
+            let recomputed = Value::new(Bytes::copy_from_slice(&payload));
+            if recomputed.id() != certificate.value_id || stored_value.extensions.as_ref() != payload
+            {
+                return Err(StoreError::IrrecoverableDecidedState {
+                    height,
+                    reason: "execution payload does not match the stored value ID and bytes",
+                });
+            }
+            let execution_payload = ExecutionPayloadV3::from_ssz_bytes(&payload).map_err(|_| {
+                StoreError::IrrecoverableDecidedState {
+                    height,
+                    reason: "execution payload cannot be decoded",
+                }
+            })?;
+            let expected_header = extract_block_header(&execution_payload).as_ssz_bytes();
+            if stored_header.value() != expected_header {
+                return Err(StoreError::IrrecoverableDecidedState {
+                    height,
+                    reason: "stored header does not match the execution payload",
+                });
+            }
+
+            let payload_len = payload.len() as u64;
+            decided_payloads.insert(height, payload)?;
+            migration.recovered_decided_payloads += 1;
+            migration.recovered_decided_bytes += payload_len;
         }
-        drop(values);
-        Self::recover_legacy_partial_commits(tx, migration)
+        Ok(())
     }
 
-    fn recover_legacy_partial_commits(
+    fn reconcile_existing_decided_state(
         tx: &redb::WriteTransaction,
         stats: &mut UndecidedBlockDataMigrationStats,
     ) -> Result<(), StoreError> {
@@ -2869,6 +2981,145 @@ mod tests {
             reopened.get_decided_value(height).unwrap(),
             Some(DecidedValue { value, certificate })
         );
+    }
+
+    #[test]
+    fn versioned_second_startup_skips_reconciliation_and_expensive_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("versioned-second-start.redb");
+        let db = Db::new(&path, 1024 * 1024, DbMetrics::new()).unwrap();
+
+        for height in [90, 91] {
+            let payload = make_execution_payload_bytes(height);
+            let proposal: ProposedValue<EmeraldContext> = ProposedValue {
+                height: Height::new(height),
+                round: Round::new(2),
+                valid_round: Round::new(1),
+                proposer: Address::new([height as u8; 20]),
+                value: Value::new(payload.clone()),
+                validity: Validity::Valid,
+            };
+            insert_raw_legacy_full_proposal_and_payload(&db, &proposal, &payload);
+        }
+        let (decided, header, payload) = make_decided_state(92);
+        db.insert_decided_state(decided, header, payload).unwrap();
+
+        let first = db.initialize_schema().unwrap();
+        assert!(first.reconciliation_ran);
+        drop(db);
+
+        let reopened = Db::new(path, 1024 * 1024, DbMetrics::new()).unwrap();
+        let second = reopened.initialize_schema().unwrap();
+        assert!(!second.reconciliation_ran);
+        assert_eq!(second.legacy_payload_rows_visited, 0);
+        assert_eq!(second.proposal_rows_visited, 0);
+        assert_eq!(second.expensive_decided_rows_validated, 0);
+        assert_eq!(reconciliation_version(&reopened), Some(1));
+    }
+
+    #[test]
+    fn versioned_restart_recovers_only_missing_decided_payload() {
+        let (db, _dir) = create_test_db("versioned-targeted-recovery");
+        let (complete, complete_header, complete_payload) = make_decided_state(100);
+        db.insert_decided_state(complete, complete_header, complete_payload)
+            .unwrap();
+
+        let (partial, partial_header, partial_payload) = make_decided_state(101);
+        insert_n_minus_one_partial_commit(
+            &db,
+            &partial,
+            &partial_header,
+            Some(&partial_payload),
+        );
+
+        let stats = db.initialize_schema().unwrap();
+        assert_eq!(stats.targeted_decided_rows_visited, 2);
+        assert_eq!(stats.expensive_decided_rows_validated, 1);
+        assert_eq!(
+            db.get_decided_block_data(Height::new(101)).unwrap(),
+            Some(partial_payload)
+        );
+    }
+
+    #[test]
+    fn versioned_restart_recovery_conflict_aborts_without_mutation() {
+        let (db, _dir) = create_test_db("versioned-targeted-conflict");
+        let (partial, partial_header, _partial_payload) = make_decided_state(102);
+        let wrong_payload = make_execution_payload_bytes(202);
+        insert_n_minus_one_partial_commit(
+            &db,
+            &partial,
+            &partial_header,
+            Some(&wrong_payload),
+        );
+        let key = (
+            Height::new(102),
+            partial.certificate.round,
+            partial.certificate.value_id,
+        );
+        let before = raw_storage_snapshot(&db, key);
+
+        let error = db.initialize_schema().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("execution payload does not match the stored value ID and bytes"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(reconciliation_version(&db), Some(1));
+        assert_eq!(raw_storage_snapshot(&db, key), before);
+    }
+
+    #[test]
+    #[ignore = "manual large-dataset restart benchmark"]
+    fn versioned_restart_large_dataset_benchmark() {
+        const PROPOSALS: u64 = 256;
+        const PAYLOAD_BYTES: usize = 256 * 1024;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("versioned-restart-benchmark.redb");
+        let db = Db::new(&path, 1024 * 1024, DbMetrics::new()).unwrap();
+        let tx = db.db.begin_write().unwrap();
+        {
+            let mut proposals = tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE).unwrap();
+            let mut payloads = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE).unwrap();
+            for index in 0..PROPOSALS {
+                let payload = Bytes::from(vec![index as u8; PAYLOAD_BYTES]);
+                let proposal: ProposedValue<EmeraldContext> = ProposedValue {
+                    height: Height::new(index + 1),
+                    round: Round::new(0),
+                    valid_round: Round::Nil,
+                    proposer: Address::new([index as u8; 20]),
+                    value: Value::new(payload.clone()),
+                    validity: Validity::Valid,
+                };
+                let key = (proposal.height, proposal.round, proposal.value.id());
+                proposals
+                    .insert(key, ProtobufCodec.encode(&proposal).unwrap().to_vec())
+                    .unwrap();
+                payloads.insert(key, payload.to_vec()).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let first_started = Instant::now();
+        let first = db.initialize_schema().unwrap();
+        let first_elapsed = first_started.elapsed();
+        drop(db);
+
+        let reopened = Db::new(path, 1024 * 1024, DbMetrics::new()).unwrap();
+        let second_started = Instant::now();
+        let second = reopened.initialize_schema().unwrap();
+        let second_elapsed = second_started.elapsed();
+        eprintln!(
+            "first={first_elapsed:?} {first:?}; second={second_elapsed:?} {second:?}"
+        );
+
+        assert_eq!(first.legacy_payload_rows_visited, PROPOSALS);
+        assert_eq!(first.proposal_rows_visited, PROPOSALS);
+        assert_eq!(second.legacy_payload_rows_visited, 0);
+        assert_eq!(second.proposal_rows_visited, 0);
+        assert_eq!(second.expensive_decided_rows_validated, 0);
     }
 
     #[test]

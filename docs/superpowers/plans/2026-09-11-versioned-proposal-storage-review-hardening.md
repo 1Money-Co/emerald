@@ -414,7 +414,7 @@ git commit -m "fix: version-gate storage reconciliation"
 - Produces `Db::recover_missing_decided_payloads(tx, migration, stats) -> Result<(), StoreError>`.
 - Keeps the full `DecodedStoredValue::IdOnly` repair only in one-time reconciliation.
 
-- [ ] **Step 1: Write the failing second-startup no-rescan test**
+- [x] **Step 1: Write the failing second-startup no-rescan test**
 
 Add `versioned_second_startup_skips_reconciliation_and_expensive_validation`. Build a database with at least two
 legacy payload/proposal rows and one complete decided row, run initialization once, reopen, and capture the returned
@@ -428,7 +428,7 @@ assert_eq!(stats.expensive_decided_rows_validated, 0);
 assert_eq!(reconciliation_version(&reopened), Some(1));
 ```
 
-- [ ] **Step 2: Write targeted recovery tests**
+- [x] **Step 2: Write targeted recovery tests**
 
 Add two tests:
 
@@ -437,7 +437,7 @@ Add two tests:
 - `versioned_restart_recovery_conflict_aborts_without_mutation` creates marker `1` and a partial row with a wrong
   legacy payload. Assert the marker remains `1`, no decided payload is inserted, and existing rows are unchanged.
 
-- [ ] **Step 3: Run steady-state and targeted tests and verify red**
+- [x] **Step 3: Run steady-state and targeted tests and verify red**
 
 Run:
 
@@ -449,7 +449,7 @@ cargo test -p emerald versioned_restart_ -- --nocapture
 Expected: the current code reports proposal/legacy scans on the second startup and hashes or SSZ-validates the
 complete decided row.
 
-- [ ] **Step 4: Split initial decided reconciliation from later recovery**
+- [x] **Step 4: Split initial decided reconciliation from later recovery**
 
 Retain the current full decoder and ID-only repair in `reconcile_existing_decided_state`, called only before writing
 marker `1`.
@@ -472,7 +472,7 @@ for entry in values.iter()? {
 The targeted path requires a full stored value. An ID-only value after marker `1` is an integrity error because
 reconciliation repaired every pre-existing ID-only row and safe N/N-1 proposal storage cannot create another.
 
-- [ ] **Step 5: Add an ignored large-dataset restart benchmark**
+- [x] **Step 5: Add an ignored large-dataset restart benchmark**
 
 Add:
 
@@ -493,7 +493,7 @@ fn versioned_restart_large_dataset_benchmark() {
 Use deterministic visit-count assertions only. Print elapsed durations with `eprintln!` for manual evidence; do not
 assert a timing ratio.
 
-- [ ] **Step 6: Run recovery regressions and compile the ignored benchmark**
+- [x] **Step 6: Run recovery regressions and compile the ignored benchmark**
 
 Run:
 
@@ -507,7 +507,7 @@ cargo test -p emerald versioned_restart_large_dataset_benchmark -- --ignored --n
 Expected: targeted and legacy recovery tests pass. The manual benchmark prints first/second durations and proves zero
 heavy phase visits on the second startup.
 
-- [ ] **Step 7: Commit restart gating**
+- [x] **Step 7: Commit restart gating**
 
 ```bash
 git add app/src/store.rs
