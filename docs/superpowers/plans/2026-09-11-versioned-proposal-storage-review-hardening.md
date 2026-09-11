@@ -154,7 +154,7 @@ git commit -m "feat: add versioned proposal storage tables"
 - Keeps existing public `Store::{store_undecided_proposal,get_undecided_proposal,get_undecided_proposals}` APIs.
 - Makes `Db::insert_undecided_proposal` write missing full and compact representations in one transaction.
 
-- [ ] **Step 1: Write failing runtime dual-write and fallback tests**
+- [x] **Step 1: Write failing runtime dual-write and fallback tests**
 
 Replace the unsafe `rollback_compact_proposal_is_readable_by_n_minus_one` expectation with:
 
@@ -196,7 +196,7 @@ Add `proposal_read_falls_back_to_full_v1_written_after_reconciliation`. Initiali
 marker exists, raw-insert only a full v1 proposal and exact legacy payload, reopen, call `initialize_schema`, assert
 the compact table remains empty, and assert `get_undecided_proposal` returns the full proposal.
 
-- [ ] **Step 2: Run the runtime tests and verify red**
+- [x] **Step 2: Run the runtime tests and verify red**
 
 Run:
 
@@ -208,7 +208,7 @@ cargo test -p emerald proposal_read_falls_back_to_full_v1_written_after_reconcil
 Expected: dual-write fails because the current table contains compact bytes under the legacy name. Fallback fails
 because reads consult only compact storage.
 
-- [ ] **Step 3: Implement full-v1 decoding and v2-first reads**
+- [x] **Step 3: Implement full-v1 decoding and v2-first reads**
 
 Add a strict helper that validates a full row without accepting ID-only data:
 
@@ -237,7 +237,7 @@ same derived ID and the same bytes as `proposal.value.extensions`.
 Refactor `get_undecided_proposals` to collect the union of matching compact and legacy keys. Prefer compact when both
 exist, and return each key once. Preserve read-byte and key-byte metrics for rows actually read.
 
-- [ ] **Step 4: Implement atomic proposal dual writes**
+- [x] **Step 4: Implement atomic proposal dual writes**
 
 Encode both representations before opening the transaction:
 
@@ -252,12 +252,12 @@ the authoritative proposal and derive the missing representation from that propo
 proposer or validity with the retry argument. Commit only when at least one row is inserted; metrics count the exact
 bytes physically inserted after commit.
 
-- [ ] **Step 5: Add paired proposal pruning coverage**
+- [x] **Step 5: Add paired proposal pruning coverage**
 
 Extend `test_prune` to assert that retained keys exist in both proposal tables before pruning, keys below the retain
 height are absent from both afterward, and surviving reads still return one logical proposal rather than duplicates.
 
-- [ ] **Step 6: Run runtime, restream, metrics, and pruning tests**
+- [x] **Step 6: Run runtime, restream, metrics, and pruning tests**
 
 Run:
 
@@ -271,7 +271,7 @@ cargo test -p emerald store::tests::test_prune -- --exact --nocapture
 
 Expected: all tests pass; existing restream callers receive fully hydrated proposals without API changes.
 
-- [ ] **Step 7: Commit runtime compatibility**
+- [x] **Step 7: Commit runtime compatibility**
 
 ```bash
 git add app/src/store.rs
