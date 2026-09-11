@@ -787,7 +787,7 @@ git diff --stat origin/seb/deduplicate-undecided-block-data...HEAD
 Inspect each match. Require full encoding only for v1 storage and wire paths, compact encoding only for v2 storage,
 and no ID-only exception in network decoding.
 
-- [ ] **Step 5: Push and verify the existing PR head**
+- [x] **Step 5: Push and verify the existing PR head**
 
 ```bash
 git push origin seb/deduplicate-undecided-block-data
@@ -796,7 +796,7 @@ gh pr view 22 --repo 1Money-Co/emerald --json url,headRefOid,state,statusCheckRo
 
 Expected: PR #22 is open and `headRefOid` equals local `git rev-parse HEAD`.
 
-- [ ] **Step 6: Reply to Simon's rollback-wire thread**
+- [x] **Step 6: Reply to Simon's rollback-wire thread**
 
 Reply to comment `3987393054` in place:
 
@@ -821,7 +821,7 @@ opt-in real-binary qualification script covers process-level downgrade, sync, an
 stored-proposal interleaving remains deterministically pinned at the database/wire boundary.'
 ```
 
-- [ ] **Step 7: Reply to Simon's restart-scan thread**
+- [x] **Step 7: Reply to Simon's restart-scan thread**
 
 Reply to comment `3987393069` in place:
 
@@ -844,7 +844,7 @@ visits on a second startup, preserve targeted N-1 partial-commit recovery, and i
 restart benchmark without unstable timing assertions.'
 ```
 
-- [ ] **Step 8: Re-read GitHub state and report qualification honestly**
+- [x] **Step 8: Re-read GitHub state and report qualification honestly**
 
 ```bash
 gh api repos/1Money-Co/emerald/pulls/comments/3987393054
