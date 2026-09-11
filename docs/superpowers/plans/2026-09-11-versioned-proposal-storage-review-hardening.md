@@ -293,7 +293,7 @@ git commit -m "fix: preserve full rollback proposal values"
 - Produces `Db::reconcile_undecided_storage(tx, migration, stats) -> Result<(), StoreError>`.
 - Writes reconciliation version `1` only after all validation and queued mutations succeed.
 
-- [ ] **Step 1: Add initialization statistics and raw marker helpers for tests**
+- [x] **Step 1: Add initialization statistics and raw marker helpers for tests**
 
 Define:
 
@@ -312,7 +312,7 @@ Add test helpers `reconciliation_version(&Db) -> Option<u64>` and
 `insert_raw_legacy_proposal(Db, key, bytes)` that explicitly target the full v1 table. Rename the existing raw compact
 helper to target v2 so tests never rely on an ambiguous table name.
 
-- [ ] **Step 2: Write failing migration-state matrix tests**
+- [x] **Step 2: Write failing migration-state matrix tests**
 
 Add these cases:
 
@@ -326,7 +326,7 @@ Add these cases:
 For every failure case, snapshot raw v1, compact v2, legacy payload, shared payload, decided, and marker values before
 initialization and assert exact equality afterward.
 
-- [ ] **Step 3: Run migration-state tests and verify red**
+- [x] **Step 3: Run migration-state tests and verify red**
 
 Run:
 
@@ -339,7 +339,7 @@ cargo test -p emerald reconciliation_failure_ -- --nocapture
 Expected: the full-row case rewrites the legacy table compactly, the current-PR case does not restore full bytes, and
 no completion marker exists.
 
-- [ ] **Step 4: Refactor full reconciliation around both proposal representations**
+- [x] **Step 4: Refactor full reconciliation around both proposal representations**
 
 Change `compact_undecided_proposals` into `reconcile_undecided_proposals`. For every v1 row:
 
@@ -352,7 +352,7 @@ Change `compact_undecided_proposals` into `reconcile_undecided_proposals`. For e
 Apply queued v1 restorations and v2 insertions only after every proposal validates. Keep legacy payload migration,
 rollback-shadow backfill, and decided-state reconciliation in the same outer write transaction.
 
-- [ ] **Step 5: Gate reconciliation with the durable marker**
+- [x] **Step 5: Gate reconciliation with the durable marker**
 
 Structure `initialize_schema` as:
 
@@ -380,7 +380,7 @@ tx.commit()?;
 Do not use retained-table existence as a completion signal. Emit the full migration event only when
 `stats.reconciliation_ran` is true and the transaction commits.
 
-- [ ] **Step 6: Run migration, rollback, reopen, and conflict tests**
+- [x] **Step 6: Run migration, rollback, reopen, and conflict tests**
 
 Run:
 
@@ -393,7 +393,7 @@ cargo test -p emerald proposal_metadata_migration_ -- --nocapture
 
 Expected: all tests pass. Update old test names and assertions to distinguish full v1 bytes from compact v2 bytes.
 
-- [ ] **Step 7: Commit one-time reconciliation**
+- [x] **Step 7: Commit one-time reconciliation**
 
 ```bash
 git add app/src/store.rs

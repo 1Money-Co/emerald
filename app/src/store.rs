@@ -19,8 +19,8 @@ use malachitebft_eth_types::{proto, EmeraldContext, Height, Value, ValueId};
 use malachitebft_proto::{Error as ProtoError, Protobuf};
 use prost::Message;
 #[cfg(test)]
-use redb::ReadableTableMetadata;
-use redb::{ReadableTable, TableHandle};
+use redb::{ReadableTableMetadata, TableHandle};
+use redb::ReadableTable;
 use ssz::{Decode, Encode};
 use thiserror::Error;
 
@@ -150,10 +150,8 @@ const UNDECIDED_PROPOSALS_TABLE: redb::TableDefinition<'_, UndecidedValueKey, Ve
 const SCHEMA_METADATA_TABLE: redb::TableDefinition<'_, &str, u64> =
     redb::TableDefinition::new("storage_schema_metadata");
 
-#[allow(dead_code)]
 const UNDECIDED_STORAGE_RECONCILIATION_KEY: &str =
     "undecided_storage_reconciliation_version";
-#[allow(dead_code)]
 const UNDECIDED_STORAGE_RECONCILIATION_VERSION: u64 = 1;
 
 const DECIDED_BLOCK_DATA_TABLE: redb::TableDefinition<'_, HeightKey, Vec<u8>> =
@@ -195,6 +193,15 @@ struct UndecidedBlockDataMigrationStats {
     proposal_compact_bytes: u64,
     repaired_compact_decided_values: u64,
     repaired_compact_decided_value_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SchemaInitializationStats {
+    reconciliation_ran: bool,
+    legacy_payload_rows_visited: u64,
+    proposal_rows_visited: u64,
+    targeted_decided_rows_visited: u64,
+    expensive_decided_rows_validated: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -975,13 +982,10 @@ impl Db {
         Ok(Some(key.value()))
     }
 
-    fn initialize_schema(&self) -> Result<(), StoreError> {
+    fn initialize_schema(&self) -> Result<SchemaInitializationStats, StoreError> {
         let start = Instant::now();
+        let mut stats = SchemaInitializationStats::default();
         let tx = self.db.begin_write()?;
-        let legacy_exists = {
-            let mut tables = tx.list_tables()?;
-            tables.any(|table| table.name() == LEGACY_UNDECIDED_BLOCK_DATA_TABLE.name())
-        };
 
         {
             let _ = tx.open_table(DECIDED_VALUES_TABLE)?;
@@ -997,22 +1001,30 @@ impl Db {
             let _ = tx.open_table(SCHEMA_METADATA_TABLE)?;
         }
 
-        let mut migration = legacy_exists
-            .then(|| Self::migrate_undecided_block_data(&tx))
-            .transpose()?
-            .unwrap_or_default();
-        Self::compact_undecided_proposals(&tx, &mut migration)?;
-        Self::backfill_legacy_undecided_block_data(&tx, &mut migration)?;
-        Self::recover_legacy_partial_commits(&tx, &mut migration)?;
+        let version = {
+            let metadata = tx.open_table(SCHEMA_METADATA_TABLE)?;
+            let version = metadata
+                .get(UNDECIDED_STORAGE_RECONCILIATION_KEY)?
+                .map(|value| value.value())
+                .unwrap_or_default();
+            version
+        };
+
+        let mut migration = UndecidedBlockDataMigrationStats::default();
+        if version < UNDECIDED_STORAGE_RECONCILIATION_VERSION {
+            stats.reconciliation_ran = true;
+            Self::reconcile_undecided_storage(&tx, &mut migration, &mut stats)?;
+            tx.open_table(SCHEMA_METADATA_TABLE)?.insert(
+                UNDECIDED_STORAGE_RECONCILIATION_KEY,
+                UNDECIDED_STORAGE_RECONCILIATION_VERSION,
+            )?;
+        } else {
+            Self::recover_missing_decided_payloads(&tx, &mut migration, &mut stats)?;
+        }
 
         tx.commit()?;
 
-        if legacy_exists
-            || migration.compatibility_rows > 0
-            || migration.recovered_decided_payloads > 0
-            || migration.compacted_proposals > 0
-            || migration.repaired_compact_decided_values > 0
-        {
+        if stats.reconciliation_ran {
             self.metrics.observe_write_time(start.elapsed());
             self.metrics.add_writes(
                 migration.inserted_payloads
@@ -1048,7 +1060,35 @@ impl Db {
             );
         }
 
+        Ok(stats)
+    }
+
+    fn reconcile_undecided_storage(
+        tx: &redb::WriteTransaction,
+        migration: &mut UndecidedBlockDataMigrationStats,
+        stats: &mut SchemaInitializationStats,
+    ) -> Result<(), StoreError> {
+        *migration = Self::migrate_undecided_block_data(tx)?;
+        stats.legacy_payload_rows_visited = migration.legacy_rows;
+        Self::reconcile_undecided_proposals(tx, migration, stats)?;
+        Self::backfill_legacy_undecided_block_data(tx, migration)?;
+        Self::recover_legacy_partial_commits(tx, migration)?;
         Ok(())
+    }
+
+    fn recover_missing_decided_payloads(
+        tx: &redb::WriteTransaction,
+        migration: &mut UndecidedBlockDataMigrationStats,
+        stats: &mut SchemaInitializationStats,
+    ) -> Result<(), StoreError> {
+        let values = tx.open_table(DECIDED_VALUES_TABLE)?;
+        for entry in values.iter()? {
+            entry?;
+            stats.targeted_decided_rows_visited += 1;
+            stats.expensive_decided_rows_validated += 1;
+        }
+        drop(values);
+        Self::recover_legacy_partial_commits(tx, migration)
     }
 
     fn recover_legacy_partial_commits(
@@ -1252,71 +1292,115 @@ impl Db {
         Ok(stats)
     }
 
-    fn compact_undecided_proposals(
+    fn reconcile_undecided_proposals(
         tx: &redb::WriteTransaction,
-        stats: &mut UndecidedBlockDataMigrationStats,
+        migration: &mut UndecidedBlockDataMigrationStats,
+        stats: &mut SchemaInitializationStats,
     ) -> Result<(), StoreError> {
-        let mut replacements = Vec::new();
+        let mut rows: BTreeMap<
+            (Height, Round, ValueId),
+            (Option<Vec<u8>>, Option<Vec<u8>>),
+        > = BTreeMap::new();
         {
-            let proposals = tx.open_table(UNDECIDED_PROPOSALS_TABLE)?;
-            let primary = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
-            let legacy = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
-
+            let proposals = tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)?;
             for entry in proposals.iter()? {
                 let (proposal_key, encoded) = entry?;
                 let key = proposal_key.value();
                 let encoded = encoded.value();
-                stats.proposal_rows += 1;
-                stats.proposal_source_bytes += encoded.len() as u64;
-
-                let decoded = decode_stored_proposal(Bytes::from(encoded)).map_err(|_| {
-                    Self::irrecoverable_undecided_proposal(
-                        key,
-                        "stored proposal metadata cannot be decoded",
-                    )
-                })?;
-                if decoded.metadata.height != key.0
-                    || decoded.metadata.round != key.1
-                    || decoded.metadata.value_id != key.2
-                {
-                    return Err(Self::irrecoverable_undecided_proposal(
-                        key,
-                        "stored proposal key does not match its metadata",
-                    ));
-                }
-                let needs_rewrite = decoded.embedded_payload.is_some();
-                let primary_payload = primary.get(&(key.0, key.2))?;
-                let legacy_payload = if primary_payload.is_none() {
-                    legacy.get(&key)?
-                } else {
-                    None
-                };
-                let payload = primary_payload
-                    .as_ref()
-                    .map(|value| value.value())
-                    .or_else(|| legacy_payload.as_ref().map(|value| value.value()))
-                    .ok_or_else(|| {
-                        Self::irrecoverable_undecided_proposal(key, "missing shared payload")
-                    })?;
-                let proposal = decoded
-                    .hydrate_verified(key, Bytes::from(payload))
-                    .map_err(|reason| Self::irrecoverable_undecided_proposal(key, reason))?;
-
-                if needs_rewrite {
-                    let compact = StoredProposalMetadata::from_proposal(&proposal).encode()?;
-                    replacements.push((key, compact));
-                }
+                stats.proposal_rows_visited += 1;
+                migration.proposal_rows += 1;
+                migration.proposal_source_bytes += encoded.len() as u64;
+                rows.entry(key).or_default().0 = Some(encoded);
+            }
+        }
+        {
+            let proposals = tx.open_table(UNDECIDED_PROPOSALS_TABLE)?;
+            for entry in proposals.iter()? {
+                let (proposal_key, encoded) = entry?;
+                let key = proposal_key.value();
+                let encoded = encoded.value();
+                stats.proposal_rows_visited += 1;
+                migration.proposal_rows += 1;
+                migration.proposal_source_bytes += encoded.len() as u64;
+                rows.entry(key).or_default().1 = Some(encoded);
             }
         }
 
-        if replacements.is_empty() {
-            return Ok(());
+        let primary = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
+        let legacy_payloads = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
+        let mut legacy_replacements = Vec::new();
+        let mut compact_replacements = Vec::new();
+
+        for (key, (legacy_encoded, compact_encoded)) in rows {
+            let primary_payload = primary.get(&(key.0, key.2))?;
+            let legacy_payload = if primary_payload.is_none() {
+                legacy_payloads.get(&key)?
+            } else {
+                None
+            };
+            let payload = primary_payload
+                .as_ref()
+                .map(|value| value.value())
+                .or_else(|| legacy_payload.as_ref().map(|value| value.value()))
+                .ok_or_else(|| {
+                    Self::irrecoverable_undecided_proposal(key, "missing shared payload")
+                })?;
+            let payload = Bytes::from(payload);
+
+            let decode = |encoded: &[u8]| {
+                decode_stored_proposal(Bytes::copy_from_slice(encoded))
+                    .map_err(|_| {
+                        Self::irrecoverable_undecided_proposal(
+                            key,
+                            "stored proposal metadata cannot be decoded",
+                        )
+                    })?
+                    .hydrate_verified(key, payload.clone())
+                    .map_err(|reason| Self::irrecoverable_undecided_proposal(key, reason))
+            };
+            let legacy_proposal = legacy_encoded.as_deref().map(decode).transpose()?;
+            let compact_proposal = compact_encoded.as_deref().map(decode).transpose()?;
+            let proposal = match (legacy_proposal, compact_proposal) {
+                (Some(legacy), Some(compact)) if legacy != compact => {
+                    return Err(Self::irrecoverable_undecided_proposal(
+                        key,
+                        "proposal representations disagree",
+                    ));
+                }
+                (Some(legacy), _) => legacy,
+                (_, Some(compact)) => compact,
+                (None, None) => unreachable!("proposal key must have at least one representation"),
+            };
+
+            let full = ProtobufCodec.encode(&proposal)?.to_vec();
+            let compact = StoredProposalMetadata::from_proposal(&proposal)
+                .encode()?
+                .to_vec();
+            if legacy_encoded.as_ref() != Some(&full) {
+                legacy_replacements.push((key, full));
+            }
+            if compact_encoded.as_ref() != Some(&compact) {
+                compact_replacements.push((key, compact));
+            }
         }
-        let mut proposals = tx.open_table(UNDECIDED_PROPOSALS_TABLE)?;
-        for (key, compact) in replacements {
-            stats.compacted_proposals += 1;
-            stats.proposal_compact_bytes += compact.len() as u64;
-            proposals.insert(key, compact.to_vec())?;
+        drop(primary);
+        drop(legacy_payloads);
+
+        if !legacy_replacements.is_empty() {
+            let mut proposals = tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)?;
+            for (key, full) in legacy_replacements {
+                migration.compacted_proposals += 1;
+                migration.proposal_compact_bytes += full.len() as u64;
+                proposals.insert(key, full)?;
+            }
+        }
+        if !compact_replacements.is_empty() {
+            let mut proposals = tx.open_table(UNDECIDED_PROPOSALS_TABLE)?;
+            for (key, compact) in compact_replacements {
+                migration.compacted_proposals += 1;
+                migration.proposal_compact_bytes += compact.len() as u64;
+                proposals.insert(key, compact)?;
+            }
         }
         Ok(())
     }
@@ -1947,17 +2031,10 @@ mod tests {
             .map(|value| Bytes::copy_from_slice(&value.value()))
     }
 
-    fn raw_undecided_proposal(db: &Db, key: (Height, Round, ValueId)) -> Vec<u8> {
-        let tx = db.db.begin_read().unwrap();
-        tx.open_table(UNDECIDED_PROPOSALS_TABLE)
-            .unwrap()
-            .get(&key)
-            .unwrap()
-            .unwrap()
-            .value()
-    }
-
     fn raw_legacy_proposal(db: &Db, key: (Height, Round, ValueId)) -> Option<Vec<u8>> {
+        if !has_table(db, LEGACY_UNDECIDED_PROPOSALS_TABLE.name()) {
+            return None;
+        }
         let tx = db.db.begin_read().unwrap();
         tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)
             .unwrap()
@@ -1967,6 +2044,9 @@ mod tests {
     }
 
     fn raw_compact_proposal(db: &Db, key: (Height, Round, ValueId)) -> Option<Vec<u8>> {
+        if !has_table(db, UNDECIDED_PROPOSALS_TABLE.name()) {
+            return None;
+        }
         let tx = db.db.begin_read().unwrap();
         tx.open_table(UNDECIDED_PROPOSALS_TABLE)
             .unwrap()
@@ -2007,6 +2087,78 @@ mod tests {
         tx.commit().unwrap();
     }
 
+    fn reconciliation_version(db: &Db) -> Option<u64> {
+        if !has_table(db, SCHEMA_METADATA_TABLE.name()) {
+            return None;
+        }
+        let tx = db.db.begin_read().unwrap();
+        tx.open_table(SCHEMA_METADATA_TABLE)
+            .unwrap()
+            .get(UNDECIDED_STORAGE_RECONCILIATION_KEY)
+            .unwrap()
+            .map(|version| version.value())
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RawStorageSnapshot {
+        legacy_proposal: Option<Vec<u8>>,
+        compact_proposal: Option<Vec<u8>>,
+        legacy_payload: Option<Vec<u8>>,
+        shared_payload: Option<Vec<u8>>,
+        decided_payload: Option<Vec<u8>>,
+        decided_value: Option<Vec<u8>>,
+        certificate: Option<Vec<u8>>,
+        header: Option<Vec<u8>>,
+        reconciliation_version: Option<u64>,
+    }
+
+    fn raw_height_row(
+        db: &Db,
+        table_definition: redb::TableDefinition<'static, HeightKey, Vec<u8>>,
+        height: Height,
+    ) -> Option<Vec<u8>> {
+        if !has_table(db, table_definition.name()) {
+            return None;
+        }
+        let tx = db.db.begin_read().unwrap();
+        tx.open_table(table_definition)
+            .unwrap()
+            .get(&height)
+            .unwrap()
+            .map(|value| value.value())
+    }
+
+    fn raw_storage_snapshot(db: &Db, key: (Height, Round, ValueId)) -> RawStorageSnapshot {
+        let legacy_payload = if has_table(db, LEGACY_UNDECIDED_BLOCK_DATA_TABLE.name()) {
+            get_legacy_undecided_block_data(db, key.0, key.1, key.2)
+                .map(|bytes| bytes.to_vec())
+        } else {
+            None
+        };
+        let shared_payload = if has_table(db, UNDECIDED_BLOCK_DATA_TABLE.name()) {
+            let tx = db.db.begin_read().unwrap();
+            tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)
+                .unwrap()
+                .get(&(key.0, key.2))
+                .unwrap()
+                .map(|value| value.value())
+        } else {
+            None
+        };
+
+        RawStorageSnapshot {
+            legacy_proposal: raw_legacy_proposal(db, key),
+            compact_proposal: raw_compact_proposal(db, key),
+            legacy_payload,
+            shared_payload,
+            decided_payload: raw_height_row(db, DECIDED_BLOCK_DATA_TABLE, key.0),
+            decided_value: raw_height_row(db, DECIDED_VALUES_TABLE, key.0),
+            certificate: raw_height_row(db, CERTIFICATES_TABLE, key.0),
+            header: raw_height_row(db, DECIDED_BLOCK_HEADERS_TABLE, key.0),
+            reconciliation_version: reconciliation_version(db),
+        }
+    }
+
     fn insert_raw_legacy_payload(db: &Db, key: (Height, Round, ValueId), payload: &Bytes) {
         let tx = db.db.begin_write().unwrap();
         tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)
@@ -2022,7 +2174,7 @@ mod tests {
         payload: &Bytes,
     ) {
         let key = (proposal.height, proposal.round, proposal.value.id());
-        insert_raw_proposal(db, key, ProtobufCodec.encode(proposal).unwrap().to_vec());
+        insert_raw_legacy_proposal(db, key, ProtobufCodec.encode(proposal).unwrap().to_vec());
         insert_raw_legacy_payload(db, key, payload);
     }
 
@@ -2332,11 +2484,15 @@ mod tests {
             get_legacy_undecided_block_data(&db, height, round, value.id()),
             Some(payload.clone())
         );
-        let compact_metadata = raw_undecided_proposal(&db, (height, round, value.id()));
-        assert_eq!(metrics.write_count(), 2);
+        let key = (height, round, value.id());
+        let compact_metadata = raw_compact_proposal(&db, key).unwrap();
+        let full_proposal = raw_legacy_proposal(&db, key).unwrap();
+        assert_eq!(metrics.write_count(), 3);
         assert_eq!(
             metrics.write_bytes(),
-            (payload.len() + compact_metadata.len()) as u64
+            (payload.len()
+                + compact_metadata.len()
+                + full_proposal.len()) as u64
         );
         drop(db);
 
@@ -2378,12 +2534,12 @@ mod tests {
     }
 
     #[test]
-    fn proposal_metadata_migration_compacts_legacy_full_rows_and_reopens() {
+    fn reconciliation_preserves_full_n_minus_one_rows_and_populates_compact_v2() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("proposal_metadata_migration.redb");
+        let path = dir.path().join("reconcile-full-v1.redb");
         let db = Db::new(&path, 1024 * 1024, DbMetrics::new()).unwrap();
         let payload = make_execution_payload_bytes(61);
-        let proposal = ProposedValue {
+        let proposal: ProposedValue<EmeraldContext> = ProposedValue {
             height: Height::new(61),
             round: Round::new(2),
             valid_round: Round::new(1),
@@ -2391,12 +2547,19 @@ mod tests {
             value: Value::new(payload.clone()),
             validity: Validity::Valid,
         };
+        let key = (proposal.height, proposal.round, proposal.value.id());
         insert_raw_legacy_full_proposal_and_payload(&db, &proposal, &payload);
+        let full = raw_legacy_proposal(&db, key).unwrap();
 
         db.initialize_schema().unwrap();
-        let raw =
-            raw_undecided_proposal(&db, (proposal.height, proposal.round, proposal.value.id()));
-        assert!(raw.len() < 128);
+        assert_eq!(raw_legacy_proposal(&db, key), Some(full));
+        let compact = raw_compact_proposal(&db, key).unwrap();
+        assert!(compact.len() < 128);
+        assert!(decode_stored_proposal(Bytes::from(compact))
+            .unwrap()
+            .embedded_payload
+            .is_none());
+        assert_eq!(reconciliation_version(&db), Some(1));
         assert_eq!(
             db.get_undecided_proposal(proposal.height, proposal.round, proposal.value.id())
                 .unwrap(),
@@ -2415,7 +2578,42 @@ mod tests {
     }
 
     #[test]
-    fn proposal_metadata_migration_rejects_corruption_without_mutation() {
+    fn reconciliation_restores_current_pr_compact_rows_to_full_v1() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reconcile-current-pr-compact.redb");
+        let db = Db::new(&path, 1024 * 1024, DbMetrics::new()).unwrap();
+        let payload = make_execution_payload_bytes(62);
+        let proposal: ProposedValue<EmeraldContext> = ProposedValue {
+            height: Height::new(62),
+            round: Round::new(3),
+            valid_round: Round::new(1),
+            proposer: Address::new([7; 20]),
+            value: Value::new(payload.clone()),
+            validity: Validity::Valid,
+        };
+        let key = (proposal.height, proposal.round, proposal.value.id());
+        let compact = StoredProposalMetadata::from_proposal(&proposal)
+            .encode()
+            .unwrap()
+            .to_vec();
+        insert_raw_legacy_proposal(&db, key, compact.clone());
+        insert_raw_proposal(&db, key, compact.clone());
+        insert_raw_legacy_payload(&db, key, &payload);
+
+        db.initialize_schema().unwrap();
+
+        let restored = raw_legacy_proposal(&db, key).unwrap();
+        let restored_proto = proto::ProposedValue::decode(restored.as_slice()).unwrap();
+        assert_eq!(
+            decode_value_like_n_minus_one(restored_proto.value.unwrap()).extensions,
+            payload
+        );
+        assert_eq!(raw_compact_proposal(&db, key), Some(compact));
+        assert_eq!(reconciliation_version(&db), Some(1));
+    }
+
+    #[test]
+    fn reconciliation_failure_leaves_marker_and_all_tables_unchanged() {
         let cases = [
             ("missing_payload", "missing shared payload"),
             (
@@ -2473,26 +2671,18 @@ mod tests {
                 _ => unreachable!(),
             }
 
-            insert_raw_proposal(&db, key, encoded.clone());
+            insert_raw_legacy_proposal(&db, key, encoded.clone());
             if let Some(stored_payload) = stored_payload.as_ref() {
                 insert_raw_legacy_payload(&db, key, stored_payload);
             }
+            let before = raw_storage_snapshot(&db, key);
 
             let error = db.initialize_schema().expect_err(case);
             assert!(
                 error.to_string().contains(expected),
                 "case {case}: unexpected error: {error}"
             );
-            assert_eq!(raw_undecided_proposal(&db, key), encoded);
-            if let Some(stored_payload) = stored_payload {
-                assert_eq!(
-                    get_legacy_undecided_block_data(&db, key.0, key.1, key.2),
-                    Some(stored_payload)
-                );
-            } else {
-                assert!(!has_table(&db, "undecided_block_data"));
-            }
-            assert!(!has_table(&db, "undecided_block_data_v2"));
+            assert_eq!(raw_storage_snapshot(&db, key), before, "case {case}");
         }
     }
 
@@ -2622,7 +2812,7 @@ mod tests {
         .unwrap();
 
         let tx = db.db.begin_write().unwrap();
-        tx.open_table(UNDECIDED_PROPOSALS_TABLE)
+        tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)
             .unwrap()
             .insert((height, round, value.id()), compact_proposal.to_vec())
             .unwrap();
@@ -2661,10 +2851,15 @@ mod tests {
                 certificate: certificate.clone(),
             })
         );
-        assert_eq!(metrics.write_count(), 1);
+        let key = (height, round, value.id());
+        let full_proposal = raw_legacy_proposal(&db, key).unwrap();
+        let compact_proposal = raw_compact_proposal(&db, key).unwrap();
+        assert_eq!(metrics.write_count(), 3);
         assert_eq!(
             metrics.write_bytes(),
-            value.to_bytes().unwrap().len() as u64
+            (value.to_bytes().unwrap().len()
+                + full_proposal.len()
+                + compact_proposal.len()) as u64
         );
         drop(db);
 
@@ -3198,8 +3393,11 @@ mod tests {
             };
             db.insert_undecided_proposal(proposal.clone()).unwrap();
 
-            let raw =
-                raw_undecided_proposal(&db, (proposal.height, proposal.round, proposal.value.id()));
+            let raw = raw_compact_proposal(
+                &db,
+                (proposal.height, proposal.round, proposal.value.id()),
+            )
+            .unwrap();
             assert!(raw.len() < 128);
             assert!(!raw
                 .windows(payload.len())
