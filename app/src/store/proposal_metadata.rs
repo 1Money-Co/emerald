@@ -200,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_proposal_metadata_decodes_legacy_full_records() {
+    fn proposal_metadata_decoder_distinguishes_compact_and_full_records() {
         let payload = Bytes::from_static(b"legacy-full-payload");
         let proposal = proposal(payload.clone());
         let encoded = ProtobufCodec.encode(&proposal).unwrap();

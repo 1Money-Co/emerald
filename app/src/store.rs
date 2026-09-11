@@ -141,8 +141,20 @@ const CERTIFICATES_TABLE: redb::TableDefinition<'_, HeightKey, Vec<u8>> =
 const DECIDED_VALUES_TABLE: redb::TableDefinition<'_, HeightKey, Vec<u8>> =
     redb::TableDefinition::new("decided_values");
 
-const UNDECIDED_PROPOSALS_TABLE: redb::TableDefinition<'_, UndecidedValueKey, Vec<u8>> =
+const LEGACY_UNDECIDED_PROPOSALS_TABLE: redb::TableDefinition<'_, UndecidedValueKey, Vec<u8>> =
     redb::TableDefinition::new("undecided_values");
+
+const UNDECIDED_PROPOSALS_TABLE: redb::TableDefinition<'_, UndecidedValueKey, Vec<u8>> =
+    redb::TableDefinition::new("undecided_values_v2");
+
+const SCHEMA_METADATA_TABLE: redb::TableDefinition<'_, &str, u64> =
+    redb::TableDefinition::new("storage_schema_metadata");
+
+#[allow(dead_code)]
+const UNDECIDED_STORAGE_RECONCILIATION_KEY: &str =
+    "undecided_storage_reconciliation_version";
+#[allow(dead_code)]
+const UNDECIDED_STORAGE_RECONCILIATION_VERSION: u64 = 1;
 
 const DECIDED_BLOCK_DATA_TABLE: redb::TableDefinition<'_, HeightKey, Vec<u8>> =
     redb::TableDefinition::new("decided_block_data");
@@ -846,6 +858,7 @@ impl Db {
         {
             let _ = tx.open_table(DECIDED_VALUES_TABLE)?;
             let _ = tx.open_table(CERTIFICATES_TABLE)?;
+            let _ = tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)?;
             let _ = tx.open_table(UNDECIDED_PROPOSALS_TABLE)?;
             let _ = tx.open_table(DECIDED_BLOCK_DATA_TABLE)?;
             let _ = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
@@ -853,6 +866,7 @@ impl Db {
             let _ = tx.open_table(DECIDED_BLOCK_HEADERS_TABLE)?;
             let _ = tx.open_table(PERSISTENT_METRICS_TABLE)?;
             let _ = tx.open_table(PENDING_PROPOSAL_PARTS_TABLE)?;
+            let _ = tx.open_table(SCHEMA_METADATA_TABLE)?;
         }
 
         let mut migration = legacy_exists
@@ -1813,6 +1827,36 @@ mod tests {
             .unwrap()
             .unwrap()
             .value()
+    }
+
+    #[allow(dead_code)]
+    fn raw_legacy_proposal(db: &Db, key: (Height, Round, ValueId)) -> Option<Vec<u8>> {
+        let tx = db.db.begin_read().unwrap();
+        tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .map(|value| value.value())
+    }
+
+    #[allow(dead_code)]
+    fn raw_compact_proposal(db: &Db, key: (Height, Round, ValueId)) -> Option<Vec<u8>> {
+        let tx = db.db.begin_read().unwrap();
+        tx.open_table(UNDECIDED_PROPOSALS_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .map(|value| value.value())
+    }
+
+    #[test]
+    fn schema_creates_separate_legacy_compact_and_metadata_tables() {
+        let (db, _dir, _metrics) =
+            create_test_db_with_metrics("versioned-proposal-schema");
+
+        assert!(has_table(&db, "undecided_values"));
+        assert!(has_table(&db, "undecided_values_v2"));
+        assert!(has_table(&db, "storage_schema_metadata"));
     }
 
     fn insert_raw_proposal(db: &Db, key: (Height, Round, ValueId), encoded: Vec<u8>) {

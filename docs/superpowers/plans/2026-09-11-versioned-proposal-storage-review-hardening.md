@@ -48,7 +48,7 @@ Bash testnet tooling, GitHub CLI.
   `UNDECIDED_STORAGE_RECONCILIATION_VERSION`.
 - Preserves `StoredProposalMetadata::{from_proposal,encode,hydrate}` and `decode_stored_proposal`.
 
-- [ ] **Step 1: Add failing schema-name and encoding tests**
+- [x] **Step 1: Add failing schema-name and encoding tests**
 
 Add raw-table helpers and this test in `app/src/store.rs`:
 
@@ -86,7 +86,7 @@ Keep the existing codec tests in `proposal_metadata.rs`; rename
 `proposal_metadata_decoder_distinguishes_compact_and_full_records` and assert the full record retains
 `embedded_payload == Some(payload)`.
 
-- [ ] **Step 2: Run the schema tests and verify red**
+- [x] **Step 2: Run the schema tests and verify red**
 
 Run:
 
@@ -98,7 +98,7 @@ cargo test -p emerald proposal_metadata_decoder_distinguishes_compact_and_full_r
 Expected: the schema test fails because `undecided_values_v2` and `storage_schema_metadata` do not exist. The codec
 test passes and pins both record forms before table routing changes.
 
-- [ ] **Step 3: Define the versioned table constants**
+- [x] **Step 3: Define the versioned table constants**
 
 Replace the current proposal table constant and add the schema metadata constants in `app/src/store.rs`:
 
@@ -120,7 +120,7 @@ const UNDECIDED_STORAGE_RECONCILIATION_VERSION: u64 = 1;
 
 Open all three tables in `Db::initialize_schema`. Do not move existing data yet; Task 3 owns reconciliation.
 
-- [ ] **Step 4: Run the schema and codec tests**
+- [x] **Step 4: Run the schema and codec tests**
 
 Run:
 
@@ -131,7 +131,7 @@ cargo test -p emerald store::proposal_metadata::tests -- --nocapture
 
 Expected: the schema test and all proposal metadata codec tests pass.
 
-- [ ] **Step 5: Commit the schema boundary**
+- [x] **Step 5: Commit the schema boundary**
 
 ```bash
 git add app/src/store.rs app/src/store/proposal_metadata.rs
