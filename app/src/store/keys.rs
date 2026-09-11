@@ -4,6 +4,7 @@ use malachitebft_app_channel::app::types::core::Round;
 use malachitebft_eth_types::{Height, ValueId};
 
 pub type UndecidedValueKey = (HeightKey, RoundKey, ValueIdKey);
+pub type UndecidedBlockDataKey = (HeightKey, ValueIdKey);
 pub type PendingValueKey = (HeightKey, RoundKey, ValueIdKey);
 
 #[derive(Copy, Clone, Debug)]

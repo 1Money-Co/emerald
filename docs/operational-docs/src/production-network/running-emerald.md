@@ -114,6 +114,62 @@ An example Malachite BFT config file is provided:
 The `--config` flag should contain the explicit file path to the Emerald config:
 - Example: `--config=/home/emerald/.emerald/config/emerald.toml`
 
+## Undecided Payload Storage Upgrade
+
+The first startup with the round-independent schema reconciles four local redb tables. The active layout uses
+`undecided_values_v2` for payload-free proposal metadata and `undecided_block_data_v2` for one payload per
+`(height, value_id)`. During this compatibility release, `undecided_values` remains a full, round-keyed
+`ProposedValue` table for N-1 and `undecided_block_data` remains its exact-round payload shadow. Runtime writes both
+proposal tables and both payload tables. Current Emerald reads compact v2 metadata first, then verifies and hydrates
+it from shared payload storage; a full v1 and exact-round payload fallback consumes state written during rollback.
+
+Before upgrading each node:
+
+1. Stop Emerald cleanly.
+2. Back up `<home>/store.db`.
+3. Reserve temporary free space for approximately one deduplicated undecided payload set plus redb overhead.
+4. Start the new binary and wait for the `undecided_block_data_migration` event with reconciliation version `1`
+   before upgrading another validator.
+
+Reconciliation copies every unique payload into v2, validates duplicate bytes, preserves or restores full v1
+proposal rows, and populates compact v2 proposal rows in one transaction. Only after every phase succeeds does it
+write schema version `1`. That copy requires headroom even when many legacy rows are duplicates. Later version-1
+starts skip legacy payload and proposal scans. They first check each decided key for its payload and perform the
+certificate, ID, byte, SSZ, and header validation only when that payload is missing.
+
+Both full proposal and exact-round payload shadows are deliberate compatibility duplicates. Replaced redb pages can
+be reused, but neither reconciliation nor later logical deletion guarantees that `store.db` shrinks. Space is still
+required for both active and compatibility layouts during this release.
+
+[Interop issue #325](https://github.com/1Money-Co/1money-interoperability-protocol/issues/325) owns the later activated
+release that removes both shadows and the operator procedure for explicit offline redb compaction when
+filesystem-space reclamation is required. This release does not delete either shadow or run automatic compaction
+during startup.
+
+The same startup transaction repairs the N-1 crash window where decided value, certificate, and header rows committed
+but their payload remained only in undecided storage. Emerald promotes the certificate-bound payload only after its
+value ID, stored value bytes, SSZ encoding, and stored header all agree. Missing or conflicting data aborts startup
+without changing the database. It also repairs an ID-only decided value left by an earlier unsafe PR revision, using
+the same certificate, payload, SSZ, and header checks. Full v1 proposals prevent N-1 from creating another ID-only
+decided value. New current-binary commits persist the payload and all three metadata rows in one transaction.
+
+If legacy rows use the same `(height, value_id)` with different bytes, startup fails without changing the legacy
+table. The error and structured log identify the incoming legacy round, the existing round when it came from legacy
+data, and both payload lengths without logging payload bytes.
+Emerald has no safe automated repair for this corrupted state: preserve the database and logs for diagnosis, or
+restore the backup and continue with the previous binary. Do not delete either row without determining the
+authoritative payload.
+
+During this compatibility release, a node may return to N-1 using the same `store.db`: stop N completely before
+starting N-1, and never let two Emerald processes open the database concurrently. N reads v2 first but atomically
+dual-writes and prunes both N-1 tables. Keep the pre-upgrade backup despite this compatibility path; separately
+persisted Malachite WAL and Reth state still make arbitrary partial filesystem restoration unsafe.
+
+The deterministic test suite pins the N-proposal/N-1-commit database and wire contract. The opt-in
+`scripts/tests/rollback_binary_qualification.sh` runner exercises real process and binary transitions when explicit
+current Emerald, N-1 Emerald, and custom Reth binaries are supplied. Passing deterministic tests does not imply that
+the mixed-binary release qualification was run or passed.
+
 ## Monitoring
 
 Emerald exposes Prometheus metrics on port `30000` (configurable in `config.toml`):

@@ -33,7 +33,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::metrics::Metrics;
 use crate::payload::{extract_block_header, validate_execution_payload, ValidatedPayloadCache};
-use crate::store::Store;
+use crate::store::{Store, StoreError};
 use crate::streaming::{PartStreamsMap, ProposalParts};
 
 pub struct StateMetrics {
@@ -173,16 +173,16 @@ fn seed_from_address(address: &Address) -> u64 {
     })
 }
 
-fn build_execution_block_from_bytes(raw_block_data: Bytes) -> ExecutionBlock {
+fn build_execution_block_from_bytes(raw_block_data: Bytes) -> eyre::Result<ExecutionBlock> {
     let execution_payload: ExecutionPayloadV3 = ExecutionPayloadV3::from_ssz_bytes(&raw_block_data)
-        .expect("failed to convert block bytes into executon payload");
-    ExecutionBlock {
+        .map_err(|error| eyre::eyre!("Failed to decode stored execution payload: {error:?}"))?;
+    Ok(ExecutionBlock {
         block_hash: execution_payload.payload_inner.payload_inner.block_hash,
         block_number: execution_payload.payload_inner.payload_inner.block_number,
         parent_hash: execution_payload.payload_inner.payload_inner.parent_hash,
         timestamp: execution_payload.payload_inner.payload_inner.timestamp,
         prev_randao: execution_payload.payload_inner.payload_inner.prev_randao,
-    }
+    })
 }
 
 impl State {
@@ -263,21 +263,32 @@ impl State {
         &mut self.validated_payload_cache
     }
 
-    pub async fn get_latest_block_candidate(&self, height: Height) -> Option<ExecutionBlock> {
-        let decided_value = self.store.get_decided_value(height).await.ok().flatten()?;
+    pub async fn get_latest_block_candidate(
+        &self,
+        height: Height,
+    ) -> eyre::Result<Option<ExecutionBlock>> {
+        let Some(decided_value) = self.store.get_decided_value(height).await? else {
+            return Ok(None);
+        };
 
         let certificate = decided_value.certificate;
 
         let raw_block_data = self
-            .get_block_data(certificate.height, certificate.round, certificate.value_id)
-            .await
-            .expect("state: certificate should have associated block data");
+            .store
+            .get_decided_block_data(certificate.height)
+            .await?
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "Decided value at height {} is missing its execution payload",
+                    certificate.height
+                )
+            })?;
         debug!(
             "🎁 block size: {:?}, height: {}",
             raw_block_data.iter().len(),
             height
         );
-        Some(build_execution_block_from_bytes(raw_block_data))
+        Ok(Some(build_execution_block_from_bytes(raw_block_data)?))
     }
 
     /// Returns the earliest height with a certificate in the store.
@@ -448,7 +459,9 @@ impl State {
 
         // Store as undecided
         info!(%value.height, %value.round, %value.proposer, "Storing validated proposal as undecided");
-        self.store_undecided_value(&value, data).await?;
+        if !self.store_peer_undecided_value(&value, data).await? {
+            return Ok(None);
+        }
 
         Ok(Some(value))
     }
@@ -499,18 +512,16 @@ impl State {
         Ok(Some(parts))
     }
 
-    /// Retrieves a decided block data at the given height
-    pub async fn get_block_data(
+    /// Retrieves undecided block data at the given height and value ID.
+    pub async fn get_undecided_block_data(
         &self,
         height: Height,
         round: Round,
         value_id: ValueId,
-    ) -> Option<Bytes> {
+    ) -> Result<Option<Bytes>, StoreError> {
         self.store
-            .get_block_data(height, round, value_id)
+            .get_undecided_block_data(height, round, value_id)
             .await
-            .ok()
-            .flatten()
     }
 
     /// Stores an undecided proposal along with its block data.
@@ -530,6 +541,33 @@ impl State {
             .await?;
         self.store.store_undecided_proposal(value.clone()).await?;
         Ok(())
+    }
+
+    /// Stores a value received from a peer, rejecting a conflicting payload without
+    /// converting untrusted input into a fatal application error.
+    pub(crate) async fn store_peer_undecided_value(
+        &self,
+        value: &ProposedValue<EmeraldContext>,
+        data: Bytes,
+    ) -> eyre::Result<bool> {
+        match self.store_undecided_value(value, data).await {
+            Ok(()) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<StoreError>(),
+                    Some(StoreError::ConflictingUndecidedBlockData { .. })
+                ) =>
+            {
+                warn!(
+                    height = %value.height,
+                    round = %value.round,
+                    value = %value.value.id(),
+                    "Rejecting peer value with conflicting block data"
+                );
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Commits a value with the given certificate, updating internal state
@@ -566,30 +604,30 @@ impl State {
         // Get block data for decided value
         let block_data = self
             .store
-            .get_block_data(certificate.height, certificate.round, certificate.value_id)
-            .await?;
+            .get_undecided_block_data(certificate.height, certificate.round, certificate.value_id)
+            .await?
+            .ok_or_else(|| eyre::eyre!("state: certificate should have associated block data"))?;
 
         // Log first 32 bytes of block data with JNT prefix
-        if let Some(data) = &block_data {
-            if data.len() >= 32 {
-                info!("Committed block_data[0..32]: {}", hex::encode(&data[..32]));
-            }
+        if block_data.len() >= 32 {
+            info!(
+                "Committed block_data[0..32]: {}",
+                hex::encode(&block_data[..32])
+            );
         }
 
-        if let Some(data) = block_data {
-            // Store decided value and the block header
-            let execution_payload = ExecutionPayloadV3::from_ssz_bytes(&data).unwrap();
-            let block_header = extract_block_header(&execution_payload);
-            let block_header_bytes = Bytes::from(block_header.as_ssz_bytes());
-            self.store
-                .store_decided_value(&certificate, proposal.value, block_header_bytes)
-                .await?;
+        let execution_payload =
+            ExecutionPayloadV3::from_ssz_bytes(&block_data).map_err(|error| {
+                eyre::eyre!("Failed to decode decided execution payload: {error:?}")
+            })?;
+        let block_header = extract_block_header(&execution_payload);
+        let block_header_bytes = Bytes::from(block_header.as_ssz_bytes());
 
-            // Store decided block data
-            self.store
-                .store_decided_block_data(certificate.height, data)
-                .await?;
-        }
+        // Publish the payload, value, certificate, and header atomically so restart never observes
+        // a certificate whose execution payload is missing.
+        self.store
+            .store_decided_state(&certificate, proposal.value, block_header_bytes, block_data)
+            .await?;
 
         let prune_certificates = self.emerald_config.num_certificates_to_retain != u64::MAX
             && certificate.height.as_u64() % self.emerald_config.prune_at_block_interval == 0;
@@ -672,7 +710,7 @@ impl State {
 
         let bytes = self
             .store
-            .get_block_data(height, proposal_round, value_id)
+            .get_undecided_block_data(height, proposal_round, value_id)
             .await?
             .ok_or_else(|| {
                 eyre::eyre!(
@@ -941,13 +979,14 @@ pub fn decode_value(bytes: Bytes) -> Result<Value, ProtoError> {
 
 #[cfg(test)]
 mod tests {
+    use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2};
     use malachitebft_app_channel::{AppMsg, Channels, NetworkMsg};
     use malachitebft_eth_types::secp256k1::PrivateKey;
     use malachitebft_eth_types::Validator;
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::app::on_restream_proposal;
+    use crate::app::{on_process_synced_value, on_restream_proposal};
     use crate::metrics::{DbMetrics, Metrics};
 
     async fn make_test_state() -> (State, tempfile::TempDir) {
@@ -995,6 +1034,33 @@ jwt_token_path = "./assets/jwt.hex"
         );
 
         (state, dir)
+    }
+
+    fn make_execution_payload_bytes() -> Bytes {
+        let payload = ExecutionPayloadV3 {
+            payload_inner: ExecutionPayloadV2 {
+                payload_inner: ExecutionPayloadV1 {
+                    parent_hash: Default::default(),
+                    fee_recipient: Default::default(),
+                    state_root: Default::default(),
+                    receipts_root: Default::default(),
+                    logs_bloom: Default::default(),
+                    prev_randao: Default::default(),
+                    block_number: 1,
+                    gas_limit: 30_000_000,
+                    gas_used: 0,
+                    timestamp: 1,
+                    extra_data: Default::default(),
+                    base_fee_per_gas: Default::default(),
+                    block_hash: Default::default(),
+                    transactions: Vec::new(),
+                },
+                withdrawals: Vec::new(),
+            },
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+        };
+        Bytes::from(payload.as_ssz_bytes())
     }
 
     fn make_test_channels() -> (
@@ -1084,11 +1150,29 @@ jwt_token_path = "./assets/jwt.hex"
 
         let current_round_bytes = state
             .store
-            .get_block_data(height, current_round, value.id())
+            .get_undecided_block_data(height, current_round, value.id())
             .await
             .unwrap()
             .expect("restreamed block data must be stored at the current round");
         assert_eq!(current_round_bytes, bytes);
+
+        let round_two = Round::new(2);
+        let (round_two_value, round_two_bytes) = state
+            .prepare_restream_proposal(height, proposal_round, round_two, value.id())
+            .await
+            .unwrap()
+            .expect("round-two restream must reuse the stored value");
+        assert_eq!(round_two_value.round, round_two);
+        assert_eq!(round_two_bytes, bytes);
+        for round in [proposal_round, current_round, round_two] {
+            assert!(state
+                .store
+                .get_undecided_proposal(height, round, value.id())
+                .await
+                .unwrap()
+                .is_some());
+        }
+        assert_eq!(state.store.undecided_block_data_len().await.unwrap(), 1);
 
         drop(channels);
         let init = proposal_init.await.unwrap();
@@ -1097,6 +1181,463 @@ jwt_token_path = "./assets/jwt.hex"
         assert_eq!(init.round, current_round);
         assert_eq!(init.pol_round, proposal_round);
         assert_eq!(init.proposer, state.address);
+    }
+
+    #[tokio::test]
+    async fn shared_undecided_block_data_commits_from_later_round() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let source_round = Round::new(0);
+        let decided_round = Round::new(2);
+        let bytes = make_execution_payload_bytes();
+        let value = Value::new(bytes.clone());
+        let proposal = ProposedValue {
+            height,
+            round: source_round,
+            valid_round: Round::Nil,
+            proposer: state.address,
+            value: value.clone(),
+            validity: Validity::Valid,
+        };
+        state
+            .store_undecided_value(&proposal, bytes.clone())
+            .await
+            .unwrap();
+        state
+            .prepare_restream_proposal(height, source_round, decided_round, value.id())
+            .await
+            .unwrap()
+            .unwrap();
+
+        state
+            .commit(CommitCertificate {
+                height,
+                round: decided_round,
+                value_id: value.id(),
+                commit_signatures: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state.store.get_decided_block_data(height).await.unwrap(),
+            Some(bytes)
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_errors_when_undecided_block_data_is_missing() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(0);
+        let value = Value::new(make_execution_payload_bytes());
+        let proposal = ProposedValue {
+            height,
+            round,
+            valid_round: Round::Nil,
+            proposer: state.address,
+            value: value.clone(),
+            validity: Validity::Valid,
+        };
+        state
+            .store
+            .store_undecided_proposal(proposal)
+            .await
+            .unwrap();
+
+        let error = state
+            .commit(CommitCertificate {
+                height,
+                round,
+                value_id: value.id(),
+                commit_signatures: Vec::new(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("missing shared payload"),
+            "unexpected error: {error:#}"
+        );
+        assert!(state
+            .store
+            .get_decided_value(height)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn commit_does_not_publish_decided_value_when_decided_payload_conflicts() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(0);
+        let bytes = make_execution_payload_bytes();
+        let value = Value::new(bytes.clone());
+        let proposal = ProposedValue {
+            height,
+            round,
+            valid_round: Round::Nil,
+            proposer: state.address,
+            value: value.clone(),
+            validity: Validity::Valid,
+        };
+        state.store_undecided_value(&proposal, bytes).await.unwrap();
+        state
+            .store
+            .store_legacy_decided_block_data(
+                height,
+                Bytes::from_static(b"conflicting-decided-payload"),
+            )
+            .await
+            .unwrap();
+
+        let error = state
+            .commit(CommitCertificate {
+                height,
+                round,
+                value_id: value.id(),
+                commit_signatures: Vec::new(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("Conflicting decided block data"),
+            "unexpected error: {error:#}"
+        );
+        assert!(state
+            .store
+            .get_decided_value(height)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn commit_retries_after_decided_payload_was_already_persisted() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(0);
+        let bytes = make_execution_payload_bytes();
+        let value = Value::new(bytes.clone());
+        let proposal = ProposedValue {
+            height,
+            round,
+            valid_round: Round::Nil,
+            proposer: state.address,
+            value: value.clone(),
+            validity: Validity::Valid,
+        };
+        state
+            .store_undecided_value(&proposal, bytes.clone())
+            .await
+            .unwrap();
+        state
+            .store
+            .store_legacy_decided_block_data(height, bytes.clone())
+            .await
+            .unwrap();
+
+        let certificate = CommitCertificate {
+            height,
+            round,
+            value_id: value.id(),
+            commit_signatures: Vec::new(),
+        };
+        state.commit(certificate.clone()).await.unwrap();
+
+        assert_eq!(
+            state.store.get_decided_block_data(height).await.unwrap(),
+            Some(bytes)
+        );
+        let decided = state
+            .store
+            .get_decided_value(height)
+            .await
+            .unwrap()
+            .expect("retry must publish the decided value");
+        assert_eq!(decided.certificate, certificate);
+        assert_eq!(decided.value, value);
+    }
+
+    #[tokio::test]
+    async fn latest_block_candidate_missing_payload_returns_error_without_panicking() {
+        let (state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let value = Value::new(make_execution_payload_bytes());
+        state
+            .store
+            .store_legacy_decided_metadata(
+                &CommitCertificate {
+                    height,
+                    round: Round::new(0),
+                    value_id: value.id(),
+                    commit_signatures: Vec::new(),
+                },
+                value,
+                Bytes::from_static(b"header"),
+            )
+            .await
+            .unwrap();
+
+        let result = tokio::spawn(async move { state.get_latest_block_candidate(height).await })
+            .await
+            .expect("missing decided payload must not panic");
+
+        let error = result.expect_err("missing decided payload must return an error");
+        assert!(
+            error.to_string().contains("missing its execution payload"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_block_candidate_malformed_payload_returns_error_without_panicking() {
+        let (state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let value = Value::new(make_execution_payload_bytes());
+        state
+            .store
+            .store_legacy_decided_metadata(
+                &CommitCertificate {
+                    height,
+                    round: Round::new(0),
+                    value_id: value.id(),
+                    commit_signatures: Vec::new(),
+                },
+                value,
+                Bytes::from_static(b"header"),
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .store_legacy_decided_block_data(height, Bytes::from_static(b"not-an-ssz-payload"))
+            .await
+            .unwrap();
+
+        let result = tokio::spawn(async move { state.get_latest_block_candidate(height).await })
+            .await
+            .expect("malformed decided payload must not panic");
+
+        let error = result.expect_err("malformed decided payload must return an error");
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to decode stored execution payload"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_undecided_block_data_reports_absence_without_error() {
+        let (state, _dir) = make_test_state().await;
+
+        assert!(matches!(
+            state
+                .get_undecided_block_data(Height::new(1426), Round::new(0), ValueId::new(7),)
+                .await,
+            Ok(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn shared_undecided_block_data_stores_synced_value() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(3);
+        let bytes = make_execution_payload_bytes();
+        let value = Value::new(bytes.clone());
+        let value_bytes = ProtobufCodec.encode(&value).unwrap();
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+
+        on_process_synced_value(
+            AppMsg::ProcessSyncedValue {
+                height,
+                round,
+                proposer: state.address,
+                value_bytes,
+                reply,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(receiver.await.unwrap().unwrap().value, value);
+        assert_eq!(
+            state
+                .store
+                .get_undecided_block_data(height, round, value.id())
+                .await
+                .unwrap(),
+            Some(bytes)
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_value_conflict_is_rejected_without_fatal_error() {
+        let (state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let original_bytes = make_execution_payload_bytes();
+        let original_value = Value::new(original_bytes.clone());
+        let original_proposal = ProposedValue {
+            height,
+            round: Round::new(0),
+            valid_round: Round::Nil,
+            proposer: state.address,
+            value: original_value.clone(),
+            validity: Validity::Valid,
+        };
+        state
+            .store_undecided_value(&original_proposal, original_bytes.clone())
+            .await
+            .unwrap();
+
+        let conflicting_value = Value {
+            value: original_value.value,
+            extensions: Bytes::from_static(b"conflicting-peer-payload"),
+        };
+        let conflicting_proposal = ProposedValue {
+            height,
+            round: Round::new(3),
+            valid_round: Round::Nil,
+            proposer: state.address,
+            value: conflicting_value,
+            validity: Validity::Valid,
+        };
+
+        let stored = state
+            .store_peer_undecided_value(
+                &conflicting_proposal,
+                Bytes::from_static(b"conflicting-peer-payload"),
+            )
+            .await
+            .unwrap();
+
+        assert!(!stored);
+        assert_eq!(
+            state
+                .store
+                .get_undecided_block_data(height, original_proposal.round, original_value.id())
+                .await
+                .unwrap(),
+            Some(original_bytes)
+        );
+    }
+
+    #[tokio::test]
+    async fn synced_value_with_malformed_execution_payload_is_rejected() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(3);
+        let malformed = Value::new(Bytes::from_static(b"not-an-ssz-execution-payload"));
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+
+        on_process_synced_value(
+            AppMsg::ProcessSyncedValue {
+                height,
+                round,
+                proposer: state.address,
+                value_bytes: ProtobufCodec.encode(&malformed).unwrap(),
+                reply,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        let rejected = receiver
+            .await
+            .unwrap()
+            .expect("decoded invalid value must be forwarded to consensus");
+        assert_eq!(rejected.value, malformed);
+        assert_eq!(rejected.validity, Validity::Invalid);
+        assert!(state
+            .store
+            .get_undecided_block_data(height, round, malformed.id())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn synced_value_with_mismatched_wire_id_is_rejected_during_decoding() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(3);
+        let payload = make_execution_payload_bytes();
+        let unrelated = Value::new(Bytes::from_static(b"different-payload"));
+        let forged = Value {
+            value: unrelated.value,
+            extensions: payload,
+        };
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+
+        on_process_synced_value(
+            AppMsg::ProcessSyncedValue {
+                height,
+                round,
+                proposer: state.address,
+                value_bytes: ProtobufCodec.encode(&forged).unwrap(),
+                reply,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        assert!(receiver.await.unwrap().is_none());
+        assert!(state
+            .store
+            .get_undecided_block_data(height, round, forged.id())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn synced_value_with_conflicting_stored_payload_is_rejected() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(3);
+        let payload = make_execution_payload_bytes();
+        let value = Value::new(payload.clone());
+        let existing = Bytes::from_static(b"conflicting-stored-payload");
+        state
+            .store
+            .store_undecided_block_data(height, round, value.id(), existing.clone())
+            .await
+            .unwrap();
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+
+        let error = on_process_synced_value(
+            AppMsg::ProcessSyncedValue {
+                height,
+                round,
+                proposer: state.address,
+                value_bytes: ProtobufCodec.encode(&value).unwrap(),
+                reply,
+            },
+            &mut state,
+        )
+        .await
+        .expect_err("a conflicting local payload must stop sync processing");
+
+        assert!(matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::ConflictingUndecidedBlockData { .. })
+        ));
+        assert!(receiver.await.is_err());
+        assert_eq!(
+            state
+                .store
+                .get_undecided_block_data(height, round, value.id())
+                .await
+                .unwrap(),
+            Some(existing)
+        );
     }
 
     #[tokio::test]
@@ -1144,9 +1685,7 @@ jwt_token_path = "./assets/jwt.hex"
             Ok(_) => panic!("missing block data must be an error"),
         };
 
-        assert!(error
-            .to_string()
-            .contains("Block data not found for restream proposal"));
+        assert!(error.to_string().contains("missing shared payload"));
         assert!(error.to_string().contains("1426"));
     }
 

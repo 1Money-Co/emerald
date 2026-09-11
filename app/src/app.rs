@@ -12,7 +12,7 @@ use malachitebft_app_channel::{AppMsg, Channels, NetworkMsg};
 use malachitebft_eth_cli::config::EmeraldConfig;
 use malachitebft_eth_engine::engine::Engine;
 use malachitebft_eth_engine::json_structures::ExecutionBlock;
-use malachitebft_eth_types::EmeraldContext;
+use malachitebft_eth_types::{EmeraldContext, Value};
 use ssz::{Decode, Encode};
 use tokio::time::Instant as TokioInstant;
 use tracing::{debug, error, info, warn};
@@ -47,7 +47,7 @@ pub async fn on_consensus_ready(
     engine.check_capabilities().await?;
 
     // Get latest decided height from local store
-    let latest_height_from_store = state.store.max_decided_value_height().await;
+    let latest_height_from_store = state.store.max_decided_value_height().await?;
     match latest_height_from_store {
         Some(h) => {
             initialize_state_from_existing_block(state, engine, h, emerald_config).await?;
@@ -222,7 +222,7 @@ pub async fn on_get_value(
             // Fetch the block data for the previously built value
             let bytes = state
                 .store
-                .get_block_data(height, round, proposal.value.id())
+                .get_undecided_block_data(height, round, proposal.value.id())
                 .await?
                 .ok_or_else(|| eyre!("Block data not found for previously built value"))?;
             (proposal, bytes)
@@ -588,15 +588,18 @@ async fn on_decided_inner(
     // that were completely received by the local node
     timings.enter_awaited(AwaitedStage::BlockDataRead);
     let started = Instant::now();
-    let block_bytes = state.get_block_data(height, round, value_id).await;
+    let block_bytes = state
+        .get_undecided_block_data(height, round, value_id)
+        .await;
     timings.observe(AwaitedStage::BlockDataRead, started.elapsed(), metrics);
     let block_bytes =
-        block_bytes.ok_or_eyre("app: certificate should have associated block data")?;
+        block_bytes?.ok_or_eyre("app: certificate should have associated block data")?;
     timings.enter_preparation();
     debug!("🎁 block size: {:?}, height: {}", block_bytes.len(), height);
 
     // Decode bytes into execution payload (a block) and get relevant fields
-    let execution_payload = ExecutionPayloadV3::from_ssz_bytes(&block_bytes).unwrap();
+    let execution_payload = ExecutionPayloadV3::from_ssz_bytes(&block_bytes)
+        .map_err(|error| eyre!("Failed to decode decided execution payload: {error:?}"))?;
     let block_hash = execution_payload.payload_inner.payload_inner.block_hash;
     let block_timestamp = execution_payload.timestamp();
     let block_number = execution_payload.payload_inner.payload_inner.block_number;
@@ -764,8 +767,7 @@ pub async fn on_process_synced_value(
     };
 
     let block_bytes = value.extensions.clone();
-
-    let proposed_value: ProposedValue<EmeraldContext> = ProposedValue {
+    let mut proposed_value: ProposedValue<EmeraldContext> = ProposedValue {
         height,
         round,
         valid_round: Round::Nil,
@@ -774,7 +776,37 @@ pub async fn on_process_synced_value(
         validity: Validity::Valid, // already validated by 2/3+ of the validator set
     };
 
+    if let Err(error) = ExecutionPayloadV3::from_ssz_bytes(&block_bytes) {
+        warn!(%height, %round, error = ?error, "Rejecting synced value with malformed execution payload");
+        proposed_value.validity = Validity::Invalid;
+        if reply.send(Some(proposed_value)).is_err() {
+            error!(%height, %round, "Failed to send invalid ProcessSyncedValue reply");
+        }
+        return Ok(());
+    }
+
+    // Defense in depth: `Value::from_proto` already binds the ID to `extensions`. Keep this check at
+    // the application boundary because a mismatch entering Malachite can poison its first-write-wins
+    // proposal keeper and later panic when the certified payload is decided.
+    let derived_value_id = Value::new(block_bytes.clone()).id();
+    if derived_value_id != proposed_value.value.id() {
+        warn!(
+            %height,
+            %round,
+            certified_value = %proposed_value.value.id(),
+            derived_value = %derived_value_id,
+            "Rejecting synced value whose ID does not match its execution payload"
+        );
+        proposed_value.validity = Validity::Invalid;
+        if reply.send(Some(proposed_value)).is_err() {
+            error!(%height, %round, "Failed to send invalid ProcessSyncedValue reply");
+        }
+        return Ok(());
+    }
+
     // Store block data so on_decided() can retrieve it when the Decided message arrives.
+    // A conflict here is local durable-state corruption: retrying another peer cannot repair it,
+    // so propagate the error instead of repeatedly rejecting and penalizing healthy peers.
     state
         .store_undecided_value(&proposed_value, block_bytes)
         .await?;
