@@ -2842,7 +2842,7 @@ mod tests {
     }
 
     #[test]
-    fn proposal_read_falls_back_to_full_v1_written_after_reconciliation() {
+    fn rollback_full_v1_proposal_written_after_marker_is_readable_on_reupgrade() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proposal-v1-fallback.redb");
         let db = Db::new(&path, 1024 * 1024, DbMetrics::new()).unwrap();
@@ -2865,19 +2865,11 @@ mod tests {
         );
         insert_raw_legacy_payload(&db, key, &payload);
 
-        let tx = db.db.begin_write().unwrap();
-        tx.open_table(SCHEMA_METADATA_TABLE)
-            .unwrap()
-            .insert(
-                UNDECIDED_STORAGE_RECONCILIATION_KEY,
-                UNDECIDED_STORAGE_RECONCILIATION_VERSION,
-            )
-            .unwrap();
-        tx.commit().unwrap();
         drop(db);
 
         let reopened = Db::new(path, 1024 * 1024, DbMetrics::new()).unwrap();
-        reopened.initialize_schema().unwrap();
+        let stats = reopened.initialize_schema().unwrap();
+        assert!(!stats.reconciliation_ran);
         assert!(raw_compact_proposal(&reopened, key).is_none());
         assert_eq!(
             reopened
@@ -2888,11 +2880,11 @@ mod tests {
     }
 
     #[test]
-    fn rollback_compact_proposal_n_minus_one_commit_is_repaired_on_reupgrade() {
+    fn rollback_wire_complete_proposal_commits_and_syncs_while_n_minus_one_active() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rollback_compact_commit.redb");
-        let metrics = DbMetrics::new();
-        let db = Db::new(&path, 1024 * 1024, metrics.clone()).unwrap();
+        let path = dir.path().join("rollback-wire-complete-lifecycle.redb");
+        let db = Db::new(&path, 1024 * 1024, DbMetrics::new()).unwrap();
+        db.initialize_schema().unwrap();
         let height = Height::new(82);
         let round = Round::new(5);
         let payload = make_execution_payload_bytes(height.as_u64());
@@ -2905,7 +2897,7 @@ mod tests {
             value_id: value.id(),
             commit_signatures: Vec::new(),
         };
-        let proposal = ProposedValue {
+        let proposal: ProposedValue<EmeraldContext> = ProposedValue {
             height,
             round,
             valid_round: Round::new(3),
@@ -2913,73 +2905,50 @@ mod tests {
             value: value.clone(),
             validity: Validity::Valid,
         };
-        let compact_proposal = StoredProposalMetadata::from_proposal(&proposal)
-            .encode()
-            .unwrap();
-        let id_only_value = Value {
-            value: value.id().as_u64(),
-            extensions: Bytes::new(),
-        }
-        .to_bytes()
-        .unwrap();
-
-        let tx = db.db.begin_write().unwrap();
-        tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)
-            .unwrap()
-            .insert((height, round, value.id()), compact_proposal.to_vec())
-            .unwrap();
-        tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)
-            .unwrap()
-            .insert((height, round, value.id()), payload.to_vec())
-            .unwrap();
-        tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)
-            .unwrap()
-            .insert((height, value.id()), payload.to_vec())
-            .unwrap();
-        tx.open_table(DECIDED_VALUES_TABLE)
-            .unwrap()
-            .insert(height, id_only_value.to_vec())
-            .unwrap();
-        tx.open_table(CERTIFICATES_TABLE)
-            .unwrap()
-            .insert(height, encode_certificate(&certificate).unwrap())
-            .unwrap();
-        tx.open_table(DECIDED_BLOCK_HEADERS_TABLE)
-            .unwrap()
-            .insert(height, header.to_vec())
-            .unwrap();
-        tx.open_table(DECIDED_BLOCK_DATA_TABLE)
-            .unwrap()
-            .insert(height, payload.to_vec())
-            .unwrap();
-        tx.commit().unwrap();
-
-        db.initialize_schema().unwrap();
-
-        assert_eq!(
-            db.get_decided_value(height).unwrap(),
-            Some(DecidedValue {
-                value: value.clone(),
-                certificate: certificate.clone(),
-            })
-        );
         let key = (height, round, value.id());
-        let full_proposal = raw_legacy_proposal(&db, key).unwrap();
-        let compact_proposal = raw_compact_proposal(&db, key).unwrap();
-        assert_eq!(metrics.write_count(), 3);
+        db.insert_undecided_block_data(height, round, value.id(), payload.clone())
+            .unwrap();
+        db.insert_undecided_proposal(proposal).unwrap();
+
+        let legacy = raw_legacy_proposal(&db, key).unwrap();
+        let legacy_proto = proto::ProposedValue::decode(legacy.as_slice()).unwrap();
+        let n_minus_one_value = decode_value_like_n_minus_one(legacy_proto.value.unwrap());
         assert_eq!(
-            metrics.write_bytes(),
-            (value.to_bytes().unwrap().len()
-                + full_proposal.len()
-                + compact_proposal.len()) as u64
+            n_minus_one_value.extensions, payload,
+            "N-1 must receive the execution payload while it is active"
         );
+
+        db.insert_legacy_decided_metadata(
+            DecidedValue {
+                value: n_minus_one_value.clone(),
+                certificate: certificate.clone(),
+            },
+            header,
+        )
+        .unwrap();
+        db.insert_decided_block_data(height, payload.clone())
+            .unwrap();
+
+        let stored = db.get_decided_value(height).unwrap().unwrap();
+        let raw_sync = ProtobufCodec.encode(&stored.value).unwrap();
+        let current_sync = Value::from_bytes(&raw_sync).unwrap();
+        let n_minus_one_sync =
+            decode_value_like_n_minus_one(proto::Value::decode(raw_sync).unwrap());
+        assert_eq!(current_sync, value);
+        assert_eq!(n_minus_one_sync, value);
+        ExecutionPayloadV3::from_ssz_bytes(&current_sync.extensions).unwrap();
+        ExecutionPayloadV3::from_ssz_bytes(&n_minus_one_sync.extensions).unwrap();
         drop(db);
 
         let reopened = Db::new(path, 1024 * 1024, DbMetrics::new()).unwrap();
-        reopened.initialize_schema().unwrap();
+        let stats = reopened.initialize_schema().unwrap();
+        assert!(!stats.reconciliation_ran);
         assert_eq!(
             reopened.get_decided_value(height).unwrap(),
-            Some(DecidedValue { value, certificate })
+            Some(DecidedValue {
+                value,
+                certificate,
+            })
         );
     }
 

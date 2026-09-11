@@ -527,7 +527,7 @@ git commit -m "perf: skip completed storage migration scans"
 - Uses `decode_value_like_n_minus_one(proto::Value) -> Value` as the pinned N-1 decoder.
 - Produces deterministic coverage for N proposal -> N-1 commit -> N-1/current sync -> N re-upgrade.
 
-- [ ] **Step 1: Replace the ID-only rollback test with a wire-complete lifecycle test**
+- [x] **Step 1: Replace the ID-only rollback test with a wire-complete lifecycle test**
 
 Add `rollback_wire_complete_proposal_commits_and_syncs_while_n_minus_one_active`:
 
@@ -541,7 +541,7 @@ Add `rollback_wire_complete_proposal_commits_and_syncs_while_n_minus_one_active`
 
 Use a test name and assertion message that explicitly mention the while-N-1-active sync boundary Simon identified.
 
-- [ ] **Step 2: Add post-marker N-1 write and N re-upgrade coverage**
+- [x] **Step 2: Add post-marker N-1 write and N re-upgrade coverage**
 
 Add `rollback_full_v1_proposal_written_after_marker_is_readable_on_reupgrade`. After creating marker `1`, raw-insert
 only a full v1 proposal and exact legacy payload as N-1 would. Reopen with N and assert:
@@ -554,7 +554,7 @@ assert_eq!(n.get_undecided_proposal(key.0, key.1, key.2).unwrap(), Some(proposal
 
 This proves the durable marker does not strand state created during a rollback interval.
 
-- [ ] **Step 3: Run lifecycle tests and verify red before implementation adjustments**
+- [x] **Step 3: Run lifecycle tests after the already-tested production fix**
 
 Run:
 
@@ -563,16 +563,16 @@ cargo test -p emerald rollback_wire_complete_ -- --nocapture
 cargo test -p emerald rollback_full_v1_ -- --nocapture
 ```
 
-Expected: tests fail against the current same-table compact encoding. Do not weaken current strict wire decoding to
-make them pass.
+Expected: the integration characterization passes because Task 2 already established the failing dual-write test and
+implemented the production fix. Do not weaken current strict wire decoding to make it pass.
 
-- [ ] **Step 4: Complete only the minimal lifecycle fixes exposed by the tests**
+- [x] **Step 4: Complete only the minimal lifecycle fixes exposed by the tests**
 
 Route every raw N-1 compatibility lookup to `LEGACY_UNDECIDED_PROPOSALS_TABLE`, keep v1 encoding full, and ensure
 marker-present startup leaves post-marker v1-only proposals for the runtime fallback. Remove the obsolete expectation
 that an ID-only proposal is a supported N-1 commit input.
 
-- [ ] **Step 5: Run sync, state, and rollback suites**
+- [x] **Step 5: Run sync, state, and rollback suites**
 
 Run:
 
@@ -585,7 +585,7 @@ cargo test -p emerald decided_state_commit_ -- --nocapture
 
 Expected: all tests pass and no network decoder accepts an unattached ID-only value.
 
-- [ ] **Step 6: Commit the N-1 lifecycle coverage**
+- [x] **Step 6: Commit the N-1 lifecycle coverage**
 
 ```bash
 git add app/src/store.rs
