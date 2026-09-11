@@ -204,7 +204,7 @@ Deterministic tests cover:
 - large multi-round payloads having one copy in the active v2 layout while compatibility duplication is reported
   separately.
 
-An ignored opt-in qualification script accepts explicit current Emerald, N-1 Emerald, and custom-Reth binary paths.
+The ignored opt-in qualification script accepts explicit current Emerald, N-1 Emerald, and custom-Reth binary paths.
 It uses an isolated local testnet to exercise process restarts, an N/N-1 mixed-version sync interval, and final
 re-upgrade convergence. The script records binary versions, block heights, process logs, and failure diagnostics. It
 does not claim to deterministically create the exact stored-proposal interleaving; that boundary is pinned by the

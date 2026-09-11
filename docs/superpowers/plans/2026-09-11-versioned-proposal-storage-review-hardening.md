@@ -611,7 +611,7 @@ git commit -m "test: pin rollback commit and sync compatibility"
   `--custom-reth-bin`.
 - Documents that v1 proposal and block-data shadows both remain until activated cleanup.
 
-- [ ] **Step 1: Add a failing shell contract test for the qualification script**
+- [x] **Step 1: Add a failing shell contract test for the qualification script**
 
 Create `scripts/tests/rollback_binary_qualification_test.sh` using the repository's existing shell-test style. It
 must assert that `--help` documents all three binary inputs and that missing or identical Emerald binaries fail before
@@ -623,7 +623,7 @@ bash scripts/tests/rollback_binary_qualification_test.sh
 
 Expected: FAIL because `rollback_binary_qualification.sh` does not exist.
 
-- [ ] **Step 2: Implement the opt-in real-binary script**
+- [x] **Step 2: Implement the opt-in real-binary script**
 
 Create `scripts/tests/rollback_binary_qualification.sh` with `set -euo pipefail`, absolute path normalization, a
 temporary home created by `mktemp -d`, and a trap that invokes testnet stop before preserving logs on failure.
@@ -644,7 +644,7 @@ The script must:
 The script is release evidence for real process/version transitions. It must state in `--help` that deterministic
 database tests, not this network run, pin the exact N-proposal/N-1-commit interleaving.
 
-- [ ] **Step 3: Run the shell contract test**
+- [x] **Step 3: Run the shell contract test**
 
 Run:
 
@@ -656,7 +656,7 @@ bash -n scripts/tests/rollback_binary_qualification.sh
 Expected: both pass. Do not claim the real-binary qualification passed unless all three external binaries are supplied
 and the full script is executed.
 
-- [ ] **Step 4: Update changelog, runbook, and design history**
+- [x] **Step 4: Update changelog, runbook, and design history**
 
 Document these exact operator facts:
 
@@ -669,7 +669,7 @@ Document these exact operator facts:
 
 Mark the same-table compact encoding in the 2026-09-10 design as superseded rather than deleting its history.
 
-- [ ] **Step 5: Extend cleanup issue #325**
+- [x] **Step 5: Extend cleanup issue #325**
 
 Edit the issue so its objective and acceptance criteria cover both compatibility tables. Preserve its existing payload
 cleanup and offline-compaction requirements, and add:
@@ -698,7 +698,7 @@ Required edits to the copied body are fully bounded:
 5. Require reads, writes, and pruning to stop depending on either compatibility table.
 6. Preserve every existing compaction, backup, logging, metrics, conflict rollback, and qualification criterion.
 
-- [ ] **Step 6: Run documentation width and shell checks**
+- [x] **Step 6: Run documentation width and shell checks**
 
 Run:
 
@@ -713,7 +713,7 @@ bash scripts/tests/rollback_binary_qualification_test.sh
 
 Expected: the width command prints nothing and the shell contract test prints `ok`.
 
-- [ ] **Step 7: Commit qualification and documentation**
+- [x] **Step 7: Commit qualification and documentation**
 
 ```bash
 git add scripts/tests/rollback_binary_qualification.sh \
@@ -738,7 +738,7 @@ git commit -m "docs: define rollback qualification boundary"
 - Produces a verified PR head on `seb/deduplicate-undecided-block-data`.
 - Replies to review comments `3987393054` and `3987393069` in their original threads.
 
-- [ ] **Step 1: Run the Emerald library suite**
+- [x] **Step 1: Run the Emerald library suite**
 
 ```bash
 cargo test -p emerald --lib
@@ -746,7 +746,7 @@ cargo test -p emerald --lib
 
 Expected: every Emerald library test passes with no ignored failure.
 
-- [ ] **Step 2: Run practical workspace and MBT gates**
+- [x] **Step 2: Run practical workspace and MBT gates**
 
 ```bash
 cargo nextest run --workspace --all-features --no-fail-fast --failure-output final \
@@ -756,7 +756,7 @@ cargo test -p emerald-mbt --no-run
 
 Expected: all selected workspace tests pass and both MBT binaries compile.
 
-- [ ] **Step 3: Run repository-required lint and format gates**
+- [x] **Step 3: Run repository-required lint and format gates**
 
 ```bash
 cargo clippy --tests -- -D warnings
@@ -772,7 +772,7 @@ cargo +nightly fmt -p emerald -p emerald-mbt --check
 
 Expected: scoped gates pass. Do not edit unrelated CLI/contracts/key-provider/utils baselines.
 
-- [ ] **Step 4: Run final static and migration checks**
+- [x] **Step 4: Run final static and migration checks**
 
 ```bash
 git diff --check

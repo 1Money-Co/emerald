@@ -18,9 +18,9 @@ use malachitebft_eth_types::codec::proto::ProtobufCodec;
 use malachitebft_eth_types::{proto, EmeraldContext, Height, Value, ValueId};
 use malachitebft_proto::{Error as ProtoError, Protobuf};
 use prost::Message;
+use redb::ReadableTable;
 #[cfg(test)]
 use redb::{ReadableTableMetadata, TableHandle};
-use redb::ReadableTable;
 use ssz::{Decode, Encode};
 use thiserror::Error;
 
@@ -150,8 +150,7 @@ const UNDECIDED_PROPOSALS_TABLE: redb::TableDefinition<'_, UndecidedValueKey, Ve
 const SCHEMA_METADATA_TABLE: redb::TableDefinition<'_, &str, u64> =
     redb::TableDefinition::new("storage_schema_metadata");
 
-const UNDECIDED_STORAGE_RECONCILIATION_KEY: &str =
-    "undecided_storage_reconciliation_version";
+const UNDECIDED_STORAGE_RECONCILIATION_KEY: &str = "undecided_storage_reconciliation_version";
 const UNDECIDED_STORAGE_RECONCILIATION_VERSION: u64 = 1;
 
 const DECIDED_BLOCK_DATA_TABLE: redb::TableDefinition<'_, HeightKey, Vec<u8>> =
@@ -614,7 +613,7 @@ impl Db {
                         "stored proposal metadata cannot be decoded",
                     )
                 })?
-                .hydrate_verified(key, proposal.value.extensions.clone())
+                .hydrate_verified(key, proposal.value.extensions)
                 .map_err(|reason| Self::irrecoverable_undecided_proposal(key, reason))?
         } else {
             proposal
@@ -719,10 +718,7 @@ impl Db {
     ) -> Result<ProposedValue<EmeraldContext>, StoreError> {
         let proposal: ProposedValue<EmeraldContext> =
             ProtobufCodec.decode(encoded).map_err(|_| {
-                Self::irrecoverable_undecided_proposal(
-                    key,
-                    "full proposal cannot be decoded",
-                )
+                Self::irrecoverable_undecided_proposal(key, "full proposal cannot be decoded")
             })?;
         if (proposal.height, proposal.round, proposal.value.id()) != key {
             return Err(Self::irrecoverable_undecided_proposal(
@@ -1040,6 +1036,7 @@ impl Db {
             );
             tracing::info!(
                 event = "undecided_block_data_migration",
+                reconciliation_version = UNDECIDED_STORAGE_RECONCILIATION_VERSION,
                 legacy_rows = migration.legacy_rows,
                 inserted_payloads = migration.inserted_payloads,
                 inserted_bytes = migration.inserted_bytes,
@@ -1116,8 +1113,7 @@ impl Db {
                 .map_err(|_| StoreError::IrrecoverableDecidedState {
                     height,
                     reason: "stored value cannot be decoded",
-                })?
-            {
+                })? {
                 DecodedStoredValue::Full(value) => value,
                 DecodedStoredValue::IdOnly(_) => {
                     return Err(StoreError::IrrecoverableDecidedState {
@@ -1126,12 +1122,13 @@ impl Db {
                     });
                 }
             };
-            let encoded_certificate = certificates.get(&height)?.ok_or(
-                StoreError::IrrecoverableDecidedState {
-                    height,
-                    reason: "missing certificate",
-                },
-            )?;
+            let encoded_certificate =
+                certificates
+                    .get(&height)?
+                    .ok_or(StoreError::IrrecoverableDecidedState {
+                        height,
+                        reason: "missing certificate",
+                    })?;
             let certificate = decode_certificate(&encoded_certificate.value()).map_err(|_| {
                 StoreError::IrrecoverableDecidedState {
                     height,
@@ -1174,7 +1171,8 @@ impl Db {
                     reason: "missing its execution payload",
                 })?;
             let recomputed = Value::new(Bytes::copy_from_slice(&payload));
-            if recomputed.id() != certificate.value_id || stored_value.extensions.as_ref() != payload
+            if recomputed.id() != certificate.value_id
+                || stored_value.extensions.as_ref() != payload
             {
                 return Err(StoreError::IrrecoverableDecidedState {
                     height,
@@ -1409,10 +1407,10 @@ impl Db {
         migration: &mut UndecidedBlockDataMigrationStats,
         stats: &mut SchemaInitializationStats,
     ) -> Result<(), StoreError> {
-        let mut rows: BTreeMap<
-            (Height, Round, ValueId),
-            (Option<Vec<u8>>, Option<Vec<u8>>),
-        > = BTreeMap::new();
+        type ProposalKey = (Height, Round, ValueId);
+        type EncodedProposalPair = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+        let mut rows: BTreeMap<ProposalKey, EncodedProposalPair> = BTreeMap::new();
         {
             let proposals = tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)?;
             for entry in proposals.iter()? {
@@ -2169,8 +2167,7 @@ mod tests {
 
     #[test]
     fn schema_creates_separate_legacy_compact_and_metadata_tables() {
-        let (db, _dir, _metrics) =
-            create_test_db_with_metrics("versioned-proposal-schema");
+        let (db, _dir, _metrics) = create_test_db_with_metrics("versioned-proposal-schema");
 
         assert!(has_table(&db, "undecided_values"));
         assert!(has_table(&db, "undecided_values_v2"));
@@ -2186,11 +2183,7 @@ mod tests {
         tx.commit().unwrap();
     }
 
-    fn insert_raw_legacy_proposal(
-        db: &Db,
-        key: (Height, Round, ValueId),
-        encoded: Vec<u8>,
-    ) {
+    fn insert_raw_legacy_proposal(db: &Db, key: (Height, Round, ValueId), encoded: Vec<u8>) {
         let tx = db.db.begin_write().unwrap();
         tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)
             .unwrap()
@@ -2242,8 +2235,7 @@ mod tests {
 
     fn raw_storage_snapshot(db: &Db, key: (Height, Round, ValueId)) -> RawStorageSnapshot {
         let legacy_payload = if has_table(db, LEGACY_UNDECIDED_BLOCK_DATA_TABLE.name()) {
-            get_legacy_undecided_block_data(db, key.0, key.1, key.2)
-                .map(|bytes| bytes.to_vec())
+            get_legacy_undecided_block_data(db, key.0, key.1, key.2).map(|bytes| bytes.to_vec())
         } else {
             None
         };
@@ -2602,9 +2594,7 @@ mod tests {
         assert_eq!(metrics.write_count(), 3);
         assert_eq!(
             metrics.write_bytes(),
-            (payload.len()
-                + compact_metadata.len()
-                + full_proposal.len()) as u64
+            (payload.len() + compact_metadata.len() + full_proposal.len()) as u64
         );
         drop(db);
 
@@ -2858,11 +2848,7 @@ mod tests {
             validity: Validity::Valid,
         };
         let key = (proposal.height, proposal.round, proposal.value.id());
-        insert_raw_legacy_proposal(
-            &db,
-            key,
-            ProtobufCodec.encode(&proposal).unwrap().to_vec(),
-        );
+        insert_raw_legacy_proposal(&db, key, ProtobufCodec.encode(&proposal).unwrap().to_vec());
         insert_raw_legacy_payload(&db, key, &payload);
 
         drop(db);
@@ -2920,14 +2906,13 @@ mod tests {
 
         db.insert_legacy_decided_metadata(
             DecidedValue {
-                value: n_minus_one_value.clone(),
+                value: n_minus_one_value,
                 certificate: certificate.clone(),
             },
             header,
         )
         .unwrap();
-        db.insert_decided_block_data(height, payload.clone())
-            .unwrap();
+        db.insert_decided_block_data(height, payload).unwrap();
 
         let stored = db.get_decided_value(height).unwrap().unwrap();
         let raw_sync = ProtobufCodec.encode(&stored.value).unwrap();
@@ -2945,10 +2930,7 @@ mod tests {
         assert!(!stats.reconciliation_ran);
         assert_eq!(
             reopened.get_decided_value(height).unwrap(),
-            Some(DecidedValue {
-                value,
-                certificate,
-            })
+            Some(DecidedValue { value, certificate })
         );
     }
 
@@ -2994,12 +2976,7 @@ mod tests {
             .unwrap();
 
         let (partial, partial_header, partial_payload) = make_decided_state(101);
-        insert_n_minus_one_partial_commit(
-            &db,
-            &partial,
-            &partial_header,
-            Some(&partial_payload),
-        );
+        insert_n_minus_one_partial_commit(&db, &partial, &partial_header, Some(&partial_payload));
 
         let stats = db.initialize_schema().unwrap();
         assert_eq!(stats.targeted_decided_rows_visited, 2);
@@ -3015,12 +2992,7 @@ mod tests {
         let (db, _dir) = create_test_db("versioned-targeted-conflict");
         let (partial, partial_header, _partial_payload) = make_decided_state(102);
         let wrong_payload = make_execution_payload_bytes(202);
-        insert_n_minus_one_partial_commit(
-            &db,
-            &partial,
-            &partial_header,
-            Some(&wrong_payload),
-        );
+        insert_n_minus_one_partial_commit(&db, &partial, &partial_header, Some(&wrong_payload));
         let key = (
             Height::new(102),
             partial.certificate.round,
@@ -3080,9 +3052,7 @@ mod tests {
         let second_started = Instant::now();
         let second = reopened.initialize_schema().unwrap();
         let second_elapsed = second_started.elapsed();
-        eprintln!(
-            "first={first_elapsed:?} {first:?}; second={second_elapsed:?} {second:?}"
-        );
+        eprintln!("first={first_elapsed:?} {first:?}; second={second_elapsed:?} {second:?}");
 
         assert_eq!(first.legacy_payload_rows_visited, PROPOSALS);
         assert_eq!(first.proposal_rows_visited, PROPOSALS);
@@ -3613,11 +3583,9 @@ mod tests {
             };
             db.insert_undecided_proposal(proposal.clone()).unwrap();
 
-            let raw = raw_compact_proposal(
-                &db,
-                (proposal.height, proposal.round, proposal.value.id()),
-            )
-            .unwrap();
+            let raw =
+                raw_compact_proposal(&db, (proposal.height, proposal.round, proposal.value.id()))
+                    .unwrap();
             assert!(raw.len() < 128);
             assert!(!raw
                 .windows(payload.len())
@@ -3892,11 +3860,7 @@ mod tests {
             "undecided proposals at height 3 should survive"
         );
         let retained = make_proposed_value(3);
-        let retained_key = (
-            retained.height,
-            retained.round,
-            retained.value.id(),
-        );
+        let retained_key = (retained.height, retained.round, retained.value.id());
         assert!(raw_legacy_proposal(&db, retained_key).is_some());
         assert!(raw_compact_proposal(&db, retained_key).is_some());
         assert_eq!(

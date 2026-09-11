@@ -1,5 +1,12 @@
 # Compact Undecided Proposal Metadata Design
 
+## Status
+
+Superseded for the N-1 compatibility release by
+`2026-09-11-versioned-proposal-storage-review-hardening-design.md`. The same-table compact encoding below is retained
+as decision history; it is unsafe because N-1 can commit and serve an ID-only value while N-1 is still active. The
+selected design preserves full `undecided_values` rows and stores compact metadata in `undecided_values_v2`.
+
 ## Context
 
 PR #22 moves undecided execution payloads from the round-keyed `undecided_block_data` table to the
