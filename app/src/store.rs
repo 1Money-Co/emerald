@@ -1,7 +1,7 @@
 #![allow(clippy::result_large_err)]
 
 use core::mem::size_of;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,7 +15,7 @@ use malachitebft_app_channel::app::types::sync::RawDecidedValue;
 use malachitebft_app_channel::app::types::ProposedValue;
 use malachitebft_eth_types::codec::proto as codec;
 use malachitebft_eth_types::codec::proto::ProtobufCodec;
-use malachitebft_eth_types::{proto, EmeraldContext, Height, Value, ValueId};
+use malachitebft_eth_types::{proto, EmeraldContext, Height, ProposalAttestation, Value, ValueId};
 use malachitebft_proto::{Error as ProtoError, Protobuf};
 use prost::Message;
 use redb::ReadableTable;
@@ -133,6 +133,51 @@ pub enum StoreError {
 
     #[error("Injected decided commit failure after {boundary}")]
     InjectedDecidedCommitFailure { boundary: &'static str },
+
+    #[error("Undecided proposal integrity error: {0}")]
+    Integrity(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UndecidedWriteSource {
+    Proposal,
+    Sync,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UndecidedConflictField {
+    ValidRound,
+    Proposer,
+    Value,
+    Payload,
+    Attestation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UndecidedConflict {
+    pub field: UndecidedConflictField,
+    pub stored: ProposedValue<EmeraldContext>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UndecidedWriteOutcome {
+    Canonical(ProposedValue<EmeraldContext>),
+    Conflict(UndecidedConflict),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UndecidedProposalWrite {
+    pub proposal: ProposedValue<EmeraldContext>,
+    pub payload: Bytes,
+    pub attestation: Option<ProposalAttestation>,
+    pub source: UndecidedWriteSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredUndecidedProposal {
+    pub proposal: ProposedValue<EmeraldContext>,
+    pub payload: Bytes,
+    pub attestation: Option<ProposalAttestation>,
 }
 
 const CERTIFICATES_TABLE: redb::TableDefinition<'_, HeightKey, Vec<u8>> =
@@ -161,6 +206,9 @@ const LEGACY_UNDECIDED_BLOCK_DATA_TABLE: redb::TableDefinition<'_, UndecidedValu
 
 const UNDECIDED_BLOCK_DATA_TABLE: redb::TableDefinition<'_, UndecidedBlockDataKey, Vec<u8>> =
     redb::TableDefinition::new("undecided_block_data_v2");
+
+const UNDECIDED_PROPOSAL_ATTESTATIONS_TABLE: redb::TableDefinition<'_, UndecidedValueKey, Vec<u8>> =
+    redb::TableDefinition::new("undecided_proposal_attestations");
 
 const DECIDED_BLOCK_HEADERS_TABLE: redb::TableDefinition<'_, HeightKey, Vec<u8>> =
     redb::TableDefinition::new("decided_block_headers");
@@ -471,6 +519,174 @@ impl Db {
         Ok(())
     }
 
+    fn proposal_key(proposal: &ProposedValue<EmeraldContext>) -> (Height, Round, ValueId) {
+        (proposal.height, proposal.round, proposal.value.id())
+    }
+
+    fn validate_write(
+        write: &UndecidedProposalWrite,
+    ) -> Result<(Height, Round, ValueId), StoreError> {
+        let key = Self::proposal_key(&write.proposal);
+        if write.proposal.value.extensions != write.payload {
+            return Err(StoreError::Integrity(format!(
+                "incoming proposal payload disagrees with embedded value at {key:?}"
+            )));
+        }
+        if let Some(attestation) = &write.attestation {
+            let init = &attestation.init;
+            if init.height != write.proposal.height
+                || init.round != write.proposal.round
+                || init.pol_round != write.proposal.valid_round
+                || init.proposer != write.proposal.proposer
+            {
+                return Err(StoreError::Integrity(format!(
+                    "incoming proposal attestation disagrees with metadata at {key:?}"
+                )));
+            }
+        }
+        Ok(key)
+    }
+
+    fn validate_stored_record(
+        key: (Height, Round, ValueId),
+        proposal: ProposedValue<EmeraldContext>,
+        payload: Bytes,
+        attestation: Option<ProposalAttestation>,
+    ) -> Result<StoredUndecidedProposal, StoreError> {
+        if Self::proposal_key(&proposal) != key || proposal.value.extensions != payload {
+            return Err(StoreError::Integrity(format!(
+                "stored proposal disagrees with its key or payload at {key:?}"
+            )));
+        }
+        if let Some(attestation) = &attestation {
+            let init = &attestation.init;
+            if init.height != proposal.height
+                || init.round != proposal.round
+                || init.pol_round != proposal.valid_round
+                || init.proposer != proposal.proposer
+            {
+                return Err(StoreError::Integrity(format!(
+                    "stored proposal attestation disagrees with metadata at {key:?}"
+                )));
+            }
+        }
+        Ok(StoredUndecidedProposal {
+            proposal,
+            payload,
+            attestation,
+        })
+    }
+
+    fn compare_write(
+        stored: &StoredUndecidedProposal,
+        write: &UndecidedProposalWrite,
+    ) -> Result<(), UndecidedConflict> {
+        let conflict = |field| UndecidedConflict {
+            field,
+            stored: stored.proposal.clone(),
+        };
+        if stored.proposal.proposer != write.proposal.proposer {
+            return Err(conflict(UndecidedConflictField::Proposer));
+        }
+        if stored.proposal.value != write.proposal.value {
+            return Err(conflict(UndecidedConflictField::Value));
+        }
+        if stored.payload != write.payload {
+            return Err(conflict(UndecidedConflictField::Payload));
+        }
+        if write.source != UndecidedWriteSource::Sync
+            && stored.proposal.valid_round != write.proposal.valid_round
+        {
+            return Err(conflict(UndecidedConflictField::ValidRound));
+        }
+        if let (Some(stored), Some(incoming)) = (&stored.attestation, &write.attestation) {
+            if stored != incoming {
+                return Err(conflict(UndecidedConflictField::Attestation));
+            }
+        }
+        Ok(())
+    }
+
+    fn decode_attestation(bytes: &[u8]) -> Result<ProposalAttestation, StoreError> {
+        ProtobufCodec
+            .decode(Bytes::copy_from_slice(bytes))
+            .map_err(StoreError::Protobuf)
+    }
+
+    #[tracing::instrument(skip(self))]
+    fn get_undecided_record(
+        &self,
+        height: Height,
+        round: Round,
+        value_id: ValueId,
+    ) -> Result<Option<StoredUndecidedProposal>, StoreError> {
+        let start = Instant::now();
+        let key = (height, round, value_id);
+        let tx = self.db.begin_read()?;
+        let compact = tx
+            .open_table(UNDECIDED_PROPOSALS_TABLE)?
+            .get(&key)?
+            .map(|value| value.value());
+        let full = tx
+            .open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)?
+            .get(&key)?
+            .map(|value| value.value());
+        let attestation = tx
+            .open_table(UNDECIDED_PROPOSAL_ATTESTATIONS_TABLE)?
+            .get(&key)?
+            .map(|value| Self::decode_attestation(&value.value()))
+            .transpose()?;
+
+        let record = if compact.is_none() && full.is_none() {
+            if attestation.is_some() {
+                return Err(StoreError::Integrity(format!(
+                    "attestation has no proposal metadata at {key:?}"
+                )));
+            }
+            None
+        } else {
+            let payload = self.resolve_undecided_payload(&tx, key)?;
+            let compact_proposal = compact
+                .map(|encoded| {
+                    decode_stored_proposal(Bytes::from(encoded))
+                        .map_err(|_| {
+                            Self::irrecoverable_undecided_proposal(
+                                key,
+                                "stored proposal metadata cannot be decoded",
+                            )
+                        })?
+                        .hydrate_verified(key, payload.clone())
+                        .map_err(|reason| Self::irrecoverable_undecided_proposal(key, reason))
+                })
+                .transpose()?;
+            let full_proposal = full
+                .map(|encoded| self.decode_full_stored_proposal(key, Bytes::from(encoded)))
+                .transpose()?;
+            let proposal = match (full_proposal, compact_proposal) {
+                (Some(full), Some(compact)) if full != compact => {
+                    return Err(Self::irrecoverable_undecided_proposal(
+                        key,
+                        "proposal representations disagree",
+                    ));
+                }
+                (Some(full), _) => full,
+                (_, Some(compact)) => compact,
+                (None, None) => unreachable!("proposal presence checked above"),
+            };
+            Some(Self::validate_stored_record(
+                key,
+                proposal,
+                payload,
+                attestation,
+            )?)
+        };
+
+        self.metrics.observe_read_time(start.elapsed());
+        self.metrics
+            .add_key_read_bytes(size_of::<(Height, Round, ValueId)>() as u64);
+        Ok(record)
+    }
+
     #[tracing::instrument(skip(self))]
     pub fn get_undecided_proposal(
         &self,
@@ -478,48 +694,9 @@ impl Db {
         round: Round,
         value_id: ValueId,
     ) -> Result<Option<ProposedValue<EmeraldContext>>, StoreError> {
-        let start = Instant::now();
-        let mut read_bytes = 0;
-
-        let key = (height, round, value_id);
-        let tx = self.db.begin_read()?;
-        let compact = {
-            let table = tx.open_table(UNDECIDED_PROPOSALS_TABLE)?;
-            table.get(&key)?.map(|value| value.value())
-        };
-        let value = if let Some(bytes) = compact {
-            read_bytes += bytes.len() as u64;
-            let proposal = self.hydrate_stored_proposal(&tx, key, Bytes::from(bytes))?;
-            read_bytes += proposal.value.extensions.len() as u64;
-            Some(proposal)
-        } else {
-            let legacy = {
-                let table = tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)?;
-                table.get(&key)?.map(|value| value.value())
-            };
-            legacy
-                .map(|bytes| {
-                    read_bytes += bytes.len() as u64;
-                    let proposal = self.decode_full_stored_proposal(key, Bytes::from(bytes))?;
-                    let payload = self.resolve_undecided_payload(&tx, key)?;
-                    read_bytes += payload.len() as u64;
-                    if proposal.value.extensions != payload {
-                        return Err(Self::irrecoverable_undecided_proposal(
-                            key,
-                            "full proposal payload does not match shared storage",
-                        ));
-                    }
-                    Ok(proposal)
-                })
-                .transpose()?
-        };
-
-        self.metrics.observe_read_time(start.elapsed());
-        self.metrics.add_read_bytes(read_bytes);
-        self.metrics
-            .add_key_read_bytes(size_of::<(Height, Round, ValueId)>() as u64);
-
-        Ok(value)
+        Ok(self
+            .get_undecided_record(height, round, value_id)?
+            .map(|record| record.proposal))
     }
 
     fn get_undecided_proposals(
@@ -527,163 +704,217 @@ impl Db {
         height: Height,
         round: Round,
     ) -> Result<Vec<ProposedValue<EmeraldContext>>, StoreError> {
-        let start = Instant::now();
-        let mut read_bytes = 0;
-
         let tx = self.db.begin_read()?;
-        let mut stored = BTreeMap::new();
-        {
-            let table = tx.open_table(UNDECIDED_PROPOSALS_TABLE)?;
-            for result in table.iter()? {
-                let (key, value) = result?;
+        let mut keys = BTreeSet::new();
+        for table_definition in [
+            LEGACY_UNDECIDED_PROPOSALS_TABLE,
+            UNDECIDED_PROPOSALS_TABLE,
+            UNDECIDED_PROPOSAL_ATTESTATIONS_TABLE,
+        ] {
+            for result in tx.open_table(table_definition)?.iter()? {
+                let (key, _) = result?;
                 let key = key.value();
                 if key.0 == height && key.1 == round {
-                    stored.insert(key, (value.value(), true));
+                    keys.insert(key);
                 }
             }
         }
-        {
-            let table = tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)?;
-            for result in table.iter()? {
-                let (key, value) = result?;
-                let key = key.value();
-                if key.0 == height && key.1 == round {
-                    stored.entry(key).or_insert_with(|| (value.value(), false));
-                }
-            }
-        }
+        drop(tx);
 
-        let mut proposals = Vec::with_capacity(stored.len());
-        for (key, (bytes, compact)) in stored {
-            read_bytes += bytes.len() as u64;
-            let proposal = if compact {
-                self.hydrate_stored_proposal(&tx, key, Bytes::from(bytes))?
-            } else {
-                let proposal = self.decode_full_stored_proposal(key, Bytes::from(bytes))?;
-                let payload = self.resolve_undecided_payload(&tx, key)?;
-                if proposal.value.extensions != payload {
-                    return Err(Self::irrecoverable_undecided_proposal(
-                        key,
-                        "full proposal payload does not match shared storage",
-                    ));
-                }
-                proposal
-            };
-            read_bytes += proposal.value.extensions.len() as u64;
-            proposals.push(proposal);
-        }
-
-        self.metrics.observe_read_time(start.elapsed());
-        self.metrics.add_read_bytes(read_bytes);
-        self.metrics.add_key_read_bytes(
-            size_of::<(Height, Round, ValueId)>() as u64 * proposals.len() as u64,
-        );
-
-        Ok(proposals)
+        keys.into_iter()
+            .map(|(height, round, value_id)| {
+                self.get_undecided_record(height, round, value_id)?
+                    .ok_or_else(|| {
+                        StoreError::Integrity(format!(
+                            "undecided proposal metadata has no coherent record at ({height:?}, {round:?}, {value_id:?})"
+                        ))
+                    })
+                    .map(|record| record.proposal)
+            })
+            .collect()
     }
 
+    fn write_undecided_proposal(
+        &self,
+        write: UndecidedProposalWrite,
+    ) -> Result<UndecidedWriteOutcome, StoreError> {
+        let start = Instant::now();
+        let key = Self::validate_write(&write)?;
+        let (height, _, value_id) = key;
+        let tx = self.db.begin_write()?;
+
+        let primary_payload = tx
+            .open_table(UNDECIDED_BLOCK_DATA_TABLE)?
+            .get(&(height, value_id))?
+            .map(|value| value.value());
+        let legacy_payload = tx
+            .open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?
+            .get(&key)?
+            .map(|value| value.value());
+        if let (Some(primary), Some(legacy)) = (&primary_payload, &legacy_payload) {
+            if primary != legacy {
+                return Err(Self::irrecoverable_undecided_proposal(
+                    key,
+                    "shared and exact-round payload representations disagree",
+                ));
+            }
+        }
+        let existing_payload = primary_payload
+            .as_ref()
+            .or(legacy_payload.as_ref())
+            .map(|payload| Bytes::copy_from_slice(payload));
+
+        let full = tx
+            .open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)?
+            .get(&key)?
+            .map(|value| value.value());
+        let compact = tx
+            .open_table(UNDECIDED_PROPOSALS_TABLE)?
+            .get(&key)?
+            .map(|value| value.value());
+        let attestation = tx
+            .open_table(UNDECIDED_PROPOSAL_ATTESTATIONS_TABLE)?
+            .get(&key)?
+            .map(|value| Self::decode_attestation(&value.value()))
+            .transpose()?;
+
+        let authoritative = if full.is_none() && compact.is_none() {
+            if attestation.is_some() {
+                return Err(StoreError::Integrity(format!(
+                    "attestation has no proposal metadata at {key:?}"
+                )));
+            }
+            if existing_payload
+                .as_ref()
+                .is_some_and(|payload| payload != &write.payload)
+            {
+                return Err(StoreError::ConflictingUndecidedBlockData { height, value_id });
+            }
+            write.proposal.clone()
+        } else {
+            let payload = existing_payload.ok_or_else(|| {
+                Self::irrecoverable_undecided_proposal(key, "missing shared payload")
+            })?;
+            let full_proposal = full
+                .as_ref()
+                .map(|encoded| {
+                    self.decode_full_stored_proposal(key, Bytes::copy_from_slice(encoded))
+                })
+                .transpose()?;
+            let compact_proposal = compact
+                .as_ref()
+                .map(|encoded| {
+                    decode_stored_proposal(Bytes::copy_from_slice(encoded))
+                        .map_err(|_| {
+                            Self::irrecoverable_undecided_proposal(
+                                key,
+                                "stored proposal metadata cannot be decoded",
+                            )
+                        })?
+                        .hydrate_verified(key, payload.clone())
+                        .map_err(|reason| Self::irrecoverable_undecided_proposal(key, reason))
+                })
+                .transpose()?;
+            let proposal = match (full_proposal, compact_proposal) {
+                (Some(full), Some(compact)) if full != compact => {
+                    return Err(Self::irrecoverable_undecided_proposal(
+                        key,
+                        "proposal representations disagree",
+                    ));
+                }
+                (Some(full), _) => full,
+                (_, Some(compact)) => compact,
+                (None, None) => unreachable!("proposal presence checked above"),
+            };
+            let stored = Self::validate_stored_record(key, proposal, payload, attestation.clone())?;
+            if let Err(conflict) = Self::compare_write(&stored, &write) {
+                return Ok(UndecidedWriteOutcome::Conflict(conflict));
+            }
+            stored.proposal
+        };
+
+        let full_bytes = ProtobufCodec.encode(&authoritative)?.to_vec();
+        let compact_bytes = StoredProposalMetadata::from_proposal(&authoritative)
+            .encode()?
+            .to_vec();
+        let attestation_bytes = write
+            .attestation
+            .as_ref()
+            .map(|value| ProtobufCodec.encode(value).map(|bytes| bytes.to_vec()))
+            .transpose()?;
+        let mut inserted_rows = 0;
+        let mut inserted_bytes = 0;
+
+        if primary_payload.is_none() {
+            tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?
+                .insert((height, value_id), write.payload.to_vec())?;
+            inserted_rows += 1;
+            inserted_bytes += write.payload.len() as u64;
+        }
+        if legacy_payload.is_none() {
+            tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?
+                .insert(key, write.payload.to_vec())?;
+            inserted_rows += 1;
+            inserted_bytes += write.payload.len() as u64;
+        }
+        if full.is_none() {
+            tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)?
+                .insert(key, full_bytes.clone())?;
+            inserted_rows += 1;
+            inserted_bytes += full_bytes.len() as u64;
+        }
+        if compact.is_none() {
+            tx.open_table(UNDECIDED_PROPOSALS_TABLE)?
+                .insert(key, compact_bytes.clone())?;
+            inserted_rows += 1;
+            inserted_bytes += compact_bytes.len() as u64;
+        }
+        if attestation.is_none() {
+            if let Some(bytes) = attestation_bytes {
+                tx.open_table(UNDECIDED_PROPOSAL_ATTESTATIONS_TABLE)?
+                    .insert(key, bytes.clone())?;
+                inserted_rows += 1;
+                inserted_bytes += bytes.len() as u64;
+            }
+        }
+
+        if inserted_rows > 0 {
+            tx.commit()?;
+            self.metrics.observe_write_time(start.elapsed());
+            self.metrics.add_writes(inserted_rows, inserted_bytes);
+        }
+        Ok(UndecidedWriteOutcome::Canonical(authoritative))
+    }
+
+    #[cfg(test)]
     fn insert_undecided_proposal(
         &self,
         proposal: ProposedValue<EmeraldContext>,
     ) -> Result<(), StoreError> {
-        let start = Instant::now();
-
-        let key = (proposal.height, proposal.round, proposal.value.id());
-
+        let key = Self::proposal_key(&proposal);
+        let full = ProtobufCodec.encode(&proposal)?.to_vec();
+        let compact = StoredProposalMetadata::from_proposal(&proposal)
+            .encode()?
+            .to_vec();
         let tx = self.db.begin_write()?;
-        let existing_legacy = {
-            let table = tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)?;
-            let value = table.get(&key)?.map(|value| value.value());
-            value
-        };
-        let existing_compact = {
-            let table = tx.open_table(UNDECIDED_PROPOSALS_TABLE)?;
-            let value = table.get(&key)?.map(|value| value.value());
-            value
-        };
-
-        // Keep the first accepted proposal authoritative for this key. Restream preparation may later try to
-        // persist locally reconstructed metadata for the same value; overwriting the original proposer would
-        // violate the proposer identity expected by consensus.
-        let authoritative = if let Some(encoded) = existing_legacy.as_ref() {
-            self.decode_full_stored_proposal(key, Bytes::copy_from_slice(encoded))?
-        } else if let Some(encoded) = existing_compact.as_ref() {
-            decode_stored_proposal(Bytes::copy_from_slice(encoded))
-                .map_err(|_| {
-                    Self::irrecoverable_undecided_proposal(
-                        key,
-                        "stored proposal metadata cannot be decoded",
-                    )
-                })?
-                .hydrate_verified(key, proposal.value.extensions)
-                .map_err(|reason| Self::irrecoverable_undecided_proposal(key, reason))?
-        } else {
-            proposal
-        };
-        let legacy = ProtobufCodec.encode(&authoritative)?;
-        let compact = StoredProposalMetadata::from_proposal(&authoritative).encode()?;
-
-        if let Some(encoded) = existing_compact.as_ref() {
-            let existing = decode_stored_proposal(Bytes::copy_from_slice(encoded))
-                .map_err(|_| {
-                    Self::irrecoverable_undecided_proposal(
-                        key,
-                        "stored proposal metadata cannot be decoded",
-                    )
-                })?
-                .hydrate_verified(key, authoritative.value.extensions.clone())
-                .map_err(|reason| Self::irrecoverable_undecided_proposal(key, reason))?;
-            if existing != authoritative {
-                return Err(Self::irrecoverable_undecided_proposal(
-                    key,
-                    "proposal representations disagree",
-                ));
-            }
-        }
-
-        let mut inserted_rows = 0;
-        let mut inserted_bytes = 0;
-        if existing_legacy.is_none() {
+        if tx
+            .open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)?
+            .get(&key)?
+            .is_none()
+        {
             tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)?
-                .insert(key, legacy.to_vec())?;
-            inserted_rows += 1;
-            inserted_bytes += legacy.len() as u64;
+                .insert(key, full)?;
         }
-        if existing_compact.is_none() {
+        if tx
+            .open_table(UNDECIDED_PROPOSALS_TABLE)?
+            .get(&key)?
+            .is_none()
+        {
             tx.open_table(UNDECIDED_PROPOSALS_TABLE)?
-                .insert(key, compact.to_vec())?;
-            inserted_rows += 1;
-            inserted_bytes += compact.len() as u64;
-        }
-
-        if inserted_rows == 0 {
-            return Ok(());
+                .insert(key, compact)?;
         }
         tx.commit()?;
-
-        self.metrics.observe_write_time(start.elapsed());
-        self.metrics.add_writes(inserted_rows, inserted_bytes);
-
         Ok(())
-    }
-
-    fn hydrate_stored_proposal(
-        &self,
-        tx: &redb::ReadTransaction,
-        key: (Height, Round, ValueId),
-        encoded: Bytes,
-    ) -> Result<ProposedValue<EmeraldContext>, StoreError> {
-        let decoded = decode_stored_proposal(encoded).map_err(|_| {
-            Self::irrecoverable_undecided_proposal(
-                key,
-                "stored proposal metadata cannot be decoded",
-            )
-        })?;
-
-        let payload = self.resolve_undecided_payload(tx, key)?;
-        decoded
-            .hydrate_verified(key, payload)
-            .map_err(|reason| Self::irrecoverable_undecided_proposal(key, reason))
     }
 
     fn resolve_undecided_payload(
@@ -898,6 +1129,10 @@ impl Db {
                 tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
             legacy_undecided_block_data.retain(|k, _| k.0 >= block_data_retain_height)?;
 
+            let mut undecided_attestations =
+                tx.open_table(UNDECIDED_PROPOSAL_ATTESTATIONS_TABLE)?;
+            undecided_attestations.retain(|k, _| k.0 >= block_data_retain_height)?;
+
             // Remove all pending proposal parts with height < retain_height
             let mut pending = tx.open_table(PENDING_PROPOSAL_PARTS_TABLE)?;
             pending.retain(|k, _| k.0 >= block_data_retain_height)?;
@@ -993,6 +1228,7 @@ impl Db {
             let _ = tx.open_table(DECIDED_BLOCK_DATA_TABLE)?;
             let _ = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
             let _ = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
+            let _ = tx.open_table(UNDECIDED_PROPOSAL_ATTESTATIONS_TABLE)?;
             let _ = tx.open_table(DECIDED_BLOCK_HEADERS_TABLE)?;
             let _ = tx.open_table(PERSISTENT_METRICS_TABLE)?;
             let _ = tx.open_table(PENDING_PROPOSAL_PARTS_TABLE)?;
@@ -1887,12 +2123,32 @@ impl Store {
 
     /// Stores an undecided proposal.
     /// Called by the application when receiving new proposals from peers.
-    pub async fn store_undecided_proposal(
+    #[cfg(test)]
+    pub(crate) async fn store_undecided_proposal(
         &self,
         value: ProposedValue<EmeraldContext>,
     ) -> Result<(), StoreError> {
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || db.insert_undecided_proposal(value)).await?
+    }
+
+    pub async fn write_undecided_proposal(
+        &self,
+        write: UndecidedProposalWrite,
+    ) -> Result<UndecidedWriteOutcome, StoreError> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || db.write_undecided_proposal(write)).await?
+    }
+
+    pub async fn get_undecided_record(
+        &self,
+        height: Height,
+        round: Round,
+        value_id: ValueId,
+    ) -> Result<Option<StoredUndecidedProposal>, StoreError> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || db.get_undecided_record(height, round, value_id))
+            .await?
     }
 
     /// Retrieves a specific undecided proposal by height, round, and value ID.
@@ -2089,11 +2345,200 @@ impl Store {
 mod tests {
     use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3};
     use malachitebft_app_channel::app::types::core::{CommitCertificate, Validity};
-    use malachitebft_eth_types::Address;
+    use malachitebft_eth_types::secp256k1::PrivateKey;
+    use malachitebft_eth_types::{Address, ProposalFin, ProposalInit};
     use ssz::{Decode, Encode};
 
     use super::*;
     use crate::payload::extract_block_header;
+
+    fn make_aggregate_write(height: u64, round: u32, payload: Bytes) -> UndecidedProposalWrite {
+        UndecidedProposalWrite {
+            proposal: ProposedValue {
+                height: Height::new(height),
+                round: Round::new(round),
+                valid_round: Round::Nil,
+                proposer: Address::new([7; 20]),
+                value: Value::new(payload.clone()),
+                validity: Validity::Valid,
+            },
+            payload,
+            attestation: None,
+            source: UndecidedWriteSource::Proposal,
+        }
+    }
+
+    fn make_attested_aggregate_write(height: u64, round: u32) -> UndecidedProposalWrite {
+        let key = PrivateKey::from_slice(&[height as u8; 32]).unwrap();
+        let payload = Bytes::from(vec![height as u8; 10]);
+        let mut write = make_aggregate_write(height, round, payload);
+        write.proposal.proposer = Address::from_public_key(&key.public_key());
+        write.attestation = Some(ProposalAttestation::new(
+            ProposalInit::new(
+                write.proposal.height,
+                write.proposal.round,
+                write.proposal.valid_round,
+                write.proposal.proposer,
+            ),
+            ProposalFin::new(key.sign(b"store-attestation")),
+        ));
+        write
+    }
+
+    #[test]
+    fn aggregate_writes_share_payload_across_rounds() {
+        let (db, _dir) = create_test_db("aggregate_shared_payload");
+        let payload = Bytes::from_static(b"same payload");
+        let first = make_aggregate_write(42, 1, payload.clone());
+        let second = make_aggregate_write(42, 2, payload);
+
+        db.write_undecided_proposal(first).unwrap();
+        db.write_undecided_proposal(second.clone()).unwrap();
+
+        assert_eq!(db.undecided_block_data_len().unwrap(), 1);
+        assert_eq!(
+            db.get_undecided_record(
+                second.proposal.height,
+                second.proposal.round,
+                second.proposal.value.id(),
+            )
+            .unwrap()
+            .unwrap()
+            .proposal,
+            second.proposal
+        );
+    }
+
+    #[test]
+    fn aggregate_write_rejects_shared_payload_collision_without_overwrite() {
+        let (db, _dir) = create_test_db("aggregate_payload_collision");
+        let first = make_aggregate_write(43, 1, Bytes::from_static(b"canonical"));
+        let mut colliding = make_aggregate_write(43, 2, Bytes::from_static(b"conflict"));
+        colliding.proposal.value.value = first.proposal.value.id().as_u64();
+
+        db.write_undecided_proposal(first.clone()).unwrap();
+        let error = db
+            .write_undecided_proposal(colliding)
+            .expect_err("a shared payload must never be replaced by colliding bytes");
+
+        assert!(matches!(
+            error,
+            StoreError::ConflictingUndecidedBlockData { .. }
+        ));
+        assert_eq!(
+            db.get_undecided_block_data(
+                first.proposal.height,
+                first.proposal.round,
+                first.proposal.value.id(),
+            )
+            .unwrap(),
+            Some(first.payload)
+        );
+        assert_eq!(db.undecided_block_data_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn aggregate_write_persists_and_reads_attestation_atomically() {
+        let (db, _dir) = create_test_db("aggregate_attestation");
+        let write = make_attested_aggregate_write(44, 3);
+
+        db.write_undecided_proposal(write.clone()).unwrap();
+
+        let stored = db
+            .get_undecided_record(
+                write.proposal.height,
+                write.proposal.round,
+                write.proposal.value.id(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.proposal, write.proposal);
+        assert_eq!(stored.payload, write.payload);
+        assert_eq!(stored.attestation, write.attestation);
+    }
+
+    #[test]
+    fn candidate_scan_rejects_orphan_attestation() {
+        let (db, _dir) = create_test_db("orphan_attestation");
+        let write = make_attested_aggregate_write(45, 2);
+        let key = Db::proposal_key(&write.proposal);
+        let encoded = ProtobufCodec
+            .encode(write.attestation.as_ref().unwrap())
+            .unwrap();
+        let tx = db.db.begin_write().unwrap();
+        tx.open_table(UNDECIDED_PROPOSAL_ATTESTATIONS_TABLE)
+            .unwrap()
+            .insert(key, encoded.to_vec())
+            .unwrap();
+        tx.commit().unwrap();
+
+        let error = db
+            .get_undecided_proposals(write.proposal.height, write.proposal.round)
+            .unwrap_err();
+        assert!(matches!(error, StoreError::Integrity(_)));
+    }
+
+    #[test]
+    fn pr21_attested_rows_survive_deduplication_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::new(
+            dir.path().join("pr21_attested_migration.redb"),
+            1024 * 1024,
+            DbMetrics::new(),
+        )
+        .unwrap();
+        let write = make_attested_aggregate_write(46, 4);
+        let key = Db::proposal_key(&write.proposal);
+        let proposal = ProtobufCodec.encode(&write.proposal).unwrap();
+        let attestation = ProtobufCodec
+            .encode(write.attestation.as_ref().unwrap())
+            .unwrap();
+        let tx = db.db.begin_write().unwrap();
+        tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)
+            .unwrap()
+            .insert(key, proposal.to_vec())
+            .unwrap();
+        tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)
+            .unwrap()
+            .insert(key, write.payload.to_vec())
+            .unwrap();
+        tx.open_table(UNDECIDED_PROPOSAL_ATTESTATIONS_TABLE)
+            .unwrap()
+            .insert(key, attestation.to_vec())
+            .unwrap();
+        tx.commit().unwrap();
+
+        db.initialize_schema().unwrap();
+
+        let stored = db
+            .get_undecided_record(key.0, key.1, key.2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.proposal, write.proposal);
+        assert_eq!(stored.payload, write.payload);
+        assert_eq!(stored.attestation, write.attestation);
+        assert_eq!(db.undecided_block_data_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn prune_removes_attestations_at_the_undecided_retention_boundary() {
+        let (db, _dir) = create_test_db("prune_attestations");
+        let expired = make_attested_aggregate_write(1, 0);
+        let retained = make_attested_aggregate_write(4, 0);
+        let expired_key = Db::proposal_key(&expired.proposal);
+        let retained_key = Db::proposal_key(&retained.proposal);
+        db.write_undecided_proposal(expired).unwrap();
+        db.write_undecided_proposal(retained).unwrap();
+
+        db.prune(2, 1, Height::new(4), false).unwrap();
+
+        let tx = db.db.begin_read().unwrap();
+        let table = tx
+            .open_table(UNDECIDED_PROPOSAL_ATTESTATIONS_TABLE)
+            .unwrap();
+        assert!(table.get(expired_key).unwrap().is_none());
+        assert!(table.get(retained_key).unwrap().is_some());
+    }
 
     /// Create a test database backed by a temporary directory.
     /// Returns both the Db and the TempDir (must be kept alive for the DB to remain valid).
@@ -2197,6 +2642,7 @@ mod tests {
 
         assert!(has_table(&db, "undecided_values"));
         assert!(has_table(&db, "undecided_values_v2"));
+        assert!(has_table(&db, "undecided_proposal_attestations"));
         assert!(has_table(&db, "storage_schema_metadata"));
     }
 

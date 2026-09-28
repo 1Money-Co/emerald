@@ -85,6 +85,7 @@ module emerald_types {
     | ConsensusReadyAction({ node: Node })
     | StartedRoundAction({ node: Node, height: Height, round: Round, proposer: Node })
     | GetValueAction({ node: Node, height: Height, round: Round, proposal: Proposal })
+    | RestreamProposalAction({ node: Node, source_proposal: Proposal, proposal: Proposal })
     | ReceivedProposalAction({ node: Node, proposal: Proposal })
     | DecidedAction({ node: Node, proposal: Proposal })
     | ProcessSyncedValueAction({ node: Node, proposal: Proposal })
@@ -112,6 +113,9 @@ module emerald_types {
     // Consensus state
     consensus_height: Height,
     consensus_round: Round,
+    // Proposal-producing request handled by this process. This state is
+    // transient across restarts, unlike persisted proposals.
+    handled_proposal_request: Option[(Height, Round)],
     // Last committed block
     last_decided_height: Height,
     last_decided_payload: Option[Payload],

@@ -1,9 +1,11 @@
-use crate::{KeyProvider, KeyProviderError};
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 use base64::Engine as _;
-use std::path::PathBuf;
 use tracing::info;
 use zeroize::Zeroizing;
+
+use crate::{KeyProvider, KeyProviderError};
 
 pub struct FileKeyProvider {
     pub path: PathBuf,

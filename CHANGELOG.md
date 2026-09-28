@@ -24,6 +24,8 @@ We want to thank Noble for their contribution in turning Emerald into a library.
 
 ### FIXES
 
+- `[consensus]` Preserve proposer-signed proposal envelopes during hidden-lock and restart recovery
+  ([issue #317](https://github.com/1Money-Co/1money-interoperability-protocol/issues/317))
 - `[engine]` Use `ExecutionPayloadEnvelopeV4` for Prague instead of `ExecutionPayloadEnvelopeV3` ([#173](https://github.com/informalsystems/emerald/issues/173))
 - `[state/app]` Validator set state is now height-related and can raise a new error when the validator set for a given height is not found in the application state ([#142](https://github.com/informalsystems/emerald/pull/142))
 
@@ -39,4 +41,3 @@ We want to thank Noble for their contribution in turning Emerald into a library.
 - Reth is forced to persist every block ([#125](https://github.com/informalsystems/emerald/pull/125))
 - Reth validation is adapted to accept multiple blocks with the same timestamp ([#109](https://github.com/informalsystems/emerald/issues/109))
 - Use secp256k1 for signing ([#36](https://github.com/informalsystems/emerald/issues/36))
-

@@ -22,42 +22,48 @@ use crate::validator_manager::types::{ValidatorKey, ValidatorSet};
 pub const OWNABLE_NAMESPACE: &str = "openzeppelin.storage.Ownable";
 
 /// Pre-computed ERC-7201 slot for OwnableUpgradeable (OZ 5.4.0).
-pub const OWNABLE_SLOT: B256 =
-    B256::new(hex!("9016d09d72d40fdae2fd8ceac6b6234c7706214fd39c1cd1e609a0528c199300"));
+pub const OWNABLE_SLOT: B256 = B256::new(hex!(
+    "9016d09d72d40fdae2fd8ceac6b6234c7706214fd39c1cd1e609a0528c199300"
+));
 
 /// Namespace identifier for ReentrancyGuardUpgradeable storage.
 pub const REENTRANCY_GUARD_NAMESPACE: &str = "openzeppelin.storage.ReentrancyGuard";
 
 /// Pre-computed ERC-7201 slot for ReentrancyGuardUpgradeable (OZ 5.4.0).
-pub const REENTRANCY_GUARD_SLOT: B256 =
-    B256::new(hex!("9b779b17422d0df92223018b32b4d1fa46e071723d6817e2486d003becc55f00"));
+pub const REENTRANCY_GUARD_SLOT: B256 = B256::new(hex!(
+    "9b779b17422d0df92223018b32b4d1fa46e071723d6817e2486d003becc55f00"
+));
 
 /// Namespace identifier for Initializable storage.
 pub const INITIALIZABLE_NAMESPACE: &str = "openzeppelin.storage.Initializable";
 
 /// Pre-computed ERC-7201 slot for Initializable (OZ 5.4.0).
-pub const INITIALIZABLE_SLOT: B256 =
-    B256::new(hex!("f0c57e16840df040f15088dc2f81fe391c3923bec73e23a9662efc9c229c6a00"));
+pub const INITIALIZABLE_SLOT: B256 = B256::new(hex!(
+    "f0c57e16840df040f15088dc2f81fe391c3923bec73e23a9662efc9c229c6a00"
+));
 
 /// Namespace identifier for AccessControlUpgradeable storage.
 pub const ACCESS_CONTROL_NAMESPACE: &str = "openzeppelin.storage.AccessControl";
 
 /// Pre-computed ERC-7201 slot for AccessControlUpgradeable (OZ 5.4.0).
 /// Layout: `mapping(bytes32 role => RoleData) _roles` at this base slot.
-pub const ACCESS_CONTROL_SLOT: B256 =
-    B256::new(hex!("02dd7bc7dec4dceedda775e58dd541e08a116c6c53815c0bd028192f7b626800"));
+pub const ACCESS_CONTROL_SLOT: B256 = B256::new(hex!(
+    "02dd7bc7dec4dceedda775e58dd541e08a116c6c53815c0bd028192f7b626800"
+));
 
 /// `keccak256("VALIDATOR_MANAGER_ROLE")` — matches the Solidity constant.
-pub const VALIDATOR_MANAGER_ROLE: B256 =
-    B256::new(hex!("87421e189bd94dc1673f0d5255fa9f0cb8ff65bb74e34e0a80b07e9f0b4e34d5"));
+pub const VALIDATOR_MANAGER_ROLE: B256 = B256::new(hex!(
+    "87421e189bd94dc1673f0d5255fa9f0cb8ff65bb74e34e0a80b07e9f0b4e34d5"
+));
 
 // ---------------------------------------------------------------------------
 // EIP-1967 proxy slots
 // ---------------------------------------------------------------------------
 
 /// EIP-1967 implementation slot: `bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1)`
-pub const EIP1967_IMPL_SLOT: B256 =
-    B256::new(hex!("360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"));
+pub const EIP1967_IMPL_SLOT: B256 = B256::new(hex!(
+    "360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+));
 
 // ---------------------------------------------------------------------------
 // ERC-7201 computation

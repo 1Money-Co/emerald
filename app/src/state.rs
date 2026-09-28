@@ -20,8 +20,8 @@ use malachitebft_eth_engine::json_structures::ExecutionBlock;
 use malachitebft_eth_types::codec::proto::ProtobufCodec;
 use malachitebft_eth_types::secp256k1::K256Provider;
 use malachitebft_eth_types::{
-    Address, BlockTimestamp, EmeraldContext, Genesis, Height, ProposalData, ProposalFin,
-    ProposalInit, ProposalPart, RetryConfig, ValidatorSet, Value, ValueId,
+    Address, BlockTimestamp, EmeraldContext, Genesis, Height, ProposalAttestation, ProposalData,
+    ProposalFin, ProposalInit, ProposalPart, RetryConfig, ValidatorSet, Value, ValueId,
 };
 use malachitebft_proto::Error as ProtoError;
 use rand::rngs::StdRng;
@@ -33,7 +33,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::metrics::Metrics;
 use crate::payload::{extract_block_header, validate_execution_payload, ValidatedPayloadCache};
-use crate::store::{Store, StoreError};
+use crate::store::{
+    Store, StoreError, UndecidedProposalWrite, UndecidedWriteOutcome, UndecidedWriteSource,
+};
 use crate::streaming::{PartStreamsMap, ProposalParts};
 
 pub struct StateMetrics {
@@ -41,6 +43,24 @@ pub struct StateMetrics {
     pub chain_bytes: u64,
     pub elapsed_seconds: u64,
     pub metrics: Metrics,
+}
+
+pub enum AttestedReplay {
+    Ready(Vec<ProposalPart>),
+    Absent,
+    IdentityMismatch { stored_init: ProposalInit },
+}
+
+pub enum PreviouslyBuiltValue {
+    Absent,
+    Reusable {
+        proposal: LocallyProposedValue<EmeraldContext>,
+        valid_round: Round,
+    },
+    UnsafeCandidates {
+        candidate_count: usize,
+        has_non_local_proposer: bool,
+    },
 }
 
 /// Size of randomly generated blocks in bytes
@@ -457,13 +477,20 @@ impl State {
             return Ok(None);
         }
 
-        // Store as undecided
+        // Store the verified proposal and its authenticated wire evidence atomically.
         info!(%value.height, %value.round, %value.proposer, "Storing validated proposal as undecided");
-        if !self.store_peer_undecided_value(&value, data).await? {
-            return Ok(None);
-        }
-
-        Ok(Some(value))
+        let attestation = ProposalAttestation {
+            init: parts
+                .init()
+                .cloned()
+                .expect("complete proposal has init part"),
+            fin: parts
+                .fin()
+                .cloned()
+                .expect("complete proposal has fin part"),
+        };
+        self.store_peer_undecided_value(&value, data, Some(attestation))
+            .await
     }
 
     /// Reassembles proposal parts from streamed messages.
@@ -524,49 +551,68 @@ impl State {
             .await
     }
 
-    /// Stores an undecided proposal along with its block data.
-    ///
-    /// WARN: The order of the two storage operations is important.
-    /// Block data must be stored before the proposal metadata to prevent crashes from
-    /// leaving a proposal that references non-existent block data. If a crash occurs
-    /// between the operations, orphaned block data is safe, but a dangling proposal
-    /// reference would cause retrieval failures.
+    /// Stores an unattested undecided proposal through the atomic aggregate boundary.
     pub async fn store_undecided_value(
         &self,
         value: &ProposedValue<EmeraldContext>,
         data: Bytes,
     ) -> eyre::Result<()> {
-        self.store
-            .store_undecided_block_data(value.height, value.round, value.value.id(), data)
-            .await?;
-        self.store.store_undecided_proposal(value.clone()).await?;
-        Ok(())
+        match self
+            .store
+            .write_undecided_proposal(UndecidedProposalWrite {
+                proposal: value.clone(),
+                payload: data,
+                attestation: None,
+                source: UndecidedWriteSource::Proposal,
+            })
+            .await?
+        {
+            UndecidedWriteOutcome::Canonical(_) => Ok(()),
+            UndecidedWriteOutcome::Conflict(conflict) => Err(eyre::eyre!(
+                "undecided proposal conflict at height {}, round {}, field {:?}",
+                value.height,
+                value.round,
+                conflict.field,
+            )),
+        }
     }
 
-    /// Stores a value received from a peer, rejecting a conflicting payload without
-    /// converting untrusted input into a fatal application error.
     pub(crate) async fn store_peer_undecided_value(
         &self,
         value: &ProposedValue<EmeraldContext>,
         data: Bytes,
-    ) -> eyre::Result<bool> {
-        match self.store_undecided_value(value, data).await {
-            Ok(()) => Ok(true),
-            Err(error)
-                if matches!(
-                    error.downcast_ref::<StoreError>(),
-                    Some(StoreError::ConflictingUndecidedBlockData { .. })
-                ) =>
-            {
+        attestation: Option<ProposalAttestation>,
+    ) -> eyre::Result<Option<ProposedValue<EmeraldContext>>> {
+        match self
+            .store
+            .write_undecided_proposal(UndecidedProposalWrite {
+                proposal: value.clone(),
+                payload: data,
+                attestation,
+                source: UndecidedWriteSource::Proposal,
+            })
+            .await
+        {
+            Ok(UndecidedWriteOutcome::Canonical(value)) => Ok(Some(value)),
+            Ok(UndecidedWriteOutcome::Conflict(conflict)) => {
+                warn!(
+                    height = %value.height,
+                    round = %value.round,
+                    field = ?conflict.field,
+                    "Rejecting conflicting peer proposal"
+                );
+                Ok(None)
+            }
+            Err(StoreError::ConflictingUndecidedBlockData { .. }) => {
                 warn!(
                     height = %value.height,
                     round = %value.round,
                     value = %value.value.id(),
-                    "Rejecting peer value with conflicting block data"
+                    "Rejecting peer proposal with colliding shared payload"
                 );
-                Ok(false)
+                Ok(None)
             }
-            Err(error) => Err(error),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -630,7 +676,10 @@ impl State {
             .await?;
 
         let prune_certificates = self.emerald_config.num_certificates_to_retain != u64::MAX
-            && certificate.height.as_u64() % self.emerald_config.prune_at_block_interval == 0;
+            && certificate
+                .height
+                .as_u64()
+                .is_multiple_of(self.emerald_config.prune_at_block_interval);
 
         // If storege becomes a bottleneck, consider optimizing this by pruning every INTERVAL heights
         let prune_result = self
@@ -667,29 +716,36 @@ impl State {
     }
 
     /// Retrieves a previously built proposal value for the given height and round.
-    /// Called by the consensus engine to re-use a previously built value.
-    /// There should be at most one proposal for a given height and round when the proposer is not byzantine.
-    /// We assume this implementation is not byzantine and we are the proposer for the given height and round.
-    /// Therefore there must be a single proposal for the rounds where we are the proposer, with the proposer address matching our own.
+    /// Exactly one locally authored proposal can be reused.
     pub async fn get_previously_built_value(
         &self,
         height: Height,
         round: Round,
-    ) -> eyre::Result<Option<LocallyProposedValue<EmeraldContext>>> {
+    ) -> eyre::Result<PreviouslyBuiltValue> {
         let proposals: Vec<ProposedValue<EmeraldContext>> =
             self.store.get_undecided_proposals(height, round).await?;
 
-        assert!(
-            proposals.len() <= 1,
-            "There should be at most one proposal for a given height and round"
-        );
-
-        proposals
-            .first()
-            .map(|p| LocallyProposedValue::new(p.height, p.round, p.value.clone()))
-            .map(Some)
-            .map(Ok)
-            .unwrap_or(Ok(None))
+        if proposals.is_empty() {
+            return Ok(PreviouslyBuiltValue::Absent);
+        }
+        let has_non_local_proposer = proposals
+            .iter()
+            .any(|proposal| proposal.proposer != self.address);
+        if proposals.len() != 1 || has_non_local_proposer {
+            return Ok(PreviouslyBuiltValue::UnsafeCandidates {
+                candidate_count: proposals.len(),
+                has_non_local_proposer,
+            });
+        }
+        let proposal = &proposals[0];
+        Ok(PreviouslyBuiltValue::Reusable {
+            proposal: LocallyProposedValue::new(
+                proposal.height,
+                proposal.round,
+                proposal.value.clone(),
+            ),
+            valid_round: proposal.valid_round,
+        })
     }
 
     /// Prepares a stored proposal for restreaming and records the re-proposal at the current round.
@@ -740,6 +796,57 @@ impl State {
         )))
     }
 
+    pub async fn prepare_attested_replay(
+        &self,
+        height: Height,
+        round: Round,
+        valid_round: Round,
+        address: Address,
+        value_id: ValueId,
+    ) -> eyre::Result<AttestedReplay> {
+        let Some(record) = self
+            .store
+            .get_undecided_record(height, round, value_id)
+            .await?
+        else {
+            return Ok(AttestedReplay::Absent);
+        };
+        let Some(attestation) = record.attestation else {
+            return Ok(AttestedReplay::Absent);
+        };
+        let identity_matches = attestation.init.height == height
+            && attestation.init.round == round
+            && attestation.init.pol_round == valid_round
+            && attestation.init.proposer == address
+            && record.proposal.value.id() == value_id;
+        if !identity_matches {
+            return Ok(AttestedReplay::IdentityMismatch {
+                stored_init: attestation.init,
+            });
+        }
+
+        let mut parts = Vec::with_capacity(record.payload.chunks(CHUNK_SIZE).len() + 2);
+        parts.push(ProposalPart::Init(attestation.init));
+        for start in (0..record.payload.len()).step_by(CHUNK_SIZE) {
+            let end = (start + CHUNK_SIZE).min(record.payload.len());
+            parts.push(ProposalPart::Data(ProposalData::new(
+                record.payload.slice(start..end),
+            )));
+        }
+        parts.push(ProposalPart::Fin(attestation.fin));
+        let proposal_parts = ProposalParts {
+            height,
+            round,
+            proposer: address,
+            parts,
+        };
+        self.verify_proposal_parts_signature(&proposal_parts)
+            .map_err(|error| eyre::eyre!(
+                "invalid stored proposal attestation at height {height}, round {round}, value {value_id}: {error:?}"
+            ))?;
+        Ok(AttestedReplay::Ready(proposal_parts.parts))
+    }
+
     // /// Make up a new value to propose
     // /// A real application would have a more complex logic here,
     // /// typically reaping transactions from a mempool and executing them against its state,
@@ -756,43 +863,30 @@ impl State {
         Bytes::from(random_bytes)
     }
 
-    /// Creates a new proposal value for the given height
-    /// Returns either a previously built proposal or creates a new one
-    pub async fn propose_value(
+    /// Builds, authenticates, and atomically persists a fresh local proposal before returning it.
+    pub async fn prepare_local_proposal(
         &mut self,
         height: Height,
         round: Round,
         data: Bytes,
-    ) -> eyre::Result<LocallyProposedValue<EmeraldContext>> {
+    ) -> eyre::Result<(
+        LocallyProposedValue<EmeraldContext>,
+        Vec<StreamMessage<ProposalPart>>,
+    )> {
         assert_eq!(height, self.consensus_height);
         assert_eq!(round, self.consensus_round);
 
-        // We create a new value.
-        let value = Value::new(data.clone());
-
-        let proposal: ProposedValue<EmeraldContext> = ProposedValue {
-            height,
-            round,
-            valid_round: Round::Nil,
-            proposer: self.address, // We are the proposer
-            value,
-            validity: Validity::Valid, // Our proposals are de facto valid
-        };
-
-        // Store the proposal and its block data
-        self.store_undecided_value(&proposal, data).await?;
-
-        Ok(LocallyProposedValue::new(
-            proposal.height,
-            proposal.round,
-            proposal.value,
-        ))
+        let proposal = LocallyProposedValue::new(height, round, Value::new(data.clone()));
+        let messages = self
+            .stream_proposal(proposal.clone(), data, Round::Nil)
+            .await?;
+        Ok((proposal, messages))
     }
 
-    fn stream_id(&mut self) -> StreamId {
+    fn stream_id(&mut self, height: Height, round: Round) -> StreamId {
         let mut bytes = Vec::with_capacity(size_of::<u64>() + size_of::<u32>());
-        bytes.extend_from_slice(&self.consensus_height.as_u64().to_be_bytes());
-        bytes.extend_from_slice(&self.consensus_round.as_u32().unwrap().to_be_bytes());
+        bytes.extend_from_slice(&height.as_u64().to_be_bytes());
+        bytes.extend_from_slice(&round.as_u32().unwrap().to_be_bytes());
         bytes.extend_from_slice(&self.stream_nonce.to_be_bytes());
         self.stream_nonce += 1;
         StreamId::new(bytes.into())
@@ -800,15 +894,60 @@ impl State {
 
     /// Creates a stream message containing a proposal part.
     /// Updates internal sequence number and current proposal.
-    pub fn stream_proposal(
+    pub async fn stream_proposal(
         &mut self,
         value: LocallyProposedValue<EmeraldContext>,
         data: Bytes,
         pol_round: Round,
-    ) -> impl Iterator<Item = StreamMessage<ProposalPart>> {
-        let parts = self.make_proposal_parts(value, data, pol_round);
+    ) -> eyre::Result<Vec<StreamMessage<ProposalPart>>> {
+        let parts = self.make_proposal_parts(value.clone(), data.clone(), pol_round);
+        let init = parts
+            .first()
+            .and_then(ProposalPart::as_init)
+            .expect("locally built proposal has init")
+            .clone();
+        let fin = parts
+            .last()
+            .and_then(ProposalPart::as_fin)
+            .expect("locally built proposal has fin")
+            .clone();
+        let proposal = ProposedValue {
+            height: value.height,
+            round: value.round,
+            valid_round: pol_round,
+            proposer: self.address,
+            value: value.value.clone(),
+            validity: Validity::Valid,
+        };
+        match self
+            .store
+            .write_undecided_proposal(UndecidedProposalWrite {
+                proposal,
+                payload: data,
+                attestation: Some(ProposalAttestation::new(init, fin)),
+                source: UndecidedWriteSource::Proposal,
+            })
+            .await?
+        {
+            UndecidedWriteOutcome::Canonical(_) => {
+                Ok(self.make_stream_messages(value.height, value.round, parts))
+            }
+            UndecidedWriteOutcome::Conflict(conflict) => Err(eyre::eyre!(
+                "local proposal attestation conflict at height {}, round {}, field {:?}",
+                value.height,
+                value.round,
+                conflict.field,
+            )),
+        }
+    }
 
-        let stream_id = self.stream_id();
+    pub(crate) fn make_stream_messages(
+        &mut self,
+        height: Height,
+        round: Round,
+        parts: Vec<ProposalPart>,
+    ) -> Vec<StreamMessage<ProposalPart>> {
+        let stream_id = self.stream_id(height, round);
 
         let mut msgs = Vec::with_capacity(parts.len() + 1);
         let mut sequence = 0;
@@ -820,7 +959,7 @@ impl State {
         }
 
         msgs.push(StreamMessage::new(stream_id, sequence, StreamContent::Fin));
-        msgs.into_iter()
+        msgs
     }
 
     fn make_proposal_parts(
@@ -847,10 +986,12 @@ impl State {
 
         // Data
         {
-            for chunk in data.chunks(CHUNK_SIZE) {
-                let chunk_data = ProposalData::new(Bytes::copy_from_slice(chunk));
-                parts.push(ProposalPart::Data(chunk_data));
-                hasher.update(chunk);
+            for start in (0..data.len()).step_by(CHUNK_SIZE) {
+                let end = (start + CHUNK_SIZE).min(data.len());
+                hasher.update(&data[start..end]);
+                parts.push(ProposalPart::Data(ProposalData::new(
+                    data.slice(start..end),
+                )));
             }
         }
 
@@ -1097,7 +1238,7 @@ jwt_token_path = "./assets/jwt.hex"
     }
 
     #[tokio::test]
-    async fn restream_proposal_stores_reproposal_at_current_round() {
+    async fn foreign_unattested_restream_does_not_create_local_reproposal() {
         let (mut state, _dir) = make_test_state().await;
         let height = Height::new(1426);
         let proposal_round = Round::new(0);
@@ -1136,51 +1277,16 @@ jwt_token_path = "./assets/jwt.hex"
         .await
         .unwrap();
 
-        let current_round_proposal = state
+        assert!(state
             .store
             .get_undecided_proposal(height, current_round, value.id())
             .await
             .unwrap()
-            .expect("restreamed proposal must be stored at the current round");
-        assert_eq!(current_round_proposal.height, height);
-        assert_eq!(current_round_proposal.round, current_round);
-        assert_eq!(current_round_proposal.valid_round, proposal_round);
-        assert_eq!(current_round_proposal.proposer, state.address);
-        assert_eq!(current_round_proposal.value, value);
-
-        let current_round_bytes = state
-            .store
-            .get_undecided_block_data(height, current_round, value.id())
-            .await
-            .unwrap()
-            .expect("restreamed block data must be stored at the current round");
-        assert_eq!(current_round_bytes, bytes);
-
-        let round_two = Round::new(2);
-        let (round_two_value, round_two_bytes) = state
-            .prepare_restream_proposal(height, proposal_round, round_two, value.id())
-            .await
-            .unwrap()
-            .expect("round-two restream must reuse the stored value");
-        assert_eq!(round_two_value.round, round_two);
-        assert_eq!(round_two_bytes, bytes);
-        for round in [proposal_round, current_round, round_two] {
-            assert!(state
-                .store
-                .get_undecided_proposal(height, round, value.id())
-                .await
-                .unwrap()
-                .is_some());
-        }
+            .is_none());
         assert_eq!(state.store.undecided_block_data_len().await.unwrap(), 1);
 
         drop(channels);
-        let init = proposal_init.await.unwrap();
-
-        assert_eq!(init.height, height);
-        assert_eq!(init.round, current_round);
-        assert_eq!(init.pol_round, proposal_round);
-        assert_eq!(init.proposer, state.address);
+        proposal_init.abort();
     }
 
     #[tokio::test]
@@ -1512,11 +1618,12 @@ jwt_token_path = "./assets/jwt.hex"
             .store_peer_undecided_value(
                 &conflicting_proposal,
                 Bytes::from_static(b"conflicting-peer-payload"),
+                None,
             )
             .await
             .unwrap();
 
-        assert!(!stored);
+        assert!(stored.is_none());
         assert_eq!(
             state
                 .store

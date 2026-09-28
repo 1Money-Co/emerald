@@ -1,5 +1,6 @@
 use core::str::FromStr;
-use std::{fs, path::Path};
+use std::fs;
+use std::path::Path;
 
 use alloy_genesis::Genesis;
 use alloy_network::EthereumWallet;

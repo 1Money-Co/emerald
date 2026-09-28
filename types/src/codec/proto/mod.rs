@@ -14,7 +14,7 @@ use prost::Message;
 use crate::secp256k1::Signature;
 use crate::{
     decode_votetype, encode_votetype, proto, Address, EmeraldContext, Height, Proposal,
-    ProposalPart, Value, ValueId, Vote,
+    ProposalAttestation, ProposalPart, Value, ValueId, Vote,
 };
 
 #[derive(Copy, Clone, Debug)]
@@ -40,6 +40,18 @@ impl Codec<ProposalPart> for ProtobufCodec {
     }
 
     fn encode(&self, msg: &ProposalPart) -> Result<Bytes, Self::Error> {
+        Protobuf::to_bytes(msg)
+    }
+}
+
+impl Codec<ProposalAttestation> for ProtobufCodec {
+    type Error = ProtoError;
+
+    fn decode(&self, bytes: Bytes) -> Result<ProposalAttestation, Self::Error> {
+        Protobuf::from_bytes(&bytes)
+    }
+
+    fn encode(&self, msg: &ProposalAttestation) -> Result<Bytes, Self::Error> {
         Protobuf::to_bytes(msg)
     }
 }

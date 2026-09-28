@@ -3129,6 +3129,8 @@ dependencies = [
  "hex",
  "humantime-serde",
  "informalsystems-malachitebft-app-channel",
+ "informalsystems-malachitebft-core-consensus",
+ "informalsystems-malachitebft-metrics",
  "informalsystems-malachitebft-proto",
  "k256",
  "key-provider",

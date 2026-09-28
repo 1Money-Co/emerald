@@ -46,6 +46,7 @@ pub(crate) fn make_signers() -> Vec<PrivateKeySigner> {
     (0..10).map(make_signer).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_genesis(
     public_keys_file: &str,
     poa_address_owner: &Option<String>,

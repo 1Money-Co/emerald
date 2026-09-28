@@ -5,11 +5,12 @@ use base64::Engine as _;
 use tracing::{debug, info};
 use zeroize::Zeroizing;
 
-use crate::{config::AwsSmKmsConfig, KeyProvider, KeyProviderError};
+use crate::config::AwsSmKmsConfig;
+use crate::{KeyProvider, KeyProviderError};
 
 // Walk the std::error::Error source chain so callers see the root cause,
 // not just the outermost "dispatch failure" wrapper.
-fn full_error_chain(e: &dyn std::error::Error) -> String {
+fn full_error_chain(e: &dyn core::error::Error) -> String {
     let mut msg = e.to_string();
     let mut src = e.source();
     while let Some(cause) = src {
@@ -119,7 +120,7 @@ impl KeyProvider for AwsSmKmsKeyProvider {
             .ok_or_else(|| KeyProviderError::Kms("KMS Decrypt returned no plaintext".into()))?;
 
         // ── Step 4: plaintext is hex(32-byte-key) → parse to [u8; 32] ───────
-        let hex_str = std::str::from_utf8(plaintext_blob.as_ref())
+        let hex_str = core::str::from_utf8(plaintext_blob.as_ref())
             .map_err(|_| KeyProviderError::ParseKey("KMS plaintext is not valid UTF-8".into()))?;
 
         let key_bytes = hex::decode(hex_str.trim())

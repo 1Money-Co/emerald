@@ -70,6 +70,11 @@ message ProposalFin {
     Signature signature = 1;
 }
 
+message ProposalAttestation {
+    ProposalInit init = 1;
+    ProposalFin fin = 2;
+}
+
 message Extension {
     bytes data = 1;
     Signature signature = 2;
