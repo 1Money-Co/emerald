@@ -8,3 +8,6 @@ mod store;
 mod streaming;
 mod sync_handler;
 mod validators;
+
+#[cfg(test)]
+mod proposal_forwarding_tests;

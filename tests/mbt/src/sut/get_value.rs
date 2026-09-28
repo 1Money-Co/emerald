@@ -45,7 +45,8 @@ impl Sut {
 
         let proposal_parts = state
             .stream_proposal(emerald_proposal, block_data, EmeraldRound::Nil)
-            .collect();
+            .await
+            .map_err(|error| anyhow!("Failed to stream proposal: {error:#}"))?;
 
         hist.record_proposal(proposal, value, proposal_parts);
         Ok(())

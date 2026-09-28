@@ -20,8 +20,8 @@ use malachitebft_eth_engine::json_structures::ExecutionBlock;
 use malachitebft_eth_types::codec::proto::ProtobufCodec;
 use malachitebft_eth_types::secp256k1::K256Provider;
 use malachitebft_eth_types::{
-    Address, BlockTimestamp, EmeraldContext, Genesis, Height, ProposalData, ProposalFin,
-    ProposalInit, ProposalPart, RetryConfig, ValidatorSet, Value, ValueId,
+    Address, BlockTimestamp, EmeraldContext, Genesis, Height, ProposalAttestation, ProposalData,
+    ProposalFin, ProposalInit, ProposalPart, RetryConfig, ValidatorSet, Value, ValueId,
 };
 use malachitebft_proto::Error as ProtoError;
 use rand::rngs::StdRng;
@@ -33,7 +33,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::metrics::Metrics;
 use crate::payload::{extract_block_header, validate_execution_payload, ValidatedPayloadCache};
-use crate::store::Store;
+use crate::store::{Store, UndecidedProposalWrite, UndecidedWriteOutcome, UndecidedWriteSource};
 use crate::streaming::{PartStreamsMap, ProposalParts};
 
 pub struct StateMetrics {
@@ -41,6 +41,32 @@ pub struct StateMetrics {
     pub chain_bytes: u64,
     pub elapsed_seconds: u64,
     pub metrics: Metrics,
+}
+
+/// The safe result of looking up material requested by a `RestreamProposal` effect.
+pub enum AttestedReplay {
+    /// Re-publish the exact authenticated proposal under a fresh transport stream ID.
+    Ready(Vec<ProposalPart>),
+    /// No authenticated proposal matches the effect, so nothing may be published.
+    Absent,
+    /// An attestation exists at the requested key but does not describe the requested effect.
+    IdentityMismatch { stored_init: ProposalInit },
+}
+
+/// The safe result of looking up a value for a `GetValue` request.
+pub enum PreviouslyBuiltValue {
+    /// No proposal is stored for the requested height and round.
+    Absent,
+    /// Exactly one locally authored proposal can be reused.
+    Reusable {
+        proposal: LocallyProposedValue<EmeraldContext>,
+        valid_round: Round,
+    },
+    /// Stored candidates cannot safely be converted into a local proposal.
+    UnsafeCandidates {
+        candidate_count: usize,
+        has_non_local_proposer: bool,
+    },
 }
 
 /// Size of randomly generated blocks in bytes
@@ -446,11 +472,41 @@ impl State {
             return Ok(None);
         }
 
-        // Store as undecided
+        // Store the verified proposal and the authenticated wire evidence together. A conflicting
+        // aggregate is not safe to deliver to consensus as though it were canonical.
         info!(%value.height, %value.round, %value.proposer, "Storing validated proposal as undecided");
-        self.store_undecided_value(&value, data).await?;
+        let attestation = ProposalAttestation {
+            init: parts
+                .init()
+                .cloned()
+                .expect("complete proposal has init part"),
+            fin: parts
+                .fin()
+                .cloned()
+                .expect("complete proposal has fin part"),
+        };
+        let outcome = self
+            .store
+            .write_undecided_proposal(UndecidedProposalWrite {
+                proposal: value.clone(),
+                payload: data,
+                attestation: Some(attestation),
+                source: UndecidedWriteSource::Proposal,
+            })
+            .await?;
+        if let UndecidedWriteOutcome::Conflict(conflict) = &outcome {
+            warn!(
+                height = %value.height,
+                round = %value.round,
+                field = ?conflict.field,
+                "Received conflicting complete proposal"
+            );
+        }
 
-        Ok(Some(value))
+        Ok(match outcome {
+            UndecidedWriteOutcome::Canonical(value) => Some(value),
+            UndecidedWriteOutcome::Conflict(_) => None,
+        })
     }
 
     /// Reassembles proposal parts from streamed messages.
@@ -513,23 +569,33 @@ impl State {
             .flatten()
     }
 
-    /// Stores an undecided proposal along with its block data.
+    /// Stores an unattested undecided proposal through the atomic aggregate boundary.
     ///
-    /// WARN: The order of the two storage operations is important.
-    /// Block data must be stored before the proposal metadata to prevent crashes from
-    /// leaving a proposal that references non-existent block data. If a crash occurs
-    /// between the operations, orphaned block data is safe, but a dangling proposal
-    /// reference would cause retrieval failures.
+    /// This is used while a local proposal is being built. `stream_proposal` upgrades the
+    /// matching record with its authenticated Init/Fin envelope before publication.
     pub async fn store_undecided_value(
         &self,
         value: &ProposedValue<EmeraldContext>,
         data: Bytes,
     ) -> eyre::Result<()> {
-        self.store
-            .store_undecided_block_data(value.height, value.round, value.value.id(), data)
-            .await?;
-        self.store.store_undecided_proposal(value.clone()).await?;
-        Ok(())
+        match self
+            .store
+            .write_undecided_proposal(UndecidedProposalWrite {
+                proposal: value.clone(),
+                payload: data,
+                attestation: None,
+                source: UndecidedWriteSource::Proposal,
+            })
+            .await?
+        {
+            UndecidedWriteOutcome::Canonical(_) => Ok(()),
+            UndecidedWriteOutcome::Conflict(conflict) => Err(eyre::eyre!(
+                "undecided proposal conflict at height {}, round {}, field {:?}",
+                value.height,
+                value.round,
+                conflict.field,
+            )),
+        }
     }
 
     /// Commits a value with the given certificate, updating internal state
@@ -630,28 +696,39 @@ impl State {
 
     /// Retrieves a previously built proposal value for the given height and round.
     /// Called by the consensus engine to re-use a previously built value.
-    /// There should be at most one proposal for a given height and round when the proposer is not byzantine.
-    /// We assume this implementation is not byzantine and we are the proposer for the given height and round.
-    /// Therefore there must be a single proposal for the rounds where we are the proposer, with the proposer address matching our own.
+    /// Exactly one locally authored proposal can be reused. Ambiguous or non-local candidates
+    /// are reported separately so callers can suppress proposal construction without treating
+    /// peer-reachable stored state as a fatal application error.
     pub async fn get_previously_built_value(
         &self,
         height: Height,
         round: Round,
-    ) -> eyre::Result<Option<LocallyProposedValue<EmeraldContext>>> {
+    ) -> eyre::Result<PreviouslyBuiltValue> {
         let proposals: Vec<ProposedValue<EmeraldContext>> =
             self.store.get_undecided_proposals(height, round).await?;
 
-        assert!(
-            proposals.len() <= 1,
-            "There should be at most one proposal for a given height and round"
-        );
+        if proposals.is_empty() {
+            return Ok(PreviouslyBuiltValue::Absent);
+        }
+        let has_non_local_proposer = proposals
+            .iter()
+            .any(|proposal| proposal.proposer != self.address);
+        if proposals.len() != 1 || has_non_local_proposer {
+            return Ok(PreviouslyBuiltValue::UnsafeCandidates {
+                candidate_count: proposals.len(),
+                has_non_local_proposer,
+            });
+        }
+        let proposal = &proposals[0];
 
-        proposals
-            .first()
-            .map(|p| LocallyProposedValue::new(p.height, p.round, p.value.clone()))
-            .map(Some)
-            .map(Ok)
-            .unwrap_or(Ok(None))
+        Ok(PreviouslyBuiltValue::Reusable {
+            proposal: LocallyProposedValue::new(
+                proposal.height,
+                proposal.round,
+                proposal.value.clone(),
+            ),
+            valid_round: proposal.valid_round,
+        })
     }
 
     /// Prepares a stored proposal for restreaming and records the re-proposal at the current round.
@@ -682,8 +759,7 @@ impl State {
             })?;
 
         if proposal_round != current_round {
-            // Store::insert_undecided_proposal is insert-if-absent. If genuine peer metadata already exists for this
-            // key, this write adds the block data but cannot overwrite that proposal's authoritative proposer.
+            // A conflicting aggregate at the current-round key aborts without mutation.
             let current_round_proposal = ProposedValue {
                 height: proposal.height,
                 round: current_round,
@@ -702,6 +778,64 @@ impl State {
         )))
     }
 
+    /// Loads and verifies the exact authenticated proposal requested for a restream effect.
+    ///
+    /// The stored proposer must match the effect address and the original fin signature is
+    /// verified again before any wire part is returned for publication.
+    pub async fn prepare_attested_replay(
+        &self,
+        height: Height,
+        round: Round,
+        valid_round: Round,
+        address: Address,
+        value_id: ValueId,
+    ) -> eyre::Result<AttestedReplay> {
+        let Some(record) = self
+            .store
+            .get_undecided_record(height, round, value_id)
+            .await?
+        else {
+            return Ok(AttestedReplay::Absent);
+        };
+        let Some(attestation) = record.attestation else {
+            return Ok(AttestedReplay::Absent);
+        };
+
+        let identity_matches = attestation.init.height == height
+            && attestation.init.round == round
+            && attestation.init.pol_round == valid_round
+            && attestation.init.proposer == address
+            && record.proposal.value.id() == value_id;
+        if !identity_matches {
+            return Ok(AttestedReplay::IdentityMismatch {
+                stored_init: attestation.init,
+            });
+        }
+
+        let mut parts = Vec::with_capacity(record.payload.chunks(CHUNK_SIZE).len() + 2);
+        parts.push(ProposalPart::Init(attestation.init));
+        for start in (0..record.payload.len()).step_by(CHUNK_SIZE) {
+            let end = (start + CHUNK_SIZE).min(record.payload.len());
+            parts.push(ProposalPart::Data(ProposalData::new(
+                record.payload.slice(start..end),
+            )));
+        }
+        parts.push(ProposalPart::Fin(attestation.fin));
+
+        let proposal_parts = ProposalParts {
+            height,
+            round,
+            proposer: address,
+            parts,
+        };
+        self.verify_proposal_parts_signature(&proposal_parts)
+            .map_err(|error| eyre::eyre!(
+                "invalid stored proposal attestation at height {height}, round {round}, value {value_id}: {error:?}"
+            ))?;
+
+        Ok(AttestedReplay::Ready(proposal_parts.parts))
+    }
+
     // /// Make up a new value to propose
     // /// A real application would have a more complex logic here,
     // /// typically reaping transactions from a mempool and executing them against its state,
@@ -718,43 +852,31 @@ impl State {
         Bytes::from(random_bytes)
     }
 
-    /// Creates a new proposal value for the given height
-    /// Returns either a previously built proposal or creates a new one
-    pub async fn propose_value(
+    /// Builds, authenticates, and atomically persists a fresh local proposal before returning it.
+    pub async fn prepare_local_proposal(
         &mut self,
         height: Height,
         round: Round,
         data: Bytes,
-    ) -> eyre::Result<LocallyProposedValue<EmeraldContext>> {
+    ) -> eyre::Result<(
+        LocallyProposedValue<EmeraldContext>,
+        Vec<StreamMessage<ProposalPart>>,
+    )> {
         assert_eq!(height, self.consensus_height);
         assert_eq!(round, self.consensus_round);
 
-        // We create a new value.
-        let value = Value::new(data.clone());
+        let proposal = LocallyProposedValue::new(height, round, Value::new(data.clone()));
+        let messages = self
+            .stream_proposal(proposal.clone(), data, Round::Nil)
+            .await?;
 
-        let proposal: ProposedValue<EmeraldContext> = ProposedValue {
-            height,
-            round,
-            valid_round: Round::Nil,
-            proposer: self.address, // We are the proposer
-            value,
-            validity: Validity::Valid, // Our proposals are de facto valid
-        };
-
-        // Store the proposal and its block data
-        self.store_undecided_value(&proposal, data).await?;
-
-        Ok(LocallyProposedValue::new(
-            proposal.height,
-            proposal.round,
-            proposal.value,
-        ))
+        Ok((proposal, messages))
     }
 
-    fn stream_id(&mut self) -> StreamId {
+    fn stream_id(&mut self, height: Height, round: Round) -> StreamId {
         let mut bytes = Vec::with_capacity(size_of::<u64>() + size_of::<u32>());
-        bytes.extend_from_slice(&self.consensus_height.as_u64().to_be_bytes());
-        bytes.extend_from_slice(&self.consensus_round.as_u32().unwrap().to_be_bytes());
+        bytes.extend_from_slice(&height.as_u64().to_be_bytes());
+        bytes.extend_from_slice(&round.as_u32().unwrap().to_be_bytes());
         bytes.extend_from_slice(&self.stream_nonce.to_be_bytes());
         self.stream_nonce += 1;
         StreamId::new(bytes.into())
@@ -762,15 +884,61 @@ impl State {
 
     /// Creates a stream message containing a proposal part.
     /// Updates internal sequence number and current proposal.
-    pub fn stream_proposal(
+    pub async fn stream_proposal(
         &mut self,
         value: LocallyProposedValue<EmeraldContext>,
         data: Bytes,
         pol_round: Round,
-    ) -> impl Iterator<Item = StreamMessage<ProposalPart>> {
-        let parts = self.make_proposal_parts(value, data, pol_round);
+    ) -> eyre::Result<Vec<StreamMessage<ProposalPart>>> {
+        let parts = self.make_proposal_parts(value.clone(), data.clone(), pol_round);
+        let init = parts
+            .first()
+            .and_then(ProposalPart::as_init)
+            .expect("locally built proposal has init")
+            .clone();
+        let fin = parts
+            .last()
+            .and_then(ProposalPart::as_fin)
+            .expect("locally built proposal has fin")
+            .clone();
+        let proposal = ProposedValue {
+            height: value.height,
+            round: value.round,
+            valid_round: pol_round,
+            proposer: self.address,
+            value: value.value.clone(),
+            validity: Validity::Valid,
+        };
 
-        let stream_id = self.stream_id();
+        match self
+            .store
+            .write_undecided_proposal(UndecidedProposalWrite {
+                proposal,
+                payload: data,
+                attestation: Some(ProposalAttestation::new(init, fin)),
+                source: UndecidedWriteSource::Proposal,
+            })
+            .await?
+        {
+            UndecidedWriteOutcome::Canonical(_) => {
+                Ok(self.make_stream_messages(value.height, value.round, parts))
+            }
+            UndecidedWriteOutcome::Conflict(conflict) => Err(eyre::eyre!(
+                "local proposal attestation conflict at height {}, round {}, field {:?}",
+                value.height,
+                value.round,
+                conflict.field,
+            )),
+        }
+    }
+
+    pub(crate) fn make_stream_messages(
+        &mut self,
+        height: Height,
+        round: Round,
+        parts: Vec<ProposalPart>,
+    ) -> Vec<StreamMessage<ProposalPart>> {
+        let stream_id = self.stream_id(height, round);
 
         let mut msgs = Vec::with_capacity(parts.len() + 1);
         let mut sequence = 0;
@@ -782,7 +950,7 @@ impl State {
         }
 
         msgs.push(StreamMessage::new(stream_id, sequence, StreamContent::Fin));
-        msgs.into_iter()
+        msgs
     }
 
     fn make_proposal_parts(
@@ -809,10 +977,12 @@ impl State {
 
         // Data
         {
-            for chunk in data.chunks(CHUNK_SIZE) {
-                let chunk_data = ProposalData::new(Bytes::copy_from_slice(chunk));
-                parts.push(ProposalPart::Data(chunk_data));
-                hasher.update(chunk);
+            for start in (0..data.len()).step_by(CHUNK_SIZE) {
+                let end = (start + CHUNK_SIZE).min(data.len());
+                hasher.update(&data[start..end]);
+                parts.push(ProposalPart::Data(ProposalData::new(
+                    data.slice(start..end),
+                )));
             }
         }
 
@@ -942,6 +1112,7 @@ pub fn decode_value(bytes: Bytes) -> Result<Value, ProtoError> {
 #[cfg(test)]
 mod tests {
     use malachitebft_app_channel::{AppMsg, Channels, NetworkMsg};
+    use malachitebft_eth_cli::config::TimeoutConfig;
     use malachitebft_eth_types::secp256k1::PrivateKey;
     use malachitebft_eth_types::Validator;
     use tokio::sync::mpsc;
@@ -960,7 +1131,7 @@ mod tests {
         let public_key = private_key.public_key();
         let address = Address::from_public_key(&public_key);
         let genesis = Genesis {
-            validator_set: ValidatorSet::new([Validator::new(public_key, 1)]),
+            validator_set: ValidatorSet::new([Validator::new(public_key.clone(), 1)]),
         };
 
         let mut emerald_config: EmeraldConfig = toml::from_str(
@@ -978,7 +1149,7 @@ jwt_token_path = "./assets/jwt.hex"
         std::fs::write(&eth_genesis_path, "{}").unwrap();
         emerald_config.ethereum_config.eth_genesis_path = eth_genesis_path.display().to_string();
 
-        let state = State::new(
+        let mut state = State::new(
             genesis,
             EmeraldContext::new(),
             K256Provider::new(private_key),
@@ -992,6 +1163,10 @@ jwt_token_path = "./assets/jwt.hex"
                 metrics: Metrics::new(),
             },
             emerald_config,
+        );
+        state.set_validator_set(
+            Height::new(1426),
+            ValidatorSet::new([Validator::new(public_key, 1)]),
         );
 
         (state, dir)
@@ -1030,8 +1205,121 @@ jwt_token_path = "./assets/jwt.hex"
         )
     }
 
+    fn make_collecting_channels() -> (
+        Channels<EmeraldContext>,
+        tokio::task::JoinHandle<Vec<ProposalPart>>,
+    ) {
+        let (_consensus_tx, consensus_rx) = mpsc::channel(1);
+        let (network_tx, mut network_rx) = mpsc::channel::<NetworkMsg<EmeraldContext>>(16);
+        let (requests_tx, _requests_rx) = mpsc::channel(1);
+        let collector = tokio::spawn(async move {
+            let mut parts = Vec::new();
+            while let Some(NetworkMsg::PublishProposalPart(message)) = network_rx.recv().await {
+                if let Some(part) = message.content.into_data() {
+                    parts.push(part);
+                }
+            }
+            parts
+        });
+
+        (
+            Channels {
+                consensus: consensus_rx,
+                network: network_tx,
+                events: Default::default(),
+                requests: requests_tx,
+            },
+            collector,
+        )
+    }
+
+    fn make_message_collecting_channels() -> (
+        Channels<EmeraldContext>,
+        tokio::task::JoinHandle<Vec<StreamMessage<ProposalPart>>>,
+    ) {
+        let (_consensus_tx, consensus_rx) = mpsc::channel(1);
+        let (network_tx, mut network_rx) = mpsc::channel::<NetworkMsg<EmeraldContext>>(16);
+        let (requests_tx, _requests_rx) = mpsc::channel(1);
+        let collector = tokio::spawn(async move {
+            let mut messages = Vec::new();
+            while let Some(NetworkMsg::PublishProposalPart(message)) = network_rx.recv().await {
+                messages.push(message);
+            }
+            messages
+        });
+
+        (
+            Channels {
+                consensus: consensus_rx,
+                network: network_tx,
+                events: Default::default(),
+                requests: requests_tx,
+            },
+            collector,
+        )
+    }
+
+    async fn store_foreign_attested_proposal(
+        state: &mut State,
+        valid_signature: bool,
+    ) -> (ProposedValue<EmeraldContext>, Vec<ProposalPart>) {
+        let foreign_key = PrivateKey::from_slice(&[2_u8; 32]).unwrap();
+        let foreign_public_key = foreign_key.public_key();
+        let foreign_address = Address::from_public_key(&foreign_public_key);
+        let height = Height::new(1426);
+        let round = Round::new(10);
+        let valid_round = Round::new(7);
+        let payload = Bytes::from(vec![0xA5; CHUNK_SIZE + 17]);
+        state.set_validator_set(
+            height,
+            ValidatorSet::new([Validator::new(foreign_public_key, 1)]),
+        );
+
+        let init = ProposalInit::new(height, round, valid_round, foreign_address);
+        let mut hasher = sha3::Keccak256::new();
+        hasher.update(height.as_u64().to_be_bytes());
+        hasher.update(round.as_i64().to_be_bytes());
+        hasher.update(&payload);
+        let digest = hasher.finalize();
+        let signature = if valid_signature {
+            K256Provider::new(foreign_key).sign(&digest)
+        } else {
+            state.signing_provider.sign(&digest)
+        };
+        let fin = ProposalFin::new(signature);
+        let proposal = ProposedValue {
+            height,
+            round,
+            valid_round,
+            proposer: foreign_address,
+            value: Value::new(payload.clone()),
+            validity: Validity::Valid,
+        };
+        state
+            .store
+            .write_undecided_proposal(UndecidedProposalWrite {
+                proposal: proposal.clone(),
+                payload: payload.clone(),
+                attestation: Some(ProposalAttestation::new(init.clone(), fin.clone())),
+                source: UndecidedWriteSource::Proposal,
+            })
+            .await
+            .unwrap();
+
+        let mut parts = Vec::with_capacity(payload.chunks(CHUNK_SIZE).len() + 2);
+        parts.push(ProposalPart::Init(init));
+        parts.extend(
+            payload
+                .chunks(CHUNK_SIZE)
+                .map(|chunk| ProposalPart::Data(ProposalData::new(Bytes::copy_from_slice(chunk)))),
+        );
+        parts.push(ProposalPart::Fin(fin));
+
+        (proposal, parts)
+    }
+
     #[tokio::test]
-    async fn restream_proposal_stores_reproposal_at_current_round() {
+    async fn restream_proposal_does_not_rebuild_a_foreign_proposal() {
         let (mut state, _dir) = make_test_state().await;
         let height = Height::new(1426);
         let proposal_round = Round::new(0);
@@ -1074,29 +1362,11 @@ jwt_token_path = "./assets/jwt.hex"
             .store
             .get_undecided_proposal(height, current_round, value.id())
             .await
-            .unwrap()
-            .expect("restreamed proposal must be stored at the current round");
-        assert_eq!(current_round_proposal.height, height);
-        assert_eq!(current_round_proposal.round, current_round);
-        assert_eq!(current_round_proposal.valid_round, proposal_round);
-        assert_eq!(current_round_proposal.proposer, state.address);
-        assert_eq!(current_round_proposal.value, value);
-
-        let current_round_bytes = state
-            .store
-            .get_block_data(height, current_round, value.id())
-            .await
-            .unwrap()
-            .expect("restreamed block data must be stored at the current round");
-        assert_eq!(current_round_bytes, bytes);
+            .unwrap();
+        assert!(current_round_proposal.is_none());
 
         drop(channels);
-        let init = proposal_init.await.unwrap();
-
-        assert_eq!(init.height, height);
-        assert_eq!(init.round, current_round);
-        assert_eq!(init.pol_round, proposal_round);
-        assert_eq!(init.proposer, state.address);
+        proposal_init.abort();
     }
 
     #[tokio::test]
@@ -1117,7 +1387,7 @@ jwt_token_path = "./assets/jwt.hex"
     }
 
     #[tokio::test]
-    async fn restream_proposal_errors_when_block_data_is_missing() {
+    async fn restream_proposal_errors_when_storage_record_is_incomplete() {
         let (state, _dir) = make_test_state().await;
         let height = Height::new(1426);
         let proposal_round = Round::new(0);
@@ -1146,7 +1416,7 @@ jwt_token_path = "./assets/jwt.hex"
 
         assert!(error
             .to_string()
-            .contains("Block data not found for restream proposal"));
+            .contains("invalid undecided proposal record shape"));
         assert!(error.to_string().contains("1426"));
     }
 
@@ -1200,5 +1470,471 @@ jwt_token_path = "./assets/jwt.hex"
             .unwrap()
             .expect("current-round proposal must remain stored");
         assert_eq!(current_round_proposal.valid_round, Round::Nil);
+    }
+
+    #[tokio::test]
+    async fn local_proposal_persists_attestation_in_one_write() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(0);
+        let payload = Bytes::from_static(b"local-attested-proposal");
+        let writes_before = state.store.write_count();
+
+        let (proposal, messages) = state
+            .prepare_local_proposal(height, round, payload)
+            .await
+            .unwrap();
+
+        assert_eq!(state.store.write_count(), writes_before + 1);
+        assert!(!messages.is_empty());
+
+        let stored = state
+            .store
+            .get_undecided_record(height, round, proposal.value.id())
+            .await
+            .unwrap()
+            .expect("streamed proposal must be stored");
+        assert!(stored.attestation.is_some());
+    }
+
+    #[tokio::test]
+    async fn maximum_local_proposal_preparation_meets_default_deadline() {
+        let (mut state, _dir) = make_test_state().await;
+        let payload = Bytes::from(vec![0xA5; BLOCK_SIZE]);
+        let deadline = TimeoutConfig::default().timeout_propose;
+
+        let (proposal, messages) = tokio::time::timeout(
+            deadline,
+            state.prepare_local_proposal(Height::new(1426), Round::new(0), payload),
+        )
+        .await
+        .expect("maximum local proposal must be durable before timeout_propose")
+        .unwrap();
+
+        assert_eq!(proposal.value.extensions.len(), BLOCK_SIZE);
+        assert_eq!(messages.len(), BLOCK_SIZE.div_ceil(CHUNK_SIZE) + 3);
+    }
+
+    #[tokio::test]
+    async fn local_proposal_parts_share_the_payload_allocation() {
+        let (state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(0);
+        let payload = Bytes::from(vec![0xA5; CHUNK_SIZE * 2 + 17]);
+        let proposal = LocallyProposedValue::new(height, round, Value::new(payload.clone()));
+
+        let parts = state.make_proposal_parts(proposal, payload, Round::Nil);
+        let data_parts: Vec<_> = parts.iter().filter_map(ProposalPart::as_data).collect();
+
+        assert_eq!(data_parts.len(), 3);
+        assert!(data_parts.iter().all(|part| !part.bytes.is_unique()));
+    }
+
+    #[tokio::test]
+    async fn previously_built_value_marks_a_non_local_proposer_as_unsafe() {
+        let (state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(0);
+        let payload = Bytes::from_static(b"foreign-proposal");
+        let foreign = ProposedValue {
+            height,
+            round,
+            valid_round: Round::Nil,
+            proposer: Address::new([9; 20]),
+            value: Value::new(payload.clone()),
+            validity: Validity::Valid,
+        };
+        state
+            .store
+            .write_undecided_proposal(UndecidedProposalWrite {
+                proposal: foreign,
+                payload,
+                attestation: None,
+                source: UndecidedWriteSource::Proposal,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            state
+                .get_previously_built_value(height, round)
+                .await
+                .unwrap(),
+            PreviouslyBuiltValue::UnsafeCandidates {
+                candidate_count: 1,
+                has_non_local_proposer: true,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn previously_built_value_marks_multiple_candidates_as_unsafe() {
+        let (state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(0);
+
+        for payload in [
+            Bytes::from_static(b"first-local-proposal"),
+            Bytes::from_static(b"second-local-proposal"),
+        ] {
+            let proposal = ProposedValue {
+                height,
+                round,
+                valid_round: Round::Nil,
+                proposer: state.address,
+                value: Value::new(payload.clone()),
+                validity: Validity::Valid,
+            };
+            state
+                .store
+                .write_undecided_proposal(UndecidedProposalWrite {
+                    proposal,
+                    payload,
+                    attestation: None,
+                    source: UndecidedWriteSource::Proposal,
+                })
+                .await
+                .unwrap();
+        }
+
+        assert!(matches!(
+            state
+                .get_previously_built_value(height, round)
+                .await
+                .unwrap(),
+            PreviouslyBuiltValue::UnsafeCandidates {
+                candidate_count: 2,
+                has_non_local_proposer: false,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn attested_replay_returns_the_original_authenticated_parts() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(0);
+        let payload = Bytes::from_static(b"authenticated-replay");
+        let (proposal, streamed) = state
+            .prepare_local_proposal(height, round, payload)
+            .await
+            .unwrap();
+
+        let AttestedReplay::Ready(parts) = state
+            .prepare_attested_replay(
+                height,
+                round,
+                Round::Nil,
+                state.address,
+                proposal.value.id(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("locally streamed proposal must be replayable");
+        };
+
+        assert_eq!(
+            parts.first().and_then(ProposalPart::as_init),
+            streamed[0]
+                .content
+                .as_data()
+                .and_then(ProposalPart::as_init)
+        );
+        assert_eq!(
+            parts.last().and_then(ProposalPart::as_fin),
+            streamed[streamed.len() - 2]
+                .content
+                .as_data()
+                .and_then(ProposalPart::as_fin)
+        );
+    }
+
+    #[tokio::test]
+    async fn attested_replay_parts_share_one_payload_allocation() {
+        let (mut state, _dir) = make_test_state().await;
+        let (proposal, _) = store_foreign_attested_proposal(&mut state, true).await;
+
+        let AttestedReplay::Ready(parts) = state
+            .prepare_attested_replay(
+                proposal.height,
+                proposal.round,
+                proposal.valid_round,
+                proposal.proposer,
+                proposal.value.id(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("stored foreign proposal must be replayable");
+        };
+        let data_parts: Vec<_> = parts.iter().filter_map(ProposalPart::as_data).collect();
+
+        assert_eq!(data_parts.len(), 2);
+        assert!(data_parts.iter().all(|part| !part.bytes.is_unique()));
+    }
+
+    #[tokio::test]
+    async fn attested_replay_rejects_an_effect_with_a_different_pol_round() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(0);
+        let payload = Bytes::from_static(b"attested-replay-identity");
+        let (proposal, _) = state
+            .prepare_local_proposal(height, round, payload)
+            .await
+            .unwrap();
+
+        let AttestedReplay::IdentityMismatch { stored_init } = state
+            .prepare_attested_replay(
+                height,
+                round,
+                Round::new(1),
+                state.address,
+                proposal.value.id(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("a different POL round must not be replayed");
+        };
+
+        assert_eq!(stored_init.pol_round, Round::Nil);
+    }
+
+    #[tokio::test]
+    async fn foreign_restream_replays_original_parts_byte_for_byte() {
+        let (mut state, _dir) = make_test_state().await;
+        let (proposal, original_parts) = store_foreign_attested_proposal(&mut state, true).await;
+        assert_ne!(proposal.proposer, state.address);
+        let (mut channels, collector) = make_collecting_channels();
+
+        on_restream_proposal(
+            AppMsg::RestreamProposal {
+                height: proposal.height,
+                round: proposal.round,
+                valid_round: proposal.valid_round,
+                address: proposal.proposer,
+                value_id: proposal.value.id(),
+            },
+            &mut state,
+            &mut channels,
+        )
+        .await
+        .unwrap();
+        drop(channels);
+        let replayed_parts = collector.await.unwrap();
+
+        let encoded_original: Vec<_> = original_parts
+            .iter()
+            .map(|part| ProtobufCodec.encode(part).unwrap())
+            .collect();
+        let encoded_replayed: Vec<_> = replayed_parts
+            .iter()
+            .map(|part| ProtobufCodec.encode(part).unwrap())
+            .collect();
+        assert_eq!(
+            replayed_parts
+                .iter()
+                .filter(|part| matches!(part, ProposalPart::Data(_)))
+                .count(),
+            2
+        );
+        assert_eq!(encoded_replayed, encoded_original);
+    }
+
+    #[tokio::test]
+    async fn repeated_foreign_restreams_use_fresh_stream_ids() {
+        let (mut state, _dir) = make_test_state().await;
+        let (proposal, _) = store_foreign_attested_proposal(&mut state, true).await;
+        let mut stream_ids = Vec::new();
+
+        for _ in 0..2 {
+            let (mut channels, collector) = make_message_collecting_channels();
+            on_restream_proposal(
+                AppMsg::RestreamProposal {
+                    height: proposal.height,
+                    round: proposal.round,
+                    valid_round: proposal.valid_round,
+                    address: proposal.proposer,
+                    value_id: proposal.value.id(),
+                },
+                &mut state,
+                &mut channels,
+            )
+            .await
+            .unwrap();
+            drop(channels);
+            let messages = collector.await.unwrap();
+            let stream_id = messages
+                .first()
+                .expect("restream must publish proposal parts")
+                .stream_id
+                .clone();
+            assert!(messages
+                .iter()
+                .all(|message| message.stream_id == stream_id));
+            stream_ids.push(stream_id);
+        }
+
+        assert_ne!(stream_ids[0], stream_ids[1]);
+    }
+
+    #[tokio::test]
+    async fn forwarded_parts_validate_on_an_independent_receiver() {
+        let (mut forwarder, _forwarder_dir) = make_test_state().await;
+        let (proposal, _) = store_foreign_attested_proposal(&mut forwarder, true).await;
+        let AttestedReplay::Ready(parts) = forwarder
+            .prepare_attested_replay(
+                proposal.height,
+                proposal.round,
+                proposal.valid_round,
+                proposal.proposer,
+                proposal.value.id(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("foreign proposal must be replayable");
+        };
+
+        let (mut receiver, _receiver_dir) = make_test_state().await;
+        let foreign_key = PrivateKey::from_slice(&[2_u8; 32]).unwrap();
+        receiver.set_validator_set(
+            proposal.height,
+            ValidatorSet::new([Validator::new(foreign_key.public_key(), 1)]),
+        );
+        let forwarded = ProposalParts {
+            height: proposal.height,
+            round: proposal.round,
+            proposer: proposal.proposer,
+            parts,
+        };
+
+        receiver.validate_proposal_parts(&forwarded).unwrap();
+    }
+
+    #[tokio::test]
+    async fn independent_receiver_rejects_mutated_forwarded_payload() {
+        let (mut forwarder, _forwarder_dir) = make_test_state().await;
+        let (proposal, _) = store_foreign_attested_proposal(&mut forwarder, true).await;
+        let AttestedReplay::Ready(mut parts) = forwarder
+            .prepare_attested_replay(
+                proposal.height,
+                proposal.round,
+                proposal.valid_round,
+                proposal.proposer,
+                proposal.value.id(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("foreign proposal must be replayable");
+        };
+        let data = parts
+            .iter_mut()
+            .find_map(|part| match part {
+                ProposalPart::Data(data) => Some(data),
+                _ => None,
+            })
+            .unwrap();
+        let mut mutated = data.bytes.to_vec();
+        mutated[0] ^= 0xFF;
+        data.bytes = Bytes::from(mutated);
+
+        let (mut receiver, _receiver_dir) = make_test_state().await;
+        let foreign_key = PrivateKey::from_slice(&[2_u8; 32]).unwrap();
+        receiver.set_validator_set(
+            proposal.height,
+            ValidatorSet::new([Validator::new(foreign_key.public_key(), 1)]),
+        );
+        let error = receiver
+            .validate_proposal_parts(&ProposalParts {
+                height: proposal.height,
+                round: proposal.round,
+                proposer: proposal.proposer,
+                parts,
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProposalValidationError::Signature(SignatureVerificationError::InvalidSignature)
+        ));
+    }
+
+    #[tokio::test]
+    async fn independent_receiver_rejects_substituted_forwarder_as_proposer() {
+        let (mut forwarder, _forwarder_dir) = make_test_state().await;
+        let (proposal, _) = store_foreign_attested_proposal(&mut forwarder, true).await;
+        let AttestedReplay::Ready(mut parts) = forwarder
+            .prepare_attested_replay(
+                proposal.height,
+                proposal.round,
+                proposal.valid_round,
+                proposal.proposer,
+                proposal.value.id(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("foreign proposal must be replayable");
+        };
+        let substituted = forwarder.address;
+        parts
+            .iter_mut()
+            .find_map(|part| match part {
+                ProposalPart::Init(init) => Some(init),
+                _ => None,
+            })
+            .unwrap()
+            .proposer = substituted;
+
+        let (mut receiver, _receiver_dir) = make_test_state().await;
+        let foreign_key = PrivateKey::from_slice(&[2_u8; 32]).unwrap();
+        receiver.set_validator_set(
+            proposal.height,
+            ValidatorSet::new([Validator::new(foreign_key.public_key(), 1)]),
+        );
+        let error = receiver
+            .validate_proposal_parts(&ProposalParts {
+                height: proposal.height,
+                round: proposal.round,
+                proposer: substituted,
+                parts,
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProposalValidationError::WrongProposer {
+                actual,
+                expected
+            } if actual == substituted && expected == proposal.proposer
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_stored_signature_does_not_stop_the_application() {
+        let (mut state, _dir) = make_test_state().await;
+        let (proposal, _) = store_foreign_attested_proposal(&mut state, false).await;
+        let (mut channels, collector) = make_collecting_channels();
+
+        let result = on_restream_proposal(
+            AppMsg::RestreamProposal {
+                height: proposal.height,
+                round: proposal.round,
+                valid_round: proposal.valid_round,
+                address: proposal.proposer,
+                value_id: proposal.value.id(),
+            },
+            &mut state,
+            &mut channels,
+        )
+        .await;
+        drop(channels);
+
+        assert!(result.is_ok());
+        assert!(collector.await.unwrap().is_empty());
     }
 }
