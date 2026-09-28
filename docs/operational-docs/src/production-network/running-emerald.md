@@ -133,7 +133,9 @@ Before upgrading each node:
 
 Reconciliation copies every unique payload into v2, validates duplicate bytes, preserves or restores full v1
 proposal rows, and populates compact v2 proposal rows in one transaction. Only after every phase succeeds does it
-write schema version `1`. That copy requires headroom even when many legacy rows are duplicates. Later version-1
+write schema version `1`. Proposal reconciliation merges the ordered v1 and v2 tables while retaining only the
+current proposal pair and its shared payload in memory; a late conflict or interruption still rolls back the entire
+transaction. The payload copy requires disk headroom even when many legacy rows are duplicates. Later version-1
 starts skip legacy payload and proposal scans. They first check each decided key for its payload and perform the
 certificate, ID, byte, SSZ, and header validation only when that payload is missing.
 

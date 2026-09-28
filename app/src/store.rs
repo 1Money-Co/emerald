@@ -199,6 +199,8 @@ struct SchemaInitializationStats {
     reconciliation_ran: bool,
     legacy_payload_rows_visited: u64,
     proposal_rows_visited: u64,
+    proposal_pairs_buffered_peak: u64,
+    proposal_bytes_buffered_peak: u64,
     targeted_decided_rows_visited: u64,
     expensive_decided_rows_validated: u64,
 }
@@ -1049,6 +1051,8 @@ impl Db {
                 compacted_proposals = migration.compacted_proposals,
                 proposal_source_bytes = migration.proposal_source_bytes,
                 proposal_compact_bytes = migration.proposal_compact_bytes,
+                proposal_pairs_buffered_peak = stats.proposal_pairs_buffered_peak,
+                proposal_bytes_buffered_peak = stats.proposal_bytes_buffered_peak,
                 repaired_compact_decided_values = migration.repaired_compact_decided_values,
                 repaired_compact_decided_value_bytes =
                     migration.repaired_compact_decided_value_bytes,
@@ -1408,54 +1412,84 @@ impl Db {
         stats: &mut SchemaInitializationStats,
     ) -> Result<(), StoreError> {
         type ProposalKey = (Height, Round, ValueId);
-        type EncodedProposalPair = (Option<Vec<u8>>, Option<Vec<u8>>);
 
-        let mut rows: BTreeMap<ProposalKey, EncodedProposalPair> = BTreeMap::new();
-        {
-            let proposals = tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)?;
-            for entry in proposals.iter()? {
-                let (proposal_key, encoded) = entry?;
-                let key = proposal_key.value();
-                let encoded = encoded.value();
-                stats.proposal_rows_visited += 1;
-                migration.proposal_rows += 1;
-                migration.proposal_source_bytes += encoded.len() as u64;
-                rows.entry(key).or_default().0 = Some(encoded);
-            }
-        }
-        {
-            let proposals = tx.open_table(UNDECIDED_PROPOSALS_TABLE)?;
-            for entry in proposals.iter()? {
-                let (proposal_key, encoded) = entry?;
-                let key = proposal_key.value();
-                let encoded = encoded.value();
-                stats.proposal_rows_visited += 1;
-                migration.proposal_rows += 1;
-                migration.proposal_source_bytes += encoded.len() as u64;
-                rows.entry(key).or_default().1 = Some(encoded);
-            }
-        }
+        let next_pair = |after: Option<ProposalKey>| -> Result<_, StoreError> {
+            use core::ops::Bound::{Excluded, Unbounded};
 
-        let primary = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
-        let legacy_payloads = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
-        let mut legacy_replacements = Vec::new();
-        let mut compact_replacements = Vec::new();
-
-        for (key, (legacy_encoded, compact_encoded)) in rows {
-            let primary_payload = primary.get(&(key.0, key.2))?;
-            let legacy_payload = if primary_payload.is_none() {
-                legacy_payloads.get(&key)?
-            } else {
-                None
+            let next_legacy = {
+                let proposals = tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)?;
+                if let Some(after) = after {
+                    let mut rows = proposals.range((Excluded(after), Unbounded))?;
+                    rows.next()
+                        .transpose()?
+                        .map(|(key, encoded)| (key.value(), encoded.value()))
+                } else {
+                    proposals
+                        .first()?
+                        .map(|(key, encoded)| (key.value(), encoded.value()))
+                }
             };
-            let payload = primary_payload
-                .as_ref()
-                .map(|value| value.value())
-                .or_else(|| legacy_payload.as_ref().map(|value| value.value()))
-                .ok_or_else(|| {
-                    Self::irrecoverable_undecided_proposal(key, "missing shared payload")
-                })?;
-            let payload = Bytes::from(payload);
+            let next_compact = {
+                let proposals = tx.open_table(UNDECIDED_PROPOSALS_TABLE)?;
+                if let Some(after) = after {
+                    let mut rows = proposals.range((Excluded(after), Unbounded))?;
+                    rows.next()
+                        .transpose()?
+                        .map(|(key, encoded)| (key.value(), encoded.value()))
+                } else {
+                    proposals
+                        .first()?
+                        .map(|(key, encoded)| (key.value(), encoded.value()))
+                }
+            };
+            let key = match (&next_legacy, &next_compact) {
+                (Some((legacy_key, _)), Some((compact_key, _))) => {
+                    Some((*legacy_key).min(*compact_key))
+                }
+                (Some((legacy_key, _)), None) => Some(*legacy_key),
+                (None, Some((compact_key, _))) => Some(*compact_key),
+                (None, None) => None,
+            };
+            Ok(key.map(|key| {
+                let legacy = next_legacy
+                    .filter(|(candidate, _)| *candidate == key)
+                    .map(|(_, encoded)| encoded);
+                let compact = next_compact
+                    .filter(|(candidate, _)| *candidate == key)
+                    .map(|(_, encoded)| encoded);
+                (key, (legacy, compact))
+            }))
+        };
+
+        let mut after = None;
+        while let Some((key, (legacy_encoded, compact_encoded))) = next_pair(after)? {
+            let source_rows =
+                u64::from(legacy_encoded.is_some()) + u64::from(compact_encoded.is_some());
+            let source_bytes = legacy_encoded.as_ref().map_or(0, Vec::len)
+                + compact_encoded.as_ref().map_or(0, Vec::len);
+            stats.proposal_rows_visited += source_rows;
+            stats.proposal_pairs_buffered_peak = stats.proposal_pairs_buffered_peak.max(1);
+            migration.proposal_rows += source_rows;
+            migration.proposal_source_bytes += source_bytes as u64;
+
+            let payload = {
+                let primary = tx.open_table(UNDECIDED_BLOCK_DATA_TABLE)?;
+                let legacy_payloads = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE)?;
+                let primary_payload = primary.get(&(key.0, key.2))?;
+                let legacy_payload = if primary_payload.is_none() {
+                    legacy_payloads.get(&key)?
+                } else {
+                    None
+                };
+                primary_payload
+                    .as_ref()
+                    .map(|value| value.value())
+                    .or_else(|| legacy_payload.as_ref().map(|value| value.value()))
+                    .map(Bytes::from)
+                    .ok_or_else(|| {
+                        Self::irrecoverable_undecided_proposal(key, "missing shared payload")
+                    })?
+            };
 
             let decode = |encoded: &[u8]| {
                 decode_stored_proposal(Bytes::copy_from_slice(encoded))
@@ -1486,31 +1520,23 @@ impl Db {
             let compact = StoredProposalMetadata::from_proposal(&proposal)
                 .encode()?
                 .to_vec();
+            let buffered_bytes = source_bytes + payload.len() + full.len() + compact.len();
+            stats.proposal_bytes_buffered_peak = stats
+                .proposal_bytes_buffered_peak
+                .max(buffered_bytes as u64);
             if legacy_encoded.as_ref() != Some(&full) {
-                legacy_replacements.push((key, full));
-            }
-            if compact_encoded.as_ref() != Some(&compact) {
-                compact_replacements.push((key, compact));
-            }
-        }
-        drop(primary);
-        drop(legacy_payloads);
-
-        if !legacy_replacements.is_empty() {
-            let mut proposals = tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)?;
-            for (key, full) in legacy_replacements {
                 migration.compacted_proposals += 1;
                 migration.proposal_compact_bytes += full.len() as u64;
-                proposals.insert(key, full)?;
+                tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE)?
+                    .insert(key, full)?;
             }
-        }
-        if !compact_replacements.is_empty() {
-            let mut proposals = tx.open_table(UNDECIDED_PROPOSALS_TABLE)?;
-            for (key, compact) in compact_replacements {
+            if compact_encoded.as_ref() != Some(&compact) {
                 migration.compacted_proposals += 1;
                 migration.proposal_compact_bytes += compact.len() as u64;
-                proposals.insert(key, compact)?;
+                tx.open_table(UNDECIDED_PROPOSALS_TABLE)?
+                    .insert(key, compact)?;
             }
+            after = Some(key);
         }
         Ok(())
     }
@@ -2786,6 +2812,150 @@ mod tests {
             );
             assert_eq!(raw_storage_snapshot(&db, key), before, "case {case}");
         }
+    }
+
+    #[test]
+    fn reconciliation_streams_thousands_of_large_proposals_with_one_pair_buffered() {
+        const PROPOSALS: u64 = 2_048;
+        const PAYLOAD_BYTES: usize = 16 * 1024;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("streaming-proposal-reconciliation.redb");
+        let db = Db::new(&path, 1024 * 1024, DbMetrics::new()).unwrap();
+        let height = Height::new(80);
+        let payload = Bytes::from(vec![7; PAYLOAD_BYTES]);
+        let value = Value::new(payload.clone());
+        let tx = db.db.begin_write().unwrap();
+        {
+            let mut proposals = tx.open_table(LEGACY_UNDECIDED_PROPOSALS_TABLE).unwrap();
+            let mut payloads = tx.open_table(LEGACY_UNDECIDED_BLOCK_DATA_TABLE).unwrap();
+            for index in 0..PROPOSALS {
+                let round = Round::new(index as u32);
+                let proposal: ProposedValue<EmeraldContext> = ProposedValue {
+                    height,
+                    round,
+                    valid_round: Round::Nil,
+                    proposer: Address::new([7; 20]),
+                    value: value.clone(),
+                    validity: Validity::Valid,
+                };
+                let key = (height, round, value.id());
+                proposals
+                    .insert(key, ProtobufCodec.encode(&proposal).unwrap().to_vec())
+                    .unwrap();
+                payloads.insert(key, payload.to_vec()).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let stats = db.initialize_schema().unwrap();
+
+        assert_eq!(stats.proposal_rows_visited, PROPOSALS);
+        assert_eq!(stats.proposal_pairs_buffered_peak, 1);
+        assert!(
+            stats.proposal_bytes_buffered_peak < (PAYLOAD_BYTES as u64 * 4),
+            "peak buffered proposal bytes were {}",
+            stats.proposal_bytes_buffered_peak
+        );
+        assert!(raw_compact_proposal(&db, (height, Round::new(0), value.id())).is_some());
+        assert!(raw_compact_proposal(
+            &db,
+            (height, Round::new((PROPOSALS - 1) as u32), value.id())
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn reconciliation_late_conflict_rolls_back_streamed_replacements() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("streaming-proposal-late-conflict.redb");
+        let db = Db::new(&path, 1024 * 1024, DbMetrics::new()).unwrap();
+        let first_payload = Bytes::from_static(b"first-valid-payload");
+        let first_value = Value::new(first_payload.clone());
+        let first: ProposedValue<EmeraldContext> = ProposedValue {
+            height: Height::new(81),
+            round: Round::new(0),
+            valid_round: Round::Nil,
+            proposer: Address::new([8; 20]),
+            value: first_value.clone(),
+            validity: Validity::Valid,
+        };
+        let first_key = (first.height, first.round, first_value.id());
+        insert_raw_legacy_full_proposal_and_payload(&db, &first, &first_payload);
+
+        let last_payload = Bytes::from_static(b"last-conflicting-payload");
+        let last_value = Value::new(last_payload.clone());
+        let last_legacy: ProposedValue<EmeraldContext> = ProposedValue {
+            height: Height::new(82),
+            round: Round::new(0),
+            valid_round: Round::Nil,
+            proposer: Address::new([1; 20]),
+            value: last_value.clone(),
+            validity: Validity::Valid,
+        };
+        let last_compact: ProposedValue<EmeraldContext> = ProposedValue {
+            proposer: Address::new([2; 20]),
+            ..last_legacy.clone()
+        };
+        let last_key = (last_legacy.height, last_legacy.round, last_value.id());
+        insert_raw_legacy_full_proposal_and_payload(&db, &last_legacy, &last_payload);
+        insert_raw_proposal(
+            &db,
+            last_key,
+            StoredProposalMetadata::from_proposal(&last_compact)
+                .encode()
+                .unwrap()
+                .to_vec(),
+        );
+        let first_before = raw_storage_snapshot(&db, first_key);
+        let last_before = raw_storage_snapshot(&db, last_key);
+
+        let error = db.initialize_schema().expect_err("late conflict must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("proposal representations disagree"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(raw_storage_snapshot(&db, first_key), first_before);
+        assert_eq!(raw_storage_snapshot(&db, last_key), last_before);
+        assert_eq!(reconciliation_version(&db), None);
+    }
+
+    #[test]
+    fn interrupted_streaming_reconciliation_rolls_back_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("streaming-proposal-interruption.redb");
+        let db = Db::new(&path, 1024 * 1024, DbMetrics::new()).unwrap();
+        let payload = Bytes::from_static(b"retryable-payload");
+        let value = Value::new(payload.clone());
+        let proposal: ProposedValue<EmeraldContext> = ProposedValue {
+            height: Height::new(83),
+            round: Round::new(2),
+            valid_round: Round::new(1),
+            proposer: Address::new([9; 20]),
+            value: value.clone(),
+            validity: Validity::Valid,
+        };
+        let key = (proposal.height, proposal.round, value.id());
+        insert_raw_legacy_full_proposal_and_payload(&db, &proposal, &payload);
+        let before = raw_storage_snapshot(&db, key);
+
+        let tx = db.db.begin_write().unwrap();
+        let mut migration = UndecidedBlockDataMigrationStats::default();
+        let mut stats = SchemaInitializationStats::default();
+        Db::reconcile_undecided_storage(&tx, &mut migration, &mut stats).unwrap();
+        drop(tx);
+
+        assert_eq!(raw_storage_snapshot(&db, key), before);
+        assert_eq!(reconciliation_version(&db), None);
+
+        let retry = db.initialize_schema().unwrap();
+        assert!(retry.reconciliation_ran);
+        assert_eq!(retry.proposal_pairs_buffered_peak, 1);
+        assert!(raw_compact_proposal(&db, key).is_some());
+        assert_eq!(reconciliation_version(&db), Some(1));
     }
 
     fn decode_value_like_n_minus_one(value: proto::Value) -> Value {

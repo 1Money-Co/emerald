@@ -3,6 +3,7 @@
   release, Emerald dual-writes full round-keyed `undecided_values` proposals and `undecided_block_data` payloads so a
   quiesced node can return to N-1 safely. Successful one-time reconciliation writes schema version `1`; later starts
   skip legacy payload and proposal scans while retaining certificate-bound recovery for a missing decided payload.
+  First-upgrade proposal reconciliation streams the ordered v1/v2 tables with one proposal pair resident at a time.
   Compatibility rows can reuse freed redb pages later, but this migration does not guarantee that `store.db` shrinks.
   Removing both shadows and optionally compacting redb offline are tracked by
   [interop issue #325](https://github.com/1Money-Co/1money-interoperability-protocol/issues/325).
