@@ -319,9 +319,8 @@ impl Spammer {
         nonce: u64,
     ) -> Result<Vec<(Vec<serde_json::Value>, u64)>> {
         let mut batch_entries = Vec::with_capacity(tx_count as usize);
-        let mut next_nonce = nonce;
 
-        for _ in 0..tx_count {
+        for next_nonce in (nonce..).take(tx_count as usize) {
             let signed_tx = if let Some(ref payload) = self.contract_payload {
                 make_signed_contract_call_tx(
                     &self.signer,
@@ -342,7 +341,6 @@ impl Spammer {
             let tx_bytes_len = tx_bytes.len() as u64;
             let payload = hex::encode(tx_bytes);
             batch_entries.push((vec![json!(payload)], tx_bytes_len));
-            next_nonce += 1;
         }
 
         Ok(batch_entries)

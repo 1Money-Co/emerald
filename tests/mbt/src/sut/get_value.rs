@@ -33,14 +33,13 @@ impl Sut {
 
         let emerald_proposal = self.process_msg(msg, reply_rx).await?;
         let height = emerald_proposal.height;
-        let round = emerald_proposal.round;
         let value = emerald_proposal.value.clone();
         let value_id = emerald_proposal.value.id();
 
         let state = &mut self.components.state;
         let block_data = state
-            .get_block_data(height, round, value_id)
-            .await
+            .get_undecided_block_data(height, emerald_proposal.round, value_id)
+            .await?
             .ok_or(anyhow!("No block data for value id: {value_id}"))?;
 
         let proposal_parts = state

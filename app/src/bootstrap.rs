@@ -199,7 +199,7 @@ pub async fn initialize_state_from_existing_block(
 
     let latest_block_candidate_from_store = state
         .get_latest_block_candidate(height)
-        .await
+        .await?
         .ok_or_eyre("we have not atomically stored the last block, database corrupted")?;
 
     // Check if Reth is behind Emerald's stored height and replay if needed

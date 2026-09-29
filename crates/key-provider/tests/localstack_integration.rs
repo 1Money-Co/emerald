@@ -8,7 +8,8 @@
 //   cargo test -p key-provider --test localstack_integration -- --ignored
 
 use base64::Engine as _;
-use key_provider::{config::AwsSmKmsConfig, AwsSmKmsKeyProvider, KeyProvider};
+use key_provider::config::AwsSmKmsConfig;
+use key_provider::{AwsSmKmsKeyProvider, KeyProvider};
 
 const REGION: &str = "ap-east-1";
 
@@ -39,7 +40,9 @@ async fn provision_key_to_sm(
     let encrypt_resp = kms
         .encrypt()
         .key_id(key_id)
-        .plaintext(aws_sdk_kms::primitives::Blob::new(hex_key.as_bytes().to_vec()))
+        .plaintext(aws_sdk_kms::primitives::Blob::new(
+            hex_key.as_bytes().to_vec(),
+        ))
         .send()
         .await
         .unwrap();

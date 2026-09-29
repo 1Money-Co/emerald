@@ -33,7 +33,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::metrics::Metrics;
 use crate::payload::{extract_block_header, validate_execution_payload, ValidatedPayloadCache};
-use crate::store::{Store, UndecidedProposalWrite, UndecidedWriteOutcome, UndecidedWriteSource};
+use crate::store::{
+    Store, StoreError, UndecidedProposalWrite, UndecidedWriteOutcome, UndecidedWriteSource,
+};
 use crate::streaming::{PartStreamsMap, ProposalParts};
 
 pub struct StateMetrics {
@@ -43,26 +45,18 @@ pub struct StateMetrics {
     pub metrics: Metrics,
 }
 
-/// The safe result of looking up material requested by a `RestreamProposal` effect.
 pub enum AttestedReplay {
-    /// Re-publish the exact authenticated proposal under a fresh transport stream ID.
     Ready(Vec<ProposalPart>),
-    /// No authenticated proposal matches the effect, so nothing may be published.
     Absent,
-    /// An attestation exists at the requested key but does not describe the requested effect.
     IdentityMismatch { stored_init: ProposalInit },
 }
 
-/// The safe result of looking up a value for a `GetValue` request.
 pub enum PreviouslyBuiltValue {
-    /// No proposal is stored for the requested height and round.
     Absent,
-    /// Exactly one locally authored proposal can be reused.
     Reusable {
         proposal: LocallyProposedValue<EmeraldContext>,
         valid_round: Round,
     },
-    /// Stored candidates cannot safely be converted into a local proposal.
     UnsafeCandidates {
         candidate_count: usize,
         has_non_local_proposer: bool,
@@ -199,16 +193,16 @@ fn seed_from_address(address: &Address) -> u64 {
     })
 }
 
-fn build_execution_block_from_bytes(raw_block_data: Bytes) -> ExecutionBlock {
+fn build_execution_block_from_bytes(raw_block_data: Bytes) -> eyre::Result<ExecutionBlock> {
     let execution_payload: ExecutionPayloadV3 = ExecutionPayloadV3::from_ssz_bytes(&raw_block_data)
-        .expect("failed to convert block bytes into executon payload");
-    ExecutionBlock {
+        .map_err(|error| eyre::eyre!("Failed to decode stored execution payload: {error:?}"))?;
+    Ok(ExecutionBlock {
         block_hash: execution_payload.payload_inner.payload_inner.block_hash,
         block_number: execution_payload.payload_inner.payload_inner.block_number,
         parent_hash: execution_payload.payload_inner.payload_inner.parent_hash,
         timestamp: execution_payload.payload_inner.payload_inner.timestamp,
         prev_randao: execution_payload.payload_inner.payload_inner.prev_randao,
-    }
+    })
 }
 
 impl State {
@@ -289,21 +283,32 @@ impl State {
         &mut self.validated_payload_cache
     }
 
-    pub async fn get_latest_block_candidate(&self, height: Height) -> Option<ExecutionBlock> {
-        let decided_value = self.store.get_decided_value(height).await.ok().flatten()?;
+    pub async fn get_latest_block_candidate(
+        &self,
+        height: Height,
+    ) -> eyre::Result<Option<ExecutionBlock>> {
+        let Some(decided_value) = self.store.get_decided_value(height).await? else {
+            return Ok(None);
+        };
 
         let certificate = decided_value.certificate;
 
         let raw_block_data = self
-            .get_block_data(certificate.height, certificate.round, certificate.value_id)
-            .await
-            .expect("state: certificate should have associated block data");
+            .store
+            .get_decided_block_data(certificate.height)
+            .await?
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "Decided value at height {} is missing its execution payload",
+                    certificate.height
+                )
+            })?;
         debug!(
             "🎁 block size: {:?}, height: {}",
             raw_block_data.iter().len(),
             height
         );
-        Some(build_execution_block_from_bytes(raw_block_data))
+        Ok(Some(build_execution_block_from_bytes(raw_block_data)?))
     }
 
     /// Returns the earliest height with a certificate in the store.
@@ -472,8 +477,7 @@ impl State {
             return Ok(None);
         }
 
-        // Store the verified proposal and the authenticated wire evidence together. A conflicting
-        // aggregate is not safe to deliver to consensus as though it were canonical.
+        // Store the verified proposal and its authenticated wire evidence atomically.
         info!(%value.height, %value.round, %value.proposer, "Storing validated proposal as undecided");
         let attestation = ProposalAttestation {
             init: parts
@@ -485,28 +489,8 @@ impl State {
                 .cloned()
                 .expect("complete proposal has fin part"),
         };
-        let outcome = self
-            .store
-            .write_undecided_proposal(UndecidedProposalWrite {
-                proposal: value.clone(),
-                payload: data,
-                attestation: Some(attestation),
-                source: UndecidedWriteSource::Proposal,
-            })
-            .await?;
-        if let UndecidedWriteOutcome::Conflict(conflict) = &outcome {
-            warn!(
-                height = %value.height,
-                round = %value.round,
-                field = ?conflict.field,
-                "Received conflicting complete proposal"
-            );
-        }
-
-        Ok(match outcome {
-            UndecidedWriteOutcome::Canonical(value) => Some(value),
-            UndecidedWriteOutcome::Conflict(_) => None,
-        })
+        self.store_peer_undecided_value(&value, data, Some(attestation))
+            .await
     }
 
     /// Reassembles proposal parts from streamed messages.
@@ -555,24 +539,19 @@ impl State {
         Ok(Some(parts))
     }
 
-    /// Retrieves a decided block data at the given height
-    pub async fn get_block_data(
+    /// Retrieves undecided block data at the given height and value ID.
+    pub async fn get_undecided_block_data(
         &self,
         height: Height,
         round: Round,
         value_id: ValueId,
-    ) -> Option<Bytes> {
+    ) -> Result<Option<Bytes>, StoreError> {
         self.store
-            .get_block_data(height, round, value_id)
+            .get_undecided_block_data(height, round, value_id)
             .await
-            .ok()
-            .flatten()
     }
 
     /// Stores an unattested undecided proposal through the atomic aggregate boundary.
-    ///
-    /// This is used while a local proposal is being built. `stream_proposal` upgrades the
-    /// matching record with its authenticated Init/Fin envelope before publication.
     pub async fn store_undecided_value(
         &self,
         value: &ProposedValue<EmeraldContext>,
@@ -595,6 +574,45 @@ impl State {
                 value.round,
                 conflict.field,
             )),
+        }
+    }
+
+    pub(crate) async fn store_peer_undecided_value(
+        &self,
+        value: &ProposedValue<EmeraldContext>,
+        data: Bytes,
+        attestation: Option<ProposalAttestation>,
+    ) -> eyre::Result<Option<ProposedValue<EmeraldContext>>> {
+        match self
+            .store
+            .write_undecided_proposal(UndecidedProposalWrite {
+                proposal: value.clone(),
+                payload: data,
+                attestation,
+                source: UndecidedWriteSource::Proposal,
+            })
+            .await
+        {
+            Ok(UndecidedWriteOutcome::Canonical(value)) => Ok(Some(value)),
+            Ok(UndecidedWriteOutcome::Conflict(conflict)) => {
+                warn!(
+                    height = %value.height,
+                    round = %value.round,
+                    field = ?conflict.field,
+                    "Rejecting conflicting peer proposal"
+                );
+                Ok(None)
+            }
+            Err(StoreError::ConflictingUndecidedBlockData { .. }) => {
+                warn!(
+                    height = %value.height,
+                    round = %value.round,
+                    value = %value.value.id(),
+                    "Rejecting peer proposal with colliding shared payload"
+                );
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -632,33 +650,36 @@ impl State {
         // Get block data for decided value
         let block_data = self
             .store
-            .get_block_data(certificate.height, certificate.round, certificate.value_id)
-            .await?;
+            .get_undecided_block_data(certificate.height, certificate.round, certificate.value_id)
+            .await?
+            .ok_or_else(|| eyre::eyre!("state: certificate should have associated block data"))?;
 
         // Log first 32 bytes of block data with JNT prefix
-        if let Some(data) = &block_data {
-            if data.len() >= 32 {
-                info!("Committed block_data[0..32]: {}", hex::encode(&data[..32]));
-            }
+        if block_data.len() >= 32 {
+            info!(
+                "Committed block_data[0..32]: {}",
+                hex::encode(&block_data[..32])
+            );
         }
 
-        if let Some(data) = block_data {
-            // Store decided value and the block header
-            let execution_payload = ExecutionPayloadV3::from_ssz_bytes(&data).unwrap();
-            let block_header = extract_block_header(&execution_payload);
-            let block_header_bytes = Bytes::from(block_header.as_ssz_bytes());
-            self.store
-                .store_decided_value(&certificate, proposal.value, block_header_bytes)
-                .await?;
+        let execution_payload =
+            ExecutionPayloadV3::from_ssz_bytes(&block_data).map_err(|error| {
+                eyre::eyre!("Failed to decode decided execution payload: {error:?}")
+            })?;
+        let block_header = extract_block_header(&execution_payload);
+        let block_header_bytes = Bytes::from(block_header.as_ssz_bytes());
 
-            // Store decided block data
-            self.store
-                .store_decided_block_data(certificate.height, data)
-                .await?;
-        }
+        // Publish the payload, value, certificate, and header atomically so restart never observes
+        // a certificate whose execution payload is missing.
+        self.store
+            .store_decided_state(&certificate, proposal.value, block_header_bytes, block_data)
+            .await?;
 
         let prune_certificates = self.emerald_config.num_certificates_to_retain != u64::MAX
-            && certificate.height.as_u64() % self.emerald_config.prune_at_block_interval == 0;
+            && certificate
+                .height
+                .as_u64()
+                .is_multiple_of(self.emerald_config.prune_at_block_interval);
 
         // If storege becomes a bottleneck, consider optimizing this by pruning every INTERVAL heights
         let prune_result = self
@@ -695,10 +716,7 @@ impl State {
     }
 
     /// Retrieves a previously built proposal value for the given height and round.
-    /// Called by the consensus engine to re-use a previously built value.
-    /// Exactly one locally authored proposal can be reused. Ambiguous or non-local candidates
-    /// are reported separately so callers can suppress proposal construction without treating
-    /// peer-reachable stored state as a fatal application error.
+    /// Exactly one locally authored proposal can be reused.
     pub async fn get_previously_built_value(
         &self,
         height: Height,
@@ -720,7 +738,6 @@ impl State {
             });
         }
         let proposal = &proposals[0];
-
         Ok(PreviouslyBuiltValue::Reusable {
             proposal: LocallyProposedValue::new(
                 proposal.height,
@@ -749,7 +766,7 @@ impl State {
 
         let bytes = self
             .store
-            .get_block_data(height, proposal_round, value_id)
+            .get_undecided_block_data(height, proposal_round, value_id)
             .await?
             .ok_or_else(|| {
                 eyre::eyre!(
@@ -759,7 +776,8 @@ impl State {
             })?;
 
         if proposal_round != current_round {
-            // A conflicting aggregate at the current-round key aborts without mutation.
+            // Store::insert_undecided_proposal is insert-if-absent. If genuine peer metadata already exists for this
+            // key, this write adds the block data but cannot overwrite that proposal's authoritative proposer.
             let current_round_proposal = ProposedValue {
                 height: proposal.height,
                 round: current_round,
@@ -778,10 +796,6 @@ impl State {
         )))
     }
 
-    /// Loads and verifies the exact authenticated proposal requested for a restream effect.
-    ///
-    /// The stored proposer must match the effect address and the original fin signature is
-    /// verified again before any wire part is returned for publication.
     pub async fn prepare_attested_replay(
         &self,
         height: Height,
@@ -800,7 +814,6 @@ impl State {
         let Some(attestation) = record.attestation else {
             return Ok(AttestedReplay::Absent);
         };
-
         let identity_matches = attestation.init.height == height
             && attestation.init.round == round
             && attestation.init.pol_round == valid_round
@@ -821,7 +834,6 @@ impl State {
             )));
         }
         parts.push(ProposalPart::Fin(attestation.fin));
-
         let proposal_parts = ProposalParts {
             height,
             round,
@@ -832,7 +844,6 @@ impl State {
             .map_err(|error| eyre::eyre!(
                 "invalid stored proposal attestation at height {height}, round {round}, value {value_id}: {error:?}"
             ))?;
-
         Ok(AttestedReplay::Ready(proposal_parts.parts))
     }
 
@@ -869,7 +880,6 @@ impl State {
         let messages = self
             .stream_proposal(proposal.clone(), data, Round::Nil)
             .await?;
-
         Ok((proposal, messages))
     }
 
@@ -909,7 +919,6 @@ impl State {
             value: value.value.clone(),
             validity: Validity::Valid,
         };
-
         match self
             .store
             .write_undecided_proposal(UndecidedProposalWrite {
@@ -1111,14 +1120,14 @@ pub fn decode_value(bytes: Bytes) -> Result<Value, ProtoError> {
 
 #[cfg(test)]
 mod tests {
+    use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2};
     use malachitebft_app_channel::{AppMsg, Channels, NetworkMsg};
-    use malachitebft_eth_cli::config::TimeoutConfig;
     use malachitebft_eth_types::secp256k1::PrivateKey;
     use malachitebft_eth_types::Validator;
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::app::on_restream_proposal;
+    use crate::app::{on_process_synced_value, on_restream_proposal};
     use crate::metrics::{DbMetrics, Metrics};
 
     async fn make_test_state() -> (State, tempfile::TempDir) {
@@ -1131,7 +1140,7 @@ mod tests {
         let public_key = private_key.public_key();
         let address = Address::from_public_key(&public_key);
         let genesis = Genesis {
-            validator_set: ValidatorSet::new([Validator::new(public_key.clone(), 1)]),
+            validator_set: ValidatorSet::new([Validator::new(public_key, 1)]),
         };
 
         let mut emerald_config: EmeraldConfig = toml::from_str(
@@ -1149,7 +1158,7 @@ jwt_token_path = "./assets/jwt.hex"
         std::fs::write(&eth_genesis_path, "{}").unwrap();
         emerald_config.ethereum_config.eth_genesis_path = eth_genesis_path.display().to_string();
 
-        let mut state = State::new(
+        let state = State::new(
             genesis,
             EmeraldContext::new(),
             K256Provider::new(private_key),
@@ -1164,12 +1173,35 @@ jwt_token_path = "./assets/jwt.hex"
             },
             emerald_config,
         );
-        state.set_validator_set(
-            Height::new(1426),
-            ValidatorSet::new([Validator::new(public_key, 1)]),
-        );
 
         (state, dir)
+    }
+
+    fn make_execution_payload_bytes() -> Bytes {
+        let payload = ExecutionPayloadV3 {
+            payload_inner: ExecutionPayloadV2 {
+                payload_inner: ExecutionPayloadV1 {
+                    parent_hash: Default::default(),
+                    fee_recipient: Default::default(),
+                    state_root: Default::default(),
+                    receipts_root: Default::default(),
+                    logs_bloom: Default::default(),
+                    prev_randao: Default::default(),
+                    block_number: 1,
+                    gas_limit: 30_000_000,
+                    gas_used: 0,
+                    timestamp: 1,
+                    extra_data: Default::default(),
+                    base_fee_per_gas: Default::default(),
+                    block_hash: Default::default(),
+                    transactions: Vec::new(),
+                },
+                withdrawals: Vec::new(),
+            },
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+        };
+        Bytes::from(payload.as_ssz_bytes())
     }
 
     fn make_test_channels() -> (
@@ -1205,121 +1237,8 @@ jwt_token_path = "./assets/jwt.hex"
         )
     }
 
-    fn make_collecting_channels() -> (
-        Channels<EmeraldContext>,
-        tokio::task::JoinHandle<Vec<ProposalPart>>,
-    ) {
-        let (_consensus_tx, consensus_rx) = mpsc::channel(1);
-        let (network_tx, mut network_rx) = mpsc::channel::<NetworkMsg<EmeraldContext>>(16);
-        let (requests_tx, _requests_rx) = mpsc::channel(1);
-        let collector = tokio::spawn(async move {
-            let mut parts = Vec::new();
-            while let Some(NetworkMsg::PublishProposalPart(message)) = network_rx.recv().await {
-                if let Some(part) = message.content.into_data() {
-                    parts.push(part);
-                }
-            }
-            parts
-        });
-
-        (
-            Channels {
-                consensus: consensus_rx,
-                network: network_tx,
-                events: Default::default(),
-                requests: requests_tx,
-            },
-            collector,
-        )
-    }
-
-    fn make_message_collecting_channels() -> (
-        Channels<EmeraldContext>,
-        tokio::task::JoinHandle<Vec<StreamMessage<ProposalPart>>>,
-    ) {
-        let (_consensus_tx, consensus_rx) = mpsc::channel(1);
-        let (network_tx, mut network_rx) = mpsc::channel::<NetworkMsg<EmeraldContext>>(16);
-        let (requests_tx, _requests_rx) = mpsc::channel(1);
-        let collector = tokio::spawn(async move {
-            let mut messages = Vec::new();
-            while let Some(NetworkMsg::PublishProposalPart(message)) = network_rx.recv().await {
-                messages.push(message);
-            }
-            messages
-        });
-
-        (
-            Channels {
-                consensus: consensus_rx,
-                network: network_tx,
-                events: Default::default(),
-                requests: requests_tx,
-            },
-            collector,
-        )
-    }
-
-    async fn store_foreign_attested_proposal(
-        state: &mut State,
-        valid_signature: bool,
-    ) -> (ProposedValue<EmeraldContext>, Vec<ProposalPart>) {
-        let foreign_key = PrivateKey::from_slice(&[2_u8; 32]).unwrap();
-        let foreign_public_key = foreign_key.public_key();
-        let foreign_address = Address::from_public_key(&foreign_public_key);
-        let height = Height::new(1426);
-        let round = Round::new(10);
-        let valid_round = Round::new(7);
-        let payload = Bytes::from(vec![0xA5; CHUNK_SIZE + 17]);
-        state.set_validator_set(
-            height,
-            ValidatorSet::new([Validator::new(foreign_public_key, 1)]),
-        );
-
-        let init = ProposalInit::new(height, round, valid_round, foreign_address);
-        let mut hasher = sha3::Keccak256::new();
-        hasher.update(height.as_u64().to_be_bytes());
-        hasher.update(round.as_i64().to_be_bytes());
-        hasher.update(&payload);
-        let digest = hasher.finalize();
-        let signature = if valid_signature {
-            K256Provider::new(foreign_key).sign(&digest)
-        } else {
-            state.signing_provider.sign(&digest)
-        };
-        let fin = ProposalFin::new(signature);
-        let proposal = ProposedValue {
-            height,
-            round,
-            valid_round,
-            proposer: foreign_address,
-            value: Value::new(payload.clone()),
-            validity: Validity::Valid,
-        };
-        state
-            .store
-            .write_undecided_proposal(UndecidedProposalWrite {
-                proposal: proposal.clone(),
-                payload: payload.clone(),
-                attestation: Some(ProposalAttestation::new(init.clone(), fin.clone())),
-                source: UndecidedWriteSource::Proposal,
-            })
-            .await
-            .unwrap();
-
-        let mut parts = Vec::with_capacity(payload.chunks(CHUNK_SIZE).len() + 2);
-        parts.push(ProposalPart::Init(init));
-        parts.extend(
-            payload
-                .chunks(CHUNK_SIZE)
-                .map(|chunk| ProposalPart::Data(ProposalData::new(Bytes::copy_from_slice(chunk)))),
-        );
-        parts.push(ProposalPart::Fin(fin));
-
-        (proposal, parts)
-    }
-
     #[tokio::test]
-    async fn restream_proposal_does_not_rebuild_a_foreign_proposal() {
+    async fn foreign_unattested_restream_does_not_create_local_reproposal() {
         let (mut state, _dir) = make_test_state().await;
         let height = Height::new(1426);
         let proposal_round = Round::new(0);
@@ -1358,15 +1277,474 @@ jwt_token_path = "./assets/jwt.hex"
         .await
         .unwrap();
 
-        let current_round_proposal = state
+        assert!(state
             .store
             .get_undecided_proposal(height, current_round, value.id())
             .await
-            .unwrap();
-        assert!(current_round_proposal.is_none());
+            .unwrap()
+            .is_none());
+        assert_eq!(state.store.undecided_block_data_len().await.unwrap(), 1);
 
         drop(channels);
         proposal_init.abort();
+    }
+
+    #[tokio::test]
+    async fn shared_undecided_block_data_commits_from_later_round() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let source_round = Round::new(0);
+        let decided_round = Round::new(2);
+        let bytes = make_execution_payload_bytes();
+        let value = Value::new(bytes.clone());
+        let proposal = ProposedValue {
+            height,
+            round: source_round,
+            valid_round: Round::Nil,
+            proposer: state.address,
+            value: value.clone(),
+            validity: Validity::Valid,
+        };
+        state
+            .store_undecided_value(&proposal, bytes.clone())
+            .await
+            .unwrap();
+        state
+            .prepare_restream_proposal(height, source_round, decided_round, value.id())
+            .await
+            .unwrap()
+            .unwrap();
+
+        state
+            .commit(CommitCertificate {
+                height,
+                round: decided_round,
+                value_id: value.id(),
+                commit_signatures: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state.store.get_decided_block_data(height).await.unwrap(),
+            Some(bytes)
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_errors_when_undecided_block_data_is_missing() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(0);
+        let value = Value::new(make_execution_payload_bytes());
+        let proposal = ProposedValue {
+            height,
+            round,
+            valid_round: Round::Nil,
+            proposer: state.address,
+            value: value.clone(),
+            validity: Validity::Valid,
+        };
+        state
+            .store
+            .store_undecided_proposal(proposal)
+            .await
+            .unwrap();
+
+        let error = state
+            .commit(CommitCertificate {
+                height,
+                round,
+                value_id: value.id(),
+                commit_signatures: Vec::new(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("missing shared payload"),
+            "unexpected error: {error:#}"
+        );
+        assert!(state
+            .store
+            .get_decided_value(height)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn commit_does_not_publish_decided_value_when_decided_payload_conflicts() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(0);
+        let bytes = make_execution_payload_bytes();
+        let value = Value::new(bytes.clone());
+        let proposal = ProposedValue {
+            height,
+            round,
+            valid_round: Round::Nil,
+            proposer: state.address,
+            value: value.clone(),
+            validity: Validity::Valid,
+        };
+        state.store_undecided_value(&proposal, bytes).await.unwrap();
+        state
+            .store
+            .store_legacy_decided_block_data(
+                height,
+                Bytes::from_static(b"conflicting-decided-payload"),
+            )
+            .await
+            .unwrap();
+
+        let error = state
+            .commit(CommitCertificate {
+                height,
+                round,
+                value_id: value.id(),
+                commit_signatures: Vec::new(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("Conflicting decided block data"),
+            "unexpected error: {error:#}"
+        );
+        assert!(state
+            .store
+            .get_decided_value(height)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn commit_retries_after_decided_payload_was_already_persisted() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(0);
+        let bytes = make_execution_payload_bytes();
+        let value = Value::new(bytes.clone());
+        let proposal = ProposedValue {
+            height,
+            round,
+            valid_round: Round::Nil,
+            proposer: state.address,
+            value: value.clone(),
+            validity: Validity::Valid,
+        };
+        state
+            .store_undecided_value(&proposal, bytes.clone())
+            .await
+            .unwrap();
+        state
+            .store
+            .store_legacy_decided_block_data(height, bytes.clone())
+            .await
+            .unwrap();
+
+        let certificate = CommitCertificate {
+            height,
+            round,
+            value_id: value.id(),
+            commit_signatures: Vec::new(),
+        };
+        state.commit(certificate.clone()).await.unwrap();
+
+        assert_eq!(
+            state.store.get_decided_block_data(height).await.unwrap(),
+            Some(bytes)
+        );
+        let decided = state
+            .store
+            .get_decided_value(height)
+            .await
+            .unwrap()
+            .expect("retry must publish the decided value");
+        assert_eq!(decided.certificate, certificate);
+        assert_eq!(decided.value, value);
+    }
+
+    #[tokio::test]
+    async fn latest_block_candidate_missing_payload_returns_error_without_panicking() {
+        let (state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let value = Value::new(make_execution_payload_bytes());
+        state
+            .store
+            .store_legacy_decided_metadata(
+                &CommitCertificate {
+                    height,
+                    round: Round::new(0),
+                    value_id: value.id(),
+                    commit_signatures: Vec::new(),
+                },
+                value,
+                Bytes::from_static(b"header"),
+            )
+            .await
+            .unwrap();
+
+        let result = tokio::spawn(async move { state.get_latest_block_candidate(height).await })
+            .await
+            .expect("missing decided payload must not panic");
+
+        let error = result.expect_err("missing decided payload must return an error");
+        assert!(
+            error.to_string().contains("missing its execution payload"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_block_candidate_malformed_payload_returns_error_without_panicking() {
+        let (state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let value = Value::new(make_execution_payload_bytes());
+        state
+            .store
+            .store_legacy_decided_metadata(
+                &CommitCertificate {
+                    height,
+                    round: Round::new(0),
+                    value_id: value.id(),
+                    commit_signatures: Vec::new(),
+                },
+                value,
+                Bytes::from_static(b"header"),
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .store_legacy_decided_block_data(height, Bytes::from_static(b"not-an-ssz-payload"))
+            .await
+            .unwrap();
+
+        let result = tokio::spawn(async move { state.get_latest_block_candidate(height).await })
+            .await
+            .expect("malformed decided payload must not panic");
+
+        let error = result.expect_err("malformed decided payload must return an error");
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to decode stored execution payload"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_undecided_block_data_reports_absence_without_error() {
+        let (state, _dir) = make_test_state().await;
+
+        assert!(matches!(
+            state
+                .get_undecided_block_data(Height::new(1426), Round::new(0), ValueId::new(7),)
+                .await,
+            Ok(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn shared_undecided_block_data_stores_synced_value() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(3);
+        let bytes = make_execution_payload_bytes();
+        let value = Value::new(bytes.clone());
+        let value_bytes = ProtobufCodec.encode(&value).unwrap();
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+
+        on_process_synced_value(
+            AppMsg::ProcessSyncedValue {
+                height,
+                round,
+                proposer: state.address,
+                value_bytes,
+                reply,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(receiver.await.unwrap().unwrap().value, value);
+        assert_eq!(
+            state
+                .store
+                .get_undecided_block_data(height, round, value.id())
+                .await
+                .unwrap(),
+            Some(bytes)
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_value_conflict_is_rejected_without_fatal_error() {
+        let (state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let original_bytes = make_execution_payload_bytes();
+        let original_value = Value::new(original_bytes.clone());
+        let original_proposal = ProposedValue {
+            height,
+            round: Round::new(0),
+            valid_round: Round::Nil,
+            proposer: state.address,
+            value: original_value.clone(),
+            validity: Validity::Valid,
+        };
+        state
+            .store_undecided_value(&original_proposal, original_bytes.clone())
+            .await
+            .unwrap();
+
+        let conflicting_value = Value {
+            value: original_value.value,
+            extensions: Bytes::from_static(b"conflicting-peer-payload"),
+        };
+        let conflicting_proposal = ProposedValue {
+            height,
+            round: Round::new(3),
+            valid_round: Round::Nil,
+            proposer: state.address,
+            value: conflicting_value,
+            validity: Validity::Valid,
+        };
+
+        let stored = state
+            .store_peer_undecided_value(
+                &conflicting_proposal,
+                Bytes::from_static(b"conflicting-peer-payload"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(stored.is_none());
+        assert_eq!(
+            state
+                .store
+                .get_undecided_block_data(height, original_proposal.round, original_value.id())
+                .await
+                .unwrap(),
+            Some(original_bytes)
+        );
+    }
+
+    #[tokio::test]
+    async fn synced_value_with_malformed_execution_payload_is_rejected() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(3);
+        let malformed = Value::new(Bytes::from_static(b"not-an-ssz-execution-payload"));
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+
+        on_process_synced_value(
+            AppMsg::ProcessSyncedValue {
+                height,
+                round,
+                proposer: state.address,
+                value_bytes: ProtobufCodec.encode(&malformed).unwrap(),
+                reply,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        let rejected = receiver
+            .await
+            .unwrap()
+            .expect("decoded invalid value must be forwarded to consensus");
+        assert_eq!(rejected.value, malformed);
+        assert_eq!(rejected.validity, Validity::Invalid);
+        assert!(state
+            .store
+            .get_undecided_block_data(height, round, malformed.id())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn synced_value_with_mismatched_wire_id_is_rejected_during_decoding() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(3);
+        let payload = make_execution_payload_bytes();
+        let unrelated = Value::new(Bytes::from_static(b"different-payload"));
+        let forged = Value {
+            value: unrelated.value,
+            extensions: payload,
+        };
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+
+        on_process_synced_value(
+            AppMsg::ProcessSyncedValue {
+                height,
+                round,
+                proposer: state.address,
+                value_bytes: ProtobufCodec.encode(&forged).unwrap(),
+                reply,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        assert!(receiver.await.unwrap().is_none());
+        assert!(state
+            .store
+            .get_undecided_block_data(height, round, forged.id())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn synced_value_with_conflicting_stored_payload_is_rejected() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = Height::new(1426);
+        let round = Round::new(3);
+        let payload = make_execution_payload_bytes();
+        let value = Value::new(payload.clone());
+        let existing = Bytes::from_static(b"conflicting-stored-payload");
+        state
+            .store
+            .store_undecided_block_data(height, round, value.id(), existing.clone())
+            .await
+            .unwrap();
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+
+        let error = on_process_synced_value(
+            AppMsg::ProcessSyncedValue {
+                height,
+                round,
+                proposer: state.address,
+                value_bytes: ProtobufCodec.encode(&value).unwrap(),
+                reply,
+            },
+            &mut state,
+        )
+        .await
+        .expect_err("a conflicting local payload must stop sync processing");
+
+        assert!(matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::ConflictingUndecidedBlockData { .. })
+        ));
+        assert!(receiver.await.is_err());
+        assert_eq!(
+            state
+                .store
+                .get_undecided_block_data(height, round, value.id())
+                .await
+                .unwrap(),
+            Some(existing)
+        );
     }
 
     #[tokio::test]
@@ -1387,7 +1765,7 @@ jwt_token_path = "./assets/jwt.hex"
     }
 
     #[tokio::test]
-    async fn restream_proposal_errors_when_storage_record_is_incomplete() {
+    async fn restream_proposal_errors_when_block_data_is_missing() {
         let (state, _dir) = make_test_state().await;
         let height = Height::new(1426);
         let proposal_round = Round::new(0);
@@ -1414,9 +1792,7 @@ jwt_token_path = "./assets/jwt.hex"
             Ok(_) => panic!("missing block data must be an error"),
         };
 
-        assert!(error
-            .to_string()
-            .contains("invalid undecided proposal record shape"));
+        assert!(error.to_string().contains("missing shared payload"));
         assert!(error.to_string().contains("1426"));
     }
 
@@ -1470,471 +1846,5 @@ jwt_token_path = "./assets/jwt.hex"
             .unwrap()
             .expect("current-round proposal must remain stored");
         assert_eq!(current_round_proposal.valid_round, Round::Nil);
-    }
-
-    #[tokio::test]
-    async fn local_proposal_persists_attestation_in_one_write() {
-        let (mut state, _dir) = make_test_state().await;
-        let height = Height::new(1426);
-        let round = Round::new(0);
-        let payload = Bytes::from_static(b"local-attested-proposal");
-        let writes_before = state.store.write_count();
-
-        let (proposal, messages) = state
-            .prepare_local_proposal(height, round, payload)
-            .await
-            .unwrap();
-
-        assert_eq!(state.store.write_count(), writes_before + 1);
-        assert!(!messages.is_empty());
-
-        let stored = state
-            .store
-            .get_undecided_record(height, round, proposal.value.id())
-            .await
-            .unwrap()
-            .expect("streamed proposal must be stored");
-        assert!(stored.attestation.is_some());
-    }
-
-    #[tokio::test]
-    async fn maximum_local_proposal_preparation_meets_default_deadline() {
-        let (mut state, _dir) = make_test_state().await;
-        let payload = Bytes::from(vec![0xA5; BLOCK_SIZE]);
-        let deadline = TimeoutConfig::default().timeout_propose;
-
-        let (proposal, messages) = tokio::time::timeout(
-            deadline,
-            state.prepare_local_proposal(Height::new(1426), Round::new(0), payload),
-        )
-        .await
-        .expect("maximum local proposal must be durable before timeout_propose")
-        .unwrap();
-
-        assert_eq!(proposal.value.extensions.len(), BLOCK_SIZE);
-        assert_eq!(messages.len(), BLOCK_SIZE.div_ceil(CHUNK_SIZE) + 3);
-    }
-
-    #[tokio::test]
-    async fn local_proposal_parts_share_the_payload_allocation() {
-        let (state, _dir) = make_test_state().await;
-        let height = Height::new(1426);
-        let round = Round::new(0);
-        let payload = Bytes::from(vec![0xA5; CHUNK_SIZE * 2 + 17]);
-        let proposal = LocallyProposedValue::new(height, round, Value::new(payload.clone()));
-
-        let parts = state.make_proposal_parts(proposal, payload, Round::Nil);
-        let data_parts: Vec<_> = parts.iter().filter_map(ProposalPart::as_data).collect();
-
-        assert_eq!(data_parts.len(), 3);
-        assert!(data_parts.iter().all(|part| !part.bytes.is_unique()));
-    }
-
-    #[tokio::test]
-    async fn previously_built_value_marks_a_non_local_proposer_as_unsafe() {
-        let (state, _dir) = make_test_state().await;
-        let height = Height::new(1426);
-        let round = Round::new(0);
-        let payload = Bytes::from_static(b"foreign-proposal");
-        let foreign = ProposedValue {
-            height,
-            round,
-            valid_round: Round::Nil,
-            proposer: Address::new([9; 20]),
-            value: Value::new(payload.clone()),
-            validity: Validity::Valid,
-        };
-        state
-            .store
-            .write_undecided_proposal(UndecidedProposalWrite {
-                proposal: foreign,
-                payload,
-                attestation: None,
-                source: UndecidedWriteSource::Proposal,
-            })
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            state
-                .get_previously_built_value(height, round)
-                .await
-                .unwrap(),
-            PreviouslyBuiltValue::UnsafeCandidates {
-                candidate_count: 1,
-                has_non_local_proposer: true,
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn previously_built_value_marks_multiple_candidates_as_unsafe() {
-        let (state, _dir) = make_test_state().await;
-        let height = Height::new(1426);
-        let round = Round::new(0);
-
-        for payload in [
-            Bytes::from_static(b"first-local-proposal"),
-            Bytes::from_static(b"second-local-proposal"),
-        ] {
-            let proposal = ProposedValue {
-                height,
-                round,
-                valid_round: Round::Nil,
-                proposer: state.address,
-                value: Value::new(payload.clone()),
-                validity: Validity::Valid,
-            };
-            state
-                .store
-                .write_undecided_proposal(UndecidedProposalWrite {
-                    proposal,
-                    payload,
-                    attestation: None,
-                    source: UndecidedWriteSource::Proposal,
-                })
-                .await
-                .unwrap();
-        }
-
-        assert!(matches!(
-            state
-                .get_previously_built_value(height, round)
-                .await
-                .unwrap(),
-            PreviouslyBuiltValue::UnsafeCandidates {
-                candidate_count: 2,
-                has_non_local_proposer: false,
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn attested_replay_returns_the_original_authenticated_parts() {
-        let (mut state, _dir) = make_test_state().await;
-        let height = Height::new(1426);
-        let round = Round::new(0);
-        let payload = Bytes::from_static(b"authenticated-replay");
-        let (proposal, streamed) = state
-            .prepare_local_proposal(height, round, payload)
-            .await
-            .unwrap();
-
-        let AttestedReplay::Ready(parts) = state
-            .prepare_attested_replay(
-                height,
-                round,
-                Round::Nil,
-                state.address,
-                proposal.value.id(),
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("locally streamed proposal must be replayable");
-        };
-
-        assert_eq!(
-            parts.first().and_then(ProposalPart::as_init),
-            streamed[0]
-                .content
-                .as_data()
-                .and_then(ProposalPart::as_init)
-        );
-        assert_eq!(
-            parts.last().and_then(ProposalPart::as_fin),
-            streamed[streamed.len() - 2]
-                .content
-                .as_data()
-                .and_then(ProposalPart::as_fin)
-        );
-    }
-
-    #[tokio::test]
-    async fn attested_replay_parts_share_one_payload_allocation() {
-        let (mut state, _dir) = make_test_state().await;
-        let (proposal, _) = store_foreign_attested_proposal(&mut state, true).await;
-
-        let AttestedReplay::Ready(parts) = state
-            .prepare_attested_replay(
-                proposal.height,
-                proposal.round,
-                proposal.valid_round,
-                proposal.proposer,
-                proposal.value.id(),
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("stored foreign proposal must be replayable");
-        };
-        let data_parts: Vec<_> = parts.iter().filter_map(ProposalPart::as_data).collect();
-
-        assert_eq!(data_parts.len(), 2);
-        assert!(data_parts.iter().all(|part| !part.bytes.is_unique()));
-    }
-
-    #[tokio::test]
-    async fn attested_replay_rejects_an_effect_with_a_different_pol_round() {
-        let (mut state, _dir) = make_test_state().await;
-        let height = Height::new(1426);
-        let round = Round::new(0);
-        let payload = Bytes::from_static(b"attested-replay-identity");
-        let (proposal, _) = state
-            .prepare_local_proposal(height, round, payload)
-            .await
-            .unwrap();
-
-        let AttestedReplay::IdentityMismatch { stored_init } = state
-            .prepare_attested_replay(
-                height,
-                round,
-                Round::new(1),
-                state.address,
-                proposal.value.id(),
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("a different POL round must not be replayed");
-        };
-
-        assert_eq!(stored_init.pol_round, Round::Nil);
-    }
-
-    #[tokio::test]
-    async fn foreign_restream_replays_original_parts_byte_for_byte() {
-        let (mut state, _dir) = make_test_state().await;
-        let (proposal, original_parts) = store_foreign_attested_proposal(&mut state, true).await;
-        assert_ne!(proposal.proposer, state.address);
-        let (mut channels, collector) = make_collecting_channels();
-
-        on_restream_proposal(
-            AppMsg::RestreamProposal {
-                height: proposal.height,
-                round: proposal.round,
-                valid_round: proposal.valid_round,
-                address: proposal.proposer,
-                value_id: proposal.value.id(),
-            },
-            &mut state,
-            &mut channels,
-        )
-        .await
-        .unwrap();
-        drop(channels);
-        let replayed_parts = collector.await.unwrap();
-
-        let encoded_original: Vec<_> = original_parts
-            .iter()
-            .map(|part| ProtobufCodec.encode(part).unwrap())
-            .collect();
-        let encoded_replayed: Vec<_> = replayed_parts
-            .iter()
-            .map(|part| ProtobufCodec.encode(part).unwrap())
-            .collect();
-        assert_eq!(
-            replayed_parts
-                .iter()
-                .filter(|part| matches!(part, ProposalPart::Data(_)))
-                .count(),
-            2
-        );
-        assert_eq!(encoded_replayed, encoded_original);
-    }
-
-    #[tokio::test]
-    async fn repeated_foreign_restreams_use_fresh_stream_ids() {
-        let (mut state, _dir) = make_test_state().await;
-        let (proposal, _) = store_foreign_attested_proposal(&mut state, true).await;
-        let mut stream_ids = Vec::new();
-
-        for _ in 0..2 {
-            let (mut channels, collector) = make_message_collecting_channels();
-            on_restream_proposal(
-                AppMsg::RestreamProposal {
-                    height: proposal.height,
-                    round: proposal.round,
-                    valid_round: proposal.valid_round,
-                    address: proposal.proposer,
-                    value_id: proposal.value.id(),
-                },
-                &mut state,
-                &mut channels,
-            )
-            .await
-            .unwrap();
-            drop(channels);
-            let messages = collector.await.unwrap();
-            let stream_id = messages
-                .first()
-                .expect("restream must publish proposal parts")
-                .stream_id
-                .clone();
-            assert!(messages
-                .iter()
-                .all(|message| message.stream_id == stream_id));
-            stream_ids.push(stream_id);
-        }
-
-        assert_ne!(stream_ids[0], stream_ids[1]);
-    }
-
-    #[tokio::test]
-    async fn forwarded_parts_validate_on_an_independent_receiver() {
-        let (mut forwarder, _forwarder_dir) = make_test_state().await;
-        let (proposal, _) = store_foreign_attested_proposal(&mut forwarder, true).await;
-        let AttestedReplay::Ready(parts) = forwarder
-            .prepare_attested_replay(
-                proposal.height,
-                proposal.round,
-                proposal.valid_round,
-                proposal.proposer,
-                proposal.value.id(),
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("foreign proposal must be replayable");
-        };
-
-        let (mut receiver, _receiver_dir) = make_test_state().await;
-        let foreign_key = PrivateKey::from_slice(&[2_u8; 32]).unwrap();
-        receiver.set_validator_set(
-            proposal.height,
-            ValidatorSet::new([Validator::new(foreign_key.public_key(), 1)]),
-        );
-        let forwarded = ProposalParts {
-            height: proposal.height,
-            round: proposal.round,
-            proposer: proposal.proposer,
-            parts,
-        };
-
-        receiver.validate_proposal_parts(&forwarded).unwrap();
-    }
-
-    #[tokio::test]
-    async fn independent_receiver_rejects_mutated_forwarded_payload() {
-        let (mut forwarder, _forwarder_dir) = make_test_state().await;
-        let (proposal, _) = store_foreign_attested_proposal(&mut forwarder, true).await;
-        let AttestedReplay::Ready(mut parts) = forwarder
-            .prepare_attested_replay(
-                proposal.height,
-                proposal.round,
-                proposal.valid_round,
-                proposal.proposer,
-                proposal.value.id(),
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("foreign proposal must be replayable");
-        };
-        let data = parts
-            .iter_mut()
-            .find_map(|part| match part {
-                ProposalPart::Data(data) => Some(data),
-                _ => None,
-            })
-            .unwrap();
-        let mut mutated = data.bytes.to_vec();
-        mutated[0] ^= 0xFF;
-        data.bytes = Bytes::from(mutated);
-
-        let (mut receiver, _receiver_dir) = make_test_state().await;
-        let foreign_key = PrivateKey::from_slice(&[2_u8; 32]).unwrap();
-        receiver.set_validator_set(
-            proposal.height,
-            ValidatorSet::new([Validator::new(foreign_key.public_key(), 1)]),
-        );
-        let error = receiver
-            .validate_proposal_parts(&ProposalParts {
-                height: proposal.height,
-                round: proposal.round,
-                proposer: proposal.proposer,
-                parts,
-            })
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            ProposalValidationError::Signature(SignatureVerificationError::InvalidSignature)
-        ));
-    }
-
-    #[tokio::test]
-    async fn independent_receiver_rejects_substituted_forwarder_as_proposer() {
-        let (mut forwarder, _forwarder_dir) = make_test_state().await;
-        let (proposal, _) = store_foreign_attested_proposal(&mut forwarder, true).await;
-        let AttestedReplay::Ready(mut parts) = forwarder
-            .prepare_attested_replay(
-                proposal.height,
-                proposal.round,
-                proposal.valid_round,
-                proposal.proposer,
-                proposal.value.id(),
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("foreign proposal must be replayable");
-        };
-        let substituted = forwarder.address;
-        parts
-            .iter_mut()
-            .find_map(|part| match part {
-                ProposalPart::Init(init) => Some(init),
-                _ => None,
-            })
-            .unwrap()
-            .proposer = substituted;
-
-        let (mut receiver, _receiver_dir) = make_test_state().await;
-        let foreign_key = PrivateKey::from_slice(&[2_u8; 32]).unwrap();
-        receiver.set_validator_set(
-            proposal.height,
-            ValidatorSet::new([Validator::new(foreign_key.public_key(), 1)]),
-        );
-        let error = receiver
-            .validate_proposal_parts(&ProposalParts {
-                height: proposal.height,
-                round: proposal.round,
-                proposer: substituted,
-                parts,
-            })
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            ProposalValidationError::WrongProposer {
-                actual,
-                expected
-            } if actual == substituted && expected == proposal.proposer
-        ));
-    }
-
-    #[tokio::test]
-    async fn invalid_stored_signature_does_not_stop_the_application() {
-        let (mut state, _dir) = make_test_state().await;
-        let (proposal, _) = store_foreign_attested_proposal(&mut state, false).await;
-        let (mut channels, collector) = make_collecting_channels();
-
-        let result = on_restream_proposal(
-            AppMsg::RestreamProposal {
-                height: proposal.height,
-                round: proposal.round,
-                valid_round: proposal.valid_round,
-                address: proposal.proposer,
-                value_id: proposal.value.id(),
-            },
-            &mut state,
-            &mut channels,
-        )
-        .await;
-        drop(channels);
-
-        assert!(result.is_ok());
-        assert!(collector.await.unwrap().is_empty());
     }
 }

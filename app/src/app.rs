@@ -12,7 +12,7 @@ use malachitebft_app_channel::{AppMsg, Channels, NetworkMsg};
 use malachitebft_eth_cli::config::EmeraldConfig;
 use malachitebft_eth_engine::engine::Engine;
 use malachitebft_eth_engine::json_structures::ExecutionBlock;
-use malachitebft_eth_types::EmeraldContext;
+use malachitebft_eth_types::{EmeraldContext, Value};
 use ssz::{Decode, Encode};
 use tokio::time::Instant as TokioInstant;
 use tracing::{debug, error, info, warn};
@@ -48,7 +48,7 @@ pub async fn on_consensus_ready(
     engine.check_capabilities().await?;
 
     // Get latest decided height from local store
-    let latest_height_from_store = state.store.max_decided_value_height().await;
+    let latest_height_from_store = state.store.max_decided_value_height().await?;
     match latest_height_from_store {
         Some(h) => {
             initialize_state_from_existing_block(state, engine, h, emerald_config).await?;
@@ -190,8 +190,8 @@ pub async fn on_started_round(
 ///
 /// Requests the application to build a value for consensus to propose.
 ///
-/// The application replies with the requested value within the timeout unless stored candidates
-/// cannot safely become a new local envelope, in which case it declines the request.
+/// The application MUST reply to this message with the requested value
+/// within the specified timeout duration.
 pub async fn on_get_value(
     get_value: AppMsg<EmeraldContext>,
     state: &mut State,
@@ -209,8 +209,6 @@ pub async fn on_get_value(
         unreachable!("on_get_value called with non-GetValue message");
     };
 
-    // The timeout is used below only while the execution client is syncing.
-
     info!(%height, %round, "🟢🟢 Consensus is requesting a value to propose");
 
     // Here it is important that, if we have previously built a value for this height and round,
@@ -220,22 +218,11 @@ pub async fn on_get_value(
             candidate_count,
             has_non_local_proposer,
         } => {
-            warn!(
-                %height,
-                %round,
-                candidate_count,
-                has_non_local_proposer,
-                "Stored proposals are unsafe to reuse; suppressing GetValue"
-            );
+            warn!(%height, %round, candidate_count, has_non_local_proposer, "Stored proposals are unsafe to reuse; suppressing GetValue");
             return Ok(());
         }
         PreviouslyBuiltValue::Reusable { valid_round, .. } if valid_round.is_defined() => {
-            warn!(
-                %height,
-                %round,
-                %valid_round,
-                "Stored proposal requires a POL; suppressing GetValue during recovery"
-            );
+            warn!(%height, %round, %valid_round, "Stored proposal requires a POL; suppressing GetValue during recovery");
             return Ok(());
         }
         PreviouslyBuiltValue::Reusable { proposal, .. } => {
@@ -243,7 +230,7 @@ pub async fn on_get_value(
             // Fetch the block data for the previously built value
             let bytes = state
                 .store
-                .get_block_data(height, round, proposal.value.id())
+                .get_undecided_block_data(height, round, proposal.value.id())
                 .await?
                 .ok_or_else(|| eyre!("Block data not found for previously built value"))?;
             let stream_messages = state
@@ -291,13 +278,11 @@ pub async fn on_get_value(
         }
     };
 
-    // Send it to consensus only after the attested stream is durable.
+    // Send it to consensus
     if reply.send(proposal.clone()).is_err() {
         error!("Failed to send GetValue reply");
     }
 
-    // Now what's left to do is to break down the value to propose into parts,
-    // and send those parts over the network to our peers, for them to re-assemble the full value.
     for stream_message in stream_messages {
         debug!(%height, %round, "Streaming proposal part: {stream_message:?}");
         channels
@@ -605,15 +590,18 @@ async fn on_decided_inner(
     // that were completely received by the local node
     timings.enter_awaited(AwaitedStage::BlockDataRead);
     let started = Instant::now();
-    let block_bytes = state.get_block_data(height, round, value_id).await;
+    let block_bytes = state
+        .get_undecided_block_data(height, round, value_id)
+        .await;
     timings.observe(AwaitedStage::BlockDataRead, started.elapsed(), metrics);
     let block_bytes =
-        block_bytes.ok_or_eyre("app: certificate should have associated block data")?;
+        block_bytes?.ok_or_eyre("app: certificate should have associated block data")?;
     timings.enter_preparation();
     debug!("🎁 block size: {:?}, height: {}", block_bytes.len(), height);
 
     // Decode bytes into execution payload (a block) and get relevant fields
-    let execution_payload = ExecutionPayloadV3::from_ssz_bytes(&block_bytes).unwrap();
+    let execution_payload = ExecutionPayloadV3::from_ssz_bytes(&block_bytes)
+        .map_err(|error| eyre!("Failed to decode decided execution payload: {error:?}"))?;
     let block_hash = execution_payload.payload_inner.payload_inner.block_hash;
     let block_timestamp = execution_payload.timestamp();
     let block_number = execution_payload.payload_inner.payload_inner.block_number;
@@ -781,8 +769,7 @@ pub async fn on_process_synced_value(
     };
 
     let block_bytes = value.extensions.clone();
-
-    let proposed_value: ProposedValue<EmeraldContext> = ProposedValue {
+    let mut proposed_value: ProposedValue<EmeraldContext> = ProposedValue {
         height,
         round,
         valid_round: Round::Nil,
@@ -791,8 +778,37 @@ pub async fn on_process_synced_value(
         validity: Validity::Valid, // already validated by 2/3+ of the validator set
     };
 
-    // Store the synchronized value atomically. The sync source deliberately preserves a
-    // previously authenticated proposal's valid_round and attestation when both agree on value.
+    if let Err(error) = ExecutionPayloadV3::from_ssz_bytes(&block_bytes) {
+        warn!(%height, %round, error = ?error, "Rejecting synced value with malformed execution payload");
+        proposed_value.validity = Validity::Invalid;
+        if reply.send(Some(proposed_value)).is_err() {
+            error!(%height, %round, "Failed to send invalid ProcessSyncedValue reply");
+        }
+        return Ok(());
+    }
+
+    // Defense in depth: `Value::from_proto` already binds the ID to `extensions`. Keep this check at
+    // the application boundary because a mismatch entering Malachite can poison its first-write-wins
+    // proposal keeper and later panic when the certified payload is decided.
+    let derived_value_id = Value::new(block_bytes.clone()).id();
+    if derived_value_id != proposed_value.value.id() {
+        warn!(
+            %height,
+            %round,
+            certified_value = %proposed_value.value.id(),
+            derived_value = %derived_value_id,
+            "Rejecting synced value whose ID does not match its execution payload"
+        );
+        proposed_value.validity = Validity::Invalid;
+        if reply.send(Some(proposed_value)).is_err() {
+            error!(%height, %round, "Failed to send invalid ProcessSyncedValue reply");
+        }
+        return Ok(());
+    }
+
+    // Preserve any previously authenticated valid-round and attestation for the same proposal.
+    // A shared-payload collision is still a fatal local storage error: retrying another peer
+    // cannot repair it and must not repeatedly penalize healthy peers.
     let proposed_value = match state
         .store
         .write_undecided_proposal(UndecidedProposalWrite {
@@ -937,14 +953,13 @@ pub async fn on_restream_proposal(
             return Ok(());
         }
         AttestedReplay::Absent if address != state.address => {
-            warn!(%height, %round, %address, %value_id, "No local authenticated proposal to restream");
+            warn!(%height, %round, %address, %value_id, "No authenticated foreign proposal to restream");
             return Ok(());
         }
         AttestedReplay::Absent => {}
     }
 
-    // Only the local proposer may fall back to creating a fresh, authenticated re-proposal.
-    // Look for a proposal at valid_round or round (which should already be stored).
+    // Only the local proposer may fall back to creating a fresh authenticated re-proposal.
     let proposal_round = if valid_round == Round::Nil {
         round
     } else {

@@ -6,18 +6,14 @@
 //! This build script reads the offsets from the Foundry JSON artifact so they stay
 //! in sync automatically after every `forge build`.
 
-use std::env;
-use std::fs;
 use std::path::Path;
+use std::{env, fs};
 
 fn main() {
     let artifact_path = Path::new("../solidity/out/ValidatorManager.sol/ValidatorManager.json");
 
     // Re-run if the artifact changes (i.e. after `forge build`)
-    println!(
-        "cargo::rerun-if-changed={}",
-        artifact_path.display()
-    );
+    println!("cargo::rerun-if-changed={}", artifact_path.display());
 
     let json_str = fs::read_to_string(artifact_path).unwrap_or_else(|e| {
         panic!(
@@ -39,7 +35,10 @@ fn main() {
     let mut length: Option<usize> = None;
 
     for (_ast_id, locations) in refs {
-        for loc in locations.as_array().expect("immutable locations should be an array") {
+        for loc in locations
+            .as_array()
+            .expect("immutable locations should be an array")
+        {
             let start = loc["start"]
                 .as_u64()
                 .expect("immutable reference missing 'start'") as usize;

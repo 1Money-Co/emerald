@@ -1,4 +1,5 @@
 use core::str::FromStr;
+
 use clap::Parser;
 use malachitebft_config::{BootstrapProtocol, RuntimeConfig, Selector, TransportProtocol};
 
@@ -13,7 +14,8 @@ impl FromStr for RuntimeFlavour {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if let Some(("multi-threaded", n)) = s.split_once(':') {
             return Ok(Self::MultiThreaded(
-                n.parse().map_err(|_| format!("invalid thread count: {n}"))?,
+                n.parse()
+                    .map_err(|_| format!("invalid thread count: {n}"))?,
             ));
         }
         match s {
