@@ -729,8 +729,10 @@ impl State {
             tokio::time::sleep(self.emerald_config.min_block_time - elapsed_height_time).await;
         }
 
-        // Keep provenance on failed commits for retry, and discard completed or stale heights
-        // only after persistence and pruning succeed. Restart defaults to normal live pacing.
+        // Discard completed or stale heights only after persistence and pruning succeed.
+        // Errors leave volatile provenance unchanged, but the current app loop exits and drops
+        // State. Only a future recovery path retaining this State could reuse it after an error;
+        // a new State defaults to normal live pacing.
         self.synced_values
             .retain(|(height, _, _)| *height > certificate.height);
 
@@ -1819,7 +1821,7 @@ jwt_token_path = "./assets/jwt.hex"
     }
 
     #[tokio::test]
-    async fn failed_synced_commit_preserves_provenance() {
+    async fn failed_synced_commit_leaves_volatile_provenance_unchanged() {
         let (mut state, _dir) = make_test_state().await;
         let height = state.consensus_height;
         let synced = accept_test_synced_value(
@@ -1843,6 +1845,8 @@ jwt_token_path = "./assets/jwt.hex"
             error.downcast_ref::<StoreError>(),
             Some(StoreError::ConflictingDecidedBlockData { .. })
         ));
+        // This checks commit's error-state contract, not production retry support: the app task
+        // currently terminates and drops State when commit returns an error.
         assert!(state
             .synced_values
             .contains(&(height, synced.round, synced.value.id())));
