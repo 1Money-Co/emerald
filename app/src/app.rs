@@ -830,8 +830,14 @@ pub async fn on_process_synced_value(
     };
 
     // Send to consensus to see if it has been decided on
+    let value_id = proposed_value.value.id();
+    let validity = proposed_value.validity;
     if reply.send(Some(proposed_value)).is_err() {
         error!(%height, %round, "Failed to send ProcessSyncedValue reply");
+    } else if validity == Validity::Valid {
+        // Sending the reply and recording provenance contain no await: the next Decided message
+        // cannot be handled by this application loop before the exact tuple is recorded.
+        state.record_synced_value(height, round, value_id);
     }
 
     Ok(())
