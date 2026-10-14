@@ -2,6 +2,7 @@
 //! A regular application would have mempool implemented, a proper database and input methods like RPC.
 
 use core::str::FromStr;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::{fmt, fs};
 
@@ -112,6 +113,10 @@ pub struct State {
 
     // Cache for tracking recently validated payloads to avoid duplicate validation
     validated_payload_cache: ValidatedPayloadCache,
+
+    /// Exact proposals accepted through value sync in this process. This only controls commit
+    /// pacing; payload validation and durable commit handling are shared with live decisions.
+    synced_values: BTreeSet<(Height, Round, ValueId)>,
 
     /// Cached earliest height with a certificate in the store.
     /// Lazily loaded on first access and updated after pruning.
@@ -247,6 +252,7 @@ impl State {
             validator_set: None,
 
             validated_payload_cache: ValidatedPayloadCache::new(10),
+            synced_values: BTreeSet::new(),
             earliest_certificate_height: None,
             earliest_value_height: None,
 
@@ -616,6 +622,11 @@ impl State {
         }
     }
 
+    /// Record a valid value successfully returned to consensus through ProcessSyncedValue.
+    pub(crate) fn record_synced_value(&mut self, height: Height, round: Round, value_id: ValueId) {
+        self.synced_values.insert((height, round, value_id));
+    }
+
     /// Commits a value with the given certificate, updating internal state
     /// and moving to the next height
     pub async fn commit(
@@ -699,18 +710,31 @@ impl State {
             self.earliest_value_height = Some(height);
         }
 
-        // Sleep to reduce the block speed, if set via config.
+        // Pace live consensus decisions, but let certified historical values catch up without
+        // waiting for the live block interval. Height alone (or value ID alone) is insufficient.
+        let synced = self.synced_values.contains(&(
+            certificate.height,
+            certificate.round,
+            certificate.value_id,
+        ));
         debug!(timeout_commit = ?self.emerald_config.min_block_time);
         let elapsed_height_time = self.last_block_time.elapsed();
 
         info!(
-            "👉 stats at {:?}: block_time {:?}",
-            certificate.height, elapsed_height_time
+            synced,
+            "👉 stats at {:?}: block_time {:?}", certificate.height, elapsed_height_time
         );
 
-        if elapsed_height_time < self.emerald_config.min_block_time {
+        if !synced && elapsed_height_time < self.emerald_config.min_block_time {
             tokio::time::sleep(self.emerald_config.min_block_time - elapsed_height_time).await;
         }
+
+        // Discard completed or stale heights only after persistence and pruning succeed.
+        // Errors leave volatile provenance unchanged, but the current app loop exits and drops
+        // State. Only a future recovery path retaining this State could reuse it after an error;
+        // a new State defaults to normal live pacing.
+        self.synced_values
+            .retain(|(height, _, _)| *height > certificate.height);
 
         Ok(())
     }
@@ -1204,6 +1228,59 @@ jwt_token_path = "./assets/jwt.hex"
         Bytes::from(payload.as_ssz_bytes())
     }
 
+    async fn accept_test_synced_value(
+        state: &mut State,
+        height: Height,
+        round: Round,
+        bytes: Bytes,
+    ) -> ProposedValue<EmeraldContext> {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        on_process_synced_value(
+            AppMsg::ProcessSyncedValue {
+                height,
+                round,
+                proposer: state.address,
+                value_bytes: ProtobufCodec.encode(&Value::new(bytes)).unwrap(),
+                reply,
+            },
+            state,
+        )
+        .await
+        .unwrap();
+        let proposal = receiver.await.unwrap().unwrap();
+        assert_eq!(proposal.validity, Validity::Valid);
+        proposal
+    }
+
+    fn test_certificate(
+        proposal: &ProposedValue<EmeraldContext>,
+    ) -> CommitCertificate<EmeraldContext> {
+        CommitCertificate {
+            height: proposal.height,
+            round: proposal.round,
+            value_id: proposal.value.id(),
+            commit_signatures: Vec::new(),
+        }
+    }
+
+    async fn store_test_live_value(
+        state: &State,
+        height: Height,
+        round: Round,
+        bytes: Bytes,
+    ) -> ProposedValue<EmeraldContext> {
+        let proposal = ProposedValue {
+            height,
+            round,
+            valid_round: Round::Nil,
+            proposer: state.address,
+            value: Value::new(bytes.clone()),
+            validity: Validity::Valid,
+        };
+        state.store_undecided_value(&proposal, bytes).await.unwrap();
+        proposal
+    }
+
     fn make_test_channels() -> (
         Channels<EmeraldContext>,
         tokio::task::JoinHandle<ProposalInit>,
@@ -1546,6 +1623,339 @@ jwt_token_path = "./assets/jwt.hex"
                 .await,
             Ok(None)
         ));
+    }
+
+    #[tokio::test]
+    async fn synced_commit_skips_min_block_time() {
+        let (mut state, _dir) = make_test_state().await;
+        state.emerald_config.min_block_time = core::time::Duration::from_secs(10);
+        let height = state.consensus_height;
+        let round = Round::new(3);
+        let value = Value::new(make_execution_payload_bytes());
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+
+        on_process_synced_value(
+            AppMsg::ProcessSyncedValue {
+                height,
+                round,
+                proposer: state.address,
+                value_bytes: ProtobufCodec.encode(&value).unwrap(),
+                reply,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(receiver.await.unwrap().unwrap().validity, Validity::Valid);
+
+        tokio::time::pause();
+        state.last_block_time = Instant::now();
+        state
+            .commit(CommitCertificate {
+                height,
+                round,
+                value_id: value.id(),
+                commit_signatures: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(state.last_block_time.elapsed(), core::time::Duration::ZERO);
+        assert_eq!(
+            state.store.get_decided_block_data(height).await.unwrap(),
+            Some(value.extensions)
+        );
+    }
+
+    #[tokio::test]
+    async fn live_commit_respects_min_block_time() {
+        let (mut state, _dir) = make_test_state().await;
+        state.emerald_config.min_block_time = core::time::Duration::from_secs(10);
+        let proposal = store_test_live_value(
+            &state,
+            state.consensus_height,
+            Round::ZERO,
+            make_execution_payload_bytes(),
+        )
+        .await;
+
+        tokio::time::pause();
+        state.last_block_time = Instant::now();
+        state.commit(test_certificate(&proposal)).await.unwrap();
+
+        assert!(state.last_block_time.elapsed() >= core::time::Duration::from_secs(10));
+        assert_eq!(
+            state
+                .store
+                .get_decided_block_data(proposal.height)
+                .await
+                .unwrap(),
+            Some(proposal.value.extensions)
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_pacing_exemption_requires_exact_height_round_and_value_id() {
+        for mismatch in ["height", "round", "value_id"] {
+            let (mut state, _dir) = make_test_state().await;
+            state.emerald_config.min_block_time = core::time::Duration::from_secs(10);
+            let height = state.consensus_height;
+            let synced = accept_test_synced_value(
+                &mut state,
+                height,
+                Round::new(3),
+                make_execution_payload_bytes(),
+            )
+            .await;
+            let mut payload = ExecutionPayloadV3::from_ssz_bytes(&synced.value.extensions).unwrap();
+            payload.payload_inner.payload_inner.block_number = 2;
+            let (height, round, bytes) = match mismatch {
+                "height" => (
+                    height.increment(),
+                    synced.round,
+                    synced.value.extensions.clone(),
+                ),
+                "round" => (height, Round::new(4), synced.value.extensions.clone()),
+                "value_id" => (height, synced.round, Bytes::from(payload.as_ssz_bytes())),
+                _ => unreachable!(),
+            };
+            let live = store_test_live_value(&state, height, round, bytes).await;
+
+            tokio::time::pause();
+            state.last_block_time = Instant::now();
+            state.commit(test_certificate(&live)).await.unwrap();
+            assert!(
+                state.last_block_time.elapsed() >= core::time::Duration::from_secs(10),
+                "a {mismatch} mismatch must retain live pacing"
+            );
+            tokio::time::resume();
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_sync_reply_does_not_exempt_a_live_commit() {
+        let (mut state, _dir) = make_test_state().await;
+        state.emerald_config.min_block_time = core::time::Duration::from_secs(10);
+        let height = state.consensus_height;
+        let value = Value::new(make_execution_payload_bytes());
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        drop(receiver);
+        on_process_synced_value(
+            AppMsg::ProcessSyncedValue {
+                height,
+                round: Round::ZERO,
+                proposer: state.address,
+                value_bytes: ProtobufCodec.encode(&value).unwrap(),
+                reply,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        tokio::time::pause();
+        state.last_block_time = Instant::now();
+        state
+            .commit(CommitCertificate {
+                height,
+                round: Round::ZERO,
+                value_id: value.id(),
+                commit_signatures: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert!(state.last_block_time.elapsed() >= core::time::Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn rejected_sync_conflict_does_not_exempt_a_live_commit() {
+        let (mut state, _dir) = make_test_state().await;
+        state.emerald_config.min_block_time = core::time::Duration::from_secs(10);
+        let live = store_test_live_value(
+            &state,
+            state.consensus_height,
+            Round::ZERO,
+            make_execution_payload_bytes(),
+        )
+        .await;
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        on_process_synced_value(
+            AppMsg::ProcessSyncedValue {
+                height: live.height,
+                round: live.round,
+                proposer: Address::new([2_u8; 20]),
+                value_bytes: ProtobufCodec.encode(&live.value).unwrap(),
+                reply,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert!(receiver.await.unwrap().is_none());
+
+        tokio::time::pause();
+        state.last_block_time = Instant::now();
+        state.commit(test_certificate(&live)).await.unwrap();
+        assert!(state.last_block_time.elapsed() >= core::time::Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn completed_sync_provenance_does_not_exempt_a_repeated_commit() {
+        let (mut state, _dir) = make_test_state().await;
+        state.emerald_config.min_block_time = core::time::Duration::from_secs(10);
+        let height = state.consensus_height;
+        let synced = accept_test_synced_value(
+            &mut state,
+            height,
+            Round::ZERO,
+            make_execution_payload_bytes(),
+        )
+        .await;
+
+        tokio::time::pause();
+        state.last_block_time = Instant::now();
+        state.commit(test_certificate(&synced)).await.unwrap();
+        assert_eq!(state.last_block_time.elapsed(), core::time::Duration::ZERO);
+        state.commit(test_certificate(&synced)).await.unwrap();
+        assert!(state.last_block_time.elapsed() >= core::time::Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn failed_synced_commit_leaves_volatile_provenance_unchanged() {
+        let (mut state, _dir) = make_test_state().await;
+        let height = state.consensus_height;
+        let synced = accept_test_synced_value(
+            &mut state,
+            height,
+            Round::ZERO,
+            make_execution_payload_bytes(),
+        )
+        .await;
+        state
+            .store
+            .store_legacy_decided_block_data(
+                height,
+                Bytes::from_static(b"conflicting-decided-payload"),
+            )
+            .await
+            .unwrap();
+
+        let error = state.commit(test_certificate(&synced)).await.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::ConflictingDecidedBlockData { .. })
+        ));
+        // This checks commit's error-state contract, not production retry support: the app task
+        // currently terminates and drops State when commit returns an error.
+        assert!(state
+            .synced_values
+            .contains(&(height, synced.round, synced.value.id())));
+        assert!(state
+            .store
+            .get_decided_value(height)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn restarted_state_defaults_to_live_pacing_for_stored_synced_value() {
+        let (mut state, _dir) = make_test_state().await;
+        state.emerald_config.min_block_time = core::time::Duration::from_secs(10);
+        let height = state.consensus_height;
+        let synced = accept_test_synced_value(
+            &mut state,
+            height,
+            Round::ZERO,
+            make_execution_payload_bytes(),
+        )
+        .await;
+        let State {
+            ctx,
+            signing_provider,
+            address,
+            store,
+            metrics,
+            emerald_config,
+            ..
+        } = state;
+        let mut restarted = State::new(
+            Genesis {
+                validator_set: ValidatorSet::new([Validator::new(
+                    PrivateKey::from_slice(&[1_u8; 32]).unwrap().public_key(),
+                    1,
+                )]),
+            },
+            ctx,
+            signing_provider,
+            address,
+            height,
+            store,
+            StateMetrics {
+                txs_count: 0,
+                chain_bytes: 0,
+                elapsed_seconds: 0,
+                metrics,
+            },
+            emerald_config,
+        );
+
+        tokio::time::pause();
+        restarted.last_block_time = Instant::now();
+        restarted.commit(test_certificate(&synced)).await.unwrap();
+        assert!(restarted.last_block_time.elapsed() >= core::time::Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn synced_backlog_returns_to_paced_live_consensus() {
+        let (mut state, _dir) = make_test_state().await;
+        state.emerald_config.min_block_time = core::time::Duration::from_secs(10);
+        let start_height = state.consensus_height.as_u64();
+        tokio::time::pause();
+        let catch_up_started = Instant::now();
+
+        for offset in 0..45 {
+            let height = Height::new(start_height + offset);
+            let mut payload =
+                ExecutionPayloadV3::from_ssz_bytes(&make_execution_payload_bytes()).unwrap();
+            payload.payload_inner.payload_inner.block_number = height.as_u64();
+            let synced = accept_test_synced_value(
+                &mut state,
+                height,
+                Round::new(3),
+                Bytes::from(payload.as_ssz_bytes()),
+            )
+            .await;
+            state.last_block_time = Instant::now();
+            let certificate = test_certificate(&synced);
+            state.commit(certificate.clone()).await.unwrap();
+            assert_eq!(
+                state
+                    .store
+                    .get_decided_value(height)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .certificate,
+                certificate
+            );
+            assert_eq!(
+                state.store.get_decided_block_data(height).await.unwrap(),
+                Some(synced.value.extensions)
+            );
+        }
+
+        assert_eq!(catch_up_started.elapsed(), core::time::Duration::ZERO);
+        let live = store_test_live_value(
+            &state,
+            Height::new(start_height + 45),
+            Round::ZERO,
+            make_execution_payload_bytes(),
+        )
+        .await;
+        state.last_block_time = Instant::now();
+        state.commit(test_certificate(&live)).await.unwrap();
+        assert!(state.last_block_time.elapsed() >= core::time::Duration::from_secs(10));
     }
 
     #[tokio::test]
