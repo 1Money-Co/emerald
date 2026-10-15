@@ -107,11 +107,10 @@ pub struct EmeraldConfig {
     #[serde(default)]
     pub key_provider: key_provider::KeyProviderConfig,
 
-    // Application set min_block_time forcing the app to sleep
-    // before moving onto the next height.
-    // Malachite does not have a notion of min_block_time, thus
-    // this has to be handled by the application.
-    // Default: 500ms
+    /// Minimum elapsed time before advancing after a live consensus commit.
+    /// Decisions matching a valid value accepted through ProcessSyncedValue skip this delay.
+    /// The application applies this pacing because Malachite has no min-block-time setting.
+    /// Default: 500ms.
     #[serde(with = "humantime_serde", default = "default_min_block_time")]
     pub min_block_time: Duration,
 
