@@ -169,6 +169,7 @@ impl Args {
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
+    use emerald_build_info::BuildMetadata;
 
     use super::Args;
 
@@ -183,6 +184,10 @@ mod tests {
         assert!(long_version.contains(env!("CARGO_PKG_VERSION")));
         assert!(long_version.contains("commit"));
         assert!(long_version.contains("branch"));
+        assert_eq!(
+            cmd.get_version(),
+            Some(BuildMetadata::current().service_version)
+        );
         assert_eq!(cmd.get_name(), "emerald");
     }
 }
