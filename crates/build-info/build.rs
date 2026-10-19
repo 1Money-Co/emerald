@@ -7,6 +7,12 @@ use shadow_rs::{
 };
 
 fn main() -> Result<(), ShadowError> {
+    // CI refs describe the invoking job, which may build a different checkout.
+    // Keep branch and tag metadata tied to this source tree, including detached builds.
+    for key in ["GITHUB_ACTIONS", "GITLAB_CI"] {
+        std::env::remove_var(key);
+    }
+
     // Cargo can reuse the build-script executable for another copy of this crate.
     // Resolve the current source directory when the script runs, not when it is compiled.
     let root = PathBuf::from(

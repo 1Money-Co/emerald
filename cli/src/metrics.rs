@@ -82,8 +82,6 @@ async fn get_metrics() -> String {
 
 #[cfg(test)]
 mod tests {
-    use emerald_build_info::build_info;
-
     use super::*;
 
     #[tokio::test]
@@ -126,23 +124,7 @@ mod tests {
             assert_eq!(samples.len(), 1, "{text}");
             assert!(samples[0].ends_with("} 1"));
             assert_eq!(samples[0].matches("=\"").count(), 5);
-            let expected_branch = match build_info::BRANCH {
-                "HEAD" | ""
-                    if !build_info::COMMIT_HASH.is_empty()
-                        && build_info::COMMIT_HASH != "unknown" =>
-                {
-                    "detached"
-                }
-                "" => "unknown",
-                branch => branch,
-            };
-            for (key, value) in [
-                ("service_version", build_info::PKG_VERSION),
-                ("service_build_time", build_info::BUILD_TIME_3339),
-                ("service_rust_version", build_info::RUST_VERSION),
-                ("vcs_ref_head", build_info::COMMIT_HASH),
-                ("vcs_ref_head_branch", expected_branch),
-            ] {
+            for (key, value) in BuildMetadata::current().labels() {
                 assert!(samples[0].contains(&format!("{key}=\"{value}\"")), "{text}");
             }
             assert!(text.contains("build_info_test_existing 7\n"));
