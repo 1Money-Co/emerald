@@ -41,6 +41,7 @@
   - [Running Emerald](production-network/running-emerald.md)
   - [Validator Key Management](production-network/key-management.md)
 - [Configuration Examples](./config-examples.md)
+- [Metrics and Build Identity](./metrics.md)
 
 ---
 
