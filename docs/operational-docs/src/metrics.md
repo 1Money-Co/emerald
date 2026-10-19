@@ -42,10 +42,4 @@ Run the focused metric and fallback tests with:
 
 ```sh
 cargo test -p emerald-build-info -p malachitebft-eth-cli
-python3 crates/build-info/tests/build-context.py
 ```
-
-The context probe builds a small consumer in temporary repositories. It checks archive isolation, attached and
-detached refs, and metadata refresh after commits without changing source files. It also reuses the build cache from
-another source directory. It requires Git and cached Cargo dependencies, uses offline Cargo, and does not modify the
-current checkout.
