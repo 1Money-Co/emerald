@@ -488,9 +488,7 @@ contract ValidatorManagerTest is Test {
 
         // Manager can no longer register
         vm.expectRevert(
-            abi.encodeWithSelector(
-                IAccessControl.AccessControlUnauthorizedAccount.selector, NON_OWNER, managerRole
-            )
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, NON_OWNER, managerRole)
         );
         vm.prank(NON_OWNER);
         validatorManager.register(BOB_COMPRESSED, SECOND_POWER);
@@ -519,9 +517,7 @@ contract ValidatorManagerTest is Test {
 
         // Cannot operate anymore
         vm.expectRevert(
-            abi.encodeWithSelector(
-                IAccessControl.AccessControlUnauthorizedAccount.selector, NON_OWNER, managerRole
-            )
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, NON_OWNER, managerRole)
         );
         vm.prank(NON_OWNER);
         validatorManager.register(ALICE_UNCOMPRESSED, INITIAL_POWER);
@@ -570,36 +566,28 @@ contract ValidatorManagerTest is Test {
     function testCannotRevokeOwnerAdminRole() public {
         bytes32 adminRole = validatorManager.DEFAULT_ADMIN_ROLE();
 
-        vm.expectRevert(
-            abi.encodeWithSelector(ValidatorManager.CannotRevokeOwnerRole.selector, adminRole)
-        );
+        vm.expectRevert(abi.encodeWithSelector(ValidatorManager.CannotRevokeOwnerRole.selector, adminRole));
         validatorManager.revokeRole(adminRole, address(this));
     }
 
     function testCannotRevokeOwnerManagerRole() public {
         bytes32 managerRole = validatorManager.VALIDATOR_MANAGER_ROLE();
 
-        vm.expectRevert(
-            abi.encodeWithSelector(ValidatorManager.CannotRevokeOwnerRole.selector, managerRole)
-        );
+        vm.expectRevert(abi.encodeWithSelector(ValidatorManager.CannotRevokeOwnerRole.selector, managerRole));
         validatorManager.revokeRole(managerRole, address(this));
     }
 
     function testOwnerCannotRenounceAdminRole() public {
         bytes32 adminRole = validatorManager.DEFAULT_ADMIN_ROLE();
 
-        vm.expectRevert(
-            abi.encodeWithSelector(ValidatorManager.CannotRevokeOwnerRole.selector, adminRole)
-        );
+        vm.expectRevert(abi.encodeWithSelector(ValidatorManager.CannotRevokeOwnerRole.selector, adminRole));
         validatorManager.renounceRole(adminRole, address(this));
     }
 
     function testOwnerCannotRenounceManagerRole() public {
         bytes32 managerRole = validatorManager.VALIDATOR_MANAGER_ROLE();
 
-        vm.expectRevert(
-            abi.encodeWithSelector(ValidatorManager.CannotRevokeOwnerRole.selector, managerRole)
-        );
+        vm.expectRevert(abi.encodeWithSelector(ValidatorManager.CannotRevokeOwnerRole.selector, managerRole));
         validatorManager.renounceRole(managerRole, address(this));
     }
 
