@@ -546,6 +546,8 @@ impl State {
     }
 
     /// Retrieves undecided block data at the given height and value ID.
+    // `StoreError` is large by design; store.rs allows this lint for the same type.
+    #[allow(clippy::result_large_err)]
     pub async fn get_undecided_block_data(
         &self,
         height: Height,
