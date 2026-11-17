@@ -1,9 +1,9 @@
 [package]
-name             = "key-provider"
-version.workspace = true
-edition.workspace = true
-repository.workspace = true
-license.workspace = true
+name                   = "key-provider"
+version.workspace      = true
+edition.workspace      = true
+repository.workspace   = true
+license.workspace      = true
 rust-version.workspace = true
 
 [lints]
@@ -11,13 +11,13 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
-base64 = "0.22"
-hex.workspace = true
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
-zeroize.workspace = true
+base64                = "0.22"
+hex.workspace         = true
+serde                 = { workspace = true, features = [ "derive" ] }
+serde_json.workspace  = true
+thiserror.workspace   = true
+tracing.workspace     = true
+zeroize.workspace     = true
 
 # AWS — gated on feature flag so non-mainnet builds stay lean
 aws-config             = { workspace = true, optional = true }
@@ -32,8 +32,8 @@ google-cloud-secretmanager-v1 = { workspace = true, optional = true }
 tokio                         = { workspace = true, features = [ "time" ], optional = true }
 
 [features]
-default    = ["aws-sm-kms", "gcp-sm-kms"]
-aws-sm-kms = ["dep:aws-config", "dep:aws-sdk-kms", "dep:aws-sdk-secretsmanager"]
+default = [ "aws-sm-kms", "gcp-sm-kms" ]
+aws-sm-kms = [ "dep:aws-config", "dep:aws-sdk-kms", "dep:aws-sdk-secretsmanager" ]
 gcp-sm-kms = [
   "dep:bytes",
   "dep:crc32c",
@@ -43,11 +43,11 @@ gcp-sm-kms = [
 ]
 
 [dev-dependencies]
-tokio    = { workspace = true, features = ["rt-multi-thread", "macros"] }
-tempfile = "3"
+tokio                  = { workspace = true, features = [ "rt-multi-thread", "macros" ] }
+tempfile               = "3"
 aws-config             = { workspace = true }
 aws-sdk-kms            = { workspace = true }
 aws-sdk-secretsmanager = { workspace = true }
 google-cloud-gax       = { workspace = true }
-libp2p-identity        = { version = "0.2", features = ["secp256k1"] }
+libp2p-identity        = { version = "0.2", features = [ "secp256k1" ] }
 malachitebft-eth-types = { workspace = true }
