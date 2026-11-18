@@ -39,5 +39,8 @@ jobs:
       - name: Run Forge build
         run: forge build --sizes
 
+      - name: Check the ValidatorManager artifact that contracts/build.rs reads
+        run: test -f solidity/out/ValidatorManager.sol/ValidatorManager.json
+
       - name: Run Forge tests
         run: forge test -vvv

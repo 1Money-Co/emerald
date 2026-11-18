@@ -219,7 +219,11 @@ contract ValidatorManager is
      * @dev Batch register validators.
      * @param registrations Array of validator registration payloads
      */
-    function registerSet(ValidatorRegistration[] calldata registrations) external nonReentrant onlyRole(VALIDATOR_MANAGER_ROLE) {
+    function registerSet(ValidatorRegistration[] calldata registrations)
+        external
+        nonReentrant
+        onlyRole(VALIDATOR_MANAGER_ROLE)
+    {
         _registerSet(registrations);
     }
 
@@ -244,7 +248,11 @@ contract ValidatorManager is
      * @param validatorPublicKey The validator public key bytes
      * @param power The voting power for the validator
      */
-    function register(bytes calldata validatorPublicKey, uint64 power) external nonReentrant onlyRole(VALIDATOR_MANAGER_ROLE) {
+    function register(bytes calldata validatorPublicKey, uint64 power)
+        external
+        nonReentrant
+        onlyRole(VALIDATOR_MANAGER_ROLE)
+    {
         Secp256k1Key memory validatorKey = _secp256k1KeyFromBytesInternal(validatorPublicKey);
         _register(ValidatorInfo({validatorKey: validatorKey, power: power}));
     }
@@ -270,7 +278,11 @@ contract ValidatorManager is
      * @dev Batch unregister validators.
      * @param validatorAddresses Array of validator addresses
      */
-    function unregisterSet(address[] calldata validatorAddresses) external nonReentrant onlyRole(VALIDATOR_MANAGER_ROLE) {
+    function unregisterSet(address[] calldata validatorAddresses)
+        external
+        nonReentrant
+        onlyRole(VALIDATOR_MANAGER_ROLE)
+    {
         _unregisterAddresses(validatorAddresses);
     }
 

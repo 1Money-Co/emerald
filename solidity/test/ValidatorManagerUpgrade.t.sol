@@ -48,9 +48,7 @@ contract ValidatorManagerUpgradeTest is Test {
     function testUpgradeRevertsForNonOwner() public {
         ValidatorManagerV2 v2Impl = new ValidatorManagerV2();
 
-        vm.expectRevert(
-            abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, NON_OWNER)
-        );
+        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, NON_OWNER));
         vm.prank(NON_OWNER);
         validatorManager.upgradeToAndCall(address(v2Impl), "");
     }
@@ -61,8 +59,7 @@ contract ValidatorManagerUpgradeTest is Test {
         // Register two validators
         validatorManager.register(ALICE_UNCOMPRESSED, ALICE_POWER);
 
-        ValidatorManager.Secp256k1Key memory aliceKey =
-            validatorManager._secp256k1KeyFromBytes(ALICE_UNCOMPRESSED);
+        ValidatorManager.Secp256k1Key memory aliceKey = validatorManager._secp256k1KeyFromBytes(ALICE_UNCOMPRESSED);
         address aliceAddr = validatorManager._validatorAddress(aliceKey);
 
         // Upgrade
@@ -100,9 +97,7 @@ contract ValidatorManagerUpgradeTest is Test {
 
         // Old owner can no longer upgrade
         ValidatorManagerV2 v2Impl = new ValidatorManagerV2();
-        vm.expectRevert(
-            abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, address(this))
-        );
+        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, address(this)));
         validatorManager.upgradeToAndCall(address(v2Impl), "");
 
         // New owner can upgrade
@@ -116,9 +111,7 @@ contract ValidatorManagerUpgradeTest is Test {
         assertEq(validatorManager.owner(), address(0));
 
         ValidatorManagerV2 v2Impl = new ValidatorManagerV2();
-        vm.expectRevert(
-            abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, address(this))
-        );
+        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, address(this)));
         validatorManager.upgradeToAndCall(address(v2Impl), "");
     }
 

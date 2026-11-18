@@ -89,7 +89,7 @@ pub fn parse_validator_identifier(identifier: &str) -> Result<Address> {
         eyre::bail!(
             "Invalid validator identifier: expected address (40 hex chars) or public key (128-130 hex chars), got {} hex chars",
             hex_len
-        )
+        );
     }
 }
 
